@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -19,6 +20,10 @@ var rootCmd = &cobra.Command{
 	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
 		variant, _ := cmd.Flags().GetString("variant")
+		err := utils.ParseVCF(variant)
+		if err != nil {
+			return
+		}
 		fmt.Printf("variant: %s\n", variant)
 	},
 }
