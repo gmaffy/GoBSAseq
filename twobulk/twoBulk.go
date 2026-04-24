@@ -96,7 +96,15 @@ func filterVCFTwoBulkTwoParents(vcfFile string, highPar string, highParDP int, l
 	return nil
 }
 
-func TwoParentsTwoBulkRun(vcfFile string, highPar string, highParDP int) error {
+func TwoParentsTwoBulkRun(vcfFile string, highPar string, highParDP int, lowPar string, lowParDP int, highBulk string, highBulkDP int, lowBulk string, lowBulkDP int) error {
 	fmt.Printf("Filtering VCF %s\n", vcfFile)
+
+	filteredVCF := strings.TrimSuffix(vcfFile, ".vcf.gz") + ".filtered.vcf.gz"
+	err := filterVCFTwoBulkTwoParents(vcfFile, highPar, highParDP, lowPar, lowParDP, highBulk, highBulkDP, lowBulk, lowBulkDP, filteredVCF)
+	if err != nil {
+		fmt.Println("Error filtering VCF:", err)
+		return err
+	}
+	fmt.Printf("Filtered VCF saved to %s\n", filteredVCF)
 	return nil
 }

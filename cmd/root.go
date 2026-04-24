@@ -6,6 +6,10 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
+
+	"github.com/fatih/color"
 
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/spf13/cobra"
@@ -20,7 +24,100 @@ var rootCmd = &cobra.Command{
 	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
 		variant, _ := cmd.Flags().GetString("variant")
-		err := utils.ParseVCF(variant)
+		parentsDepth, _ := cmd.Flags().GetString("parents-depth")
+		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
+		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
+		windowSize, _ := cmd.Flags().GetInt64("window-size")
+
+		bulksDepthLst := strings.Split(bulksDepth, ",")
+		bulkSizesLst := strings.Split(bulkSizes, ",")
+		parentsDepthLst := strings.Split(parentsDepth, ",")
+
+		highBulkDepth := 0
+		lowBulkDepth := 0
+		oneBulkDepth := 0
+		highParentDepth := 0
+		lowParentDepth := 0
+		oneParentDepth := 0
+		highBulkSize := 0
+		lowBulkSize := 0
+		oneBulkSize := 0
+		winSize := 0
+
+		var err error
+
+		// ========================================== Get bulk depths =============================================== //
+		if len(bulksDepthLst) > 2 {
+			color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+			return
+		} else if len(bulksDepthLst) == 1 {
+			oneBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
+			if err != nil {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+
+		} else {
+			highBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
+			if err != nil {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowBulkDepth, err = strconv.Atoi(bulksDepthLst[1])
+			if err != nil {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+		}
+
+		// =========================================== Get Parent Depths============================================= //
+		if len(parentsDepthLst) > 2 {
+			color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+			return
+		} else if len(parentsDepthLst) == 1 {
+			oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
+
+		} else {
+			highParentDepth, err = strconv.Atoi(parentsDepthLst[0])
+			if err != nil {
+				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowBulkDepth, err = strconv.Atoi(parentsDepthLst[1])
+			if err != nil {
+				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+			}
+		}
+
+		// ======================================== Get Bulk Sizes ================================================== //
+
+		if len(bulkSizesLst) > 2 {
+			color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+			return
+		} else if len(bulkSizesLst) == 1 {
+			oneBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+
+		} else {
+			highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+			if err != nil {
+				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowBulkSize, err = strconv.Atoi(bulkSizesLst[1])
+			if err != nil {
+				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+		}
+
+		// ================================ window size ================================================//
+		winSize, err = strconv.Atoi(fmt.Sprintf("%d", windowSize))
+		if err != nil {
+			color.Red("windowSize is supposed to be an integer")
+			return
+		}
+
+		err := utils.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize)
 		if err != nil {
 			return
 		}
@@ -48,4 +145,8 @@ func init() {
 	// when this action is called directly.
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
+	rootCmd.Flags().StringP("parents-depth", "P", "5,5", "Parents Min Depth")
+	rootCmd.Flags().StringP("bulks-depth", "B", "40,40", "Low Parent Min Depth")
+	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "High Bulk Min Depth")
+	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
 }
