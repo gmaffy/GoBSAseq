@@ -83,13 +83,13 @@ var rootCmd = &cobra.Command{
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
 			}
-			lowBulkDepth, err = strconv.Atoi(parentsDepthLst[1])
+			lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
 			if err != nil {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 			}
 		}
 
-		// ======================================== Get Bulk Sizes ================================================== //
+		// ========================================== Get Bulk Sizes ================================================ //
 
 		if len(bulkSizesLst) > 2 {
 			color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
@@ -110,14 +110,14 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// ================================ window size ================================================//
+		// ============================================== window size ================================================//
 		winSize, err = strconv.Atoi(fmt.Sprintf("%d", windowSize))
 		if err != nil {
 			color.Red("windowSize is supposed to be an integer")
 			return
 		}
 
-		err := utils.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize)
+		err = utils.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize)
 		if err != nil {
 			return
 		}

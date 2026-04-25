@@ -15,44 +15,39 @@ type VCF struct {
 	ALT   string
 }
 
-func filterVCFTwoBulkTwoParents(vcfFile string, highPar string, highParDP int, lowPar string, lowParDP int, highBulk string, highBulkDP int, lowBulk string, lowBulkDP int, outVCF string) error {
-
-	fmt.Printf("Filtering VCF %s\n", vcfFile)
-	fmt.Printf("Replacing | with / ....")
-
-	unphasedVCF := strings.TrimSuffix(vcfFile, ".vcf.gz") + ".unphased.vcf.gz"
-	cmdStr := fmt.Sprintf("bcftools view %s \\\n| sed 's/|/\\//g' \\\n| bcftools view -Oz -o %s\nbcftools index %s\n``", vcfFile, unphasedVCF, unphasedVCF)
-
-	cmd := exec.Command("bash", "-c", cmdStr)
-	err := cmd.Run()
-	if err != nil {
-		fmt.Println("CMD error:", err)
-		return err
-	}
-
-	start := time.Now()
-
+func filterVCFTwoBulkTwoParents(vcfFile string, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int, outVCF string) error {
 	expr := fmt.Sprintf(`
-        GT[%s]!="./." && GT[%s]!="./." && GT[%s]!="./." && GT[%s]!="./." &&
+		GT[%d]!="./." && GT[%d]!=".|." &&
+		GT[%d]!="./." && GT[%d]!=".|." &&
+		GT[%d]!="./." && GT[%d]!=".|." &&
+		GT[%d]!="./." && GT[%d]!=".|." &&
 
-        ((GT[%s]="0/0" && GT[%s]="1/1") || (GT[%s]="1/1" && GT[%s]="0/0")) &&
+		(((GT[%d]="0/0" || GT[%d]="0|0") && (GT[%d]="1/1" || GT[%d]="1|1")) ||
+		((GT[%d]="1/1" || GT[%d]="1|1") && (GT[%d]="0/0" || GT[%d]="0|0"))) &&
 
-        DP[%s] >= %d &&
-        DP[%s] >= %d &&
-        DP[%s] >= %d &&
-        DP[%s] >= %d &&
+		FMT/DP[%d] >= %d &&
+		FMT/DP[%d] >= %d &&
+		FMT/DP[%d] >= %d &&
+		FMT/DP[%d] >= %d &&
 
-        AD[%s][1]>=0  && AD[%s][2]=="." &&
-        AD[%s][1]>=0  && AD[%s][2]=="." &&
-        AD[%s][1]>=0  && AD[%s][2]=="." &&
-        AD[%s][1]>=0  && AD[%s][2]=="."
-    `,
-		highPar, lowPar, highBulk, lowBulk,
-		highPar, lowPar, highPar, lowPar,
+		AD[%d:1]>=0 && AD[%d:2]=="." &&
+		AD[%d:1]>=0 && AD[%d:2]=="." &&
+		AD[%d:1]>=0 && AD[%d:2]=="." &&
+		AD[%d:1]>=0 && AD[%d:2]=="."
+	`,
+		highPar, highPar,
+		lowPar, lowPar,
+		highBulk, highBulk,
+		lowBulk, lowBulk,
+
+		highPar, highPar, lowPar, lowPar,
+		highPar, highPar, lowPar, lowPar,
+
 		highPar, highParDP,
 		lowPar, lowParDP,
 		highBulk, highBulkDP,
 		lowBulk, lowBulkDP,
+
 		highPar, highPar,
 		lowPar, lowPar,
 		highBulk, highBulk,
@@ -61,32 +56,25 @@ func filterVCFTwoBulkTwoParents(vcfFile string, highPar string, highParDP int, l
 
 	expr = strings.Join(strings.Fields(expr), " ")
 
-	args := []string{
-		"view",
-		"-m2", "-M2", "-v", "snps",
-		"-i", expr,
-		"-Oz",
-		"-o", outVCF,
-		unphasedVCF,
-	}
+	args := []string{"view", "-m2", "-M2", "-v", "snps", "-i", expr, "-Oz", "-o", outVCF, vcfFile}
 
-	cmd = exec.Command("bcftools", args...)
+	start := time.Now()
+	cmd := exec.Command("bcftools", args...)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		//fmt.Fprintf(log, "[ERROR] bcftools view failed:\n%s\n", stderr.String())
-		return fmt.Errorf("bcftools view error: %w", err)
+		return fmt.Errorf("bcftools view error: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	// index output VCF
+	stderr.Reset()
 	idxCmd := exec.Command("bcftools", "index", "-f", outVCF)
 	idxCmd.Stderr = &stderr
 
 	if err := idxCmd.Run(); err != nil {
-		//fmt.Fprintf(log, "[ERROR] bcftools index failed:\n%s\n", stderr.String())
-		return fmt.Errorf("bcftools index error: %w", err)
+		return fmt.Errorf("bcftools index error: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
 	elapsed := time.Since(start)
@@ -96,7 +84,7 @@ func filterVCFTwoBulkTwoParents(vcfFile string, highPar string, highParDP int, l
 	return nil
 }
 
-func TwoParentsTwoBulkRun(vcfFile string, highPar string, highParDP int, lowPar string, lowParDP int, highBulk string, highBulkDP int, lowBulk string, lowBulkDP int) error {
+func TwoParentsTwoBulkRun(vcfFile string, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int) error {
 	fmt.Printf("Filtering VCF %s\n", vcfFile)
 
 	filteredVCF := strings.TrimSuffix(vcfFile, ".vcf.gz") + ".filtered.vcf.gz"

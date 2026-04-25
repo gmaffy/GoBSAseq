@@ -6,10 +6,11 @@ import (
 	"os/exec"
 	"sort"
 
+	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/twobulk"
 )
 
-func GetSampleNames(vcf string) (map[int]string, []int, error) {
+func GetSampleNames1(vcf string) (map[int]string, []int, error) {
 	sampleParametersDic := map[int]string{0: "None"}
 	sampleID := 0
 	var ids []int
@@ -41,6 +42,8 @@ func GetSampleNames(vcf string) (map[int]string, []int, error) {
 	return sampleParametersDic, ids, nil
 
 }
+
+func getSampleNames(vcf string) (map[int]string, []int, error)
 
 func ParseVCF(vcf string) error {
 	//fmt.Printf("VCF: %s\n", vcf)
@@ -126,7 +129,7 @@ func ParseVCF(vcf string) error {
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
 	} else {
 		fmt.Println("Working with two bulks")
-		twobulk.TwoParentsTwoBulkRun(vcf, highParent, 5, lowParent, 5, highBulk, 40, lowBulk, 40)
+		twobulk.TwoParentsTwoBulkRun(vcf, highParentChoice-1, 5, lowParentChoice-1, 5, highBulkChoice-1, 40, lowBulkChoice-1, 40)
 
 	}
 
@@ -135,10 +138,11 @@ func ParseVCF(vcf string) error {
 }
 
 func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int) error {
-	fmt.Printf("VCF: %s\n", vcf)
-	sampleParametersDic, ids, err := GetSampleNames(vcf)
-
+	fmt.Printf("VCF IS: %s\n", vcf)
+	//sampleParametersDic, ids, err := GetSampleNames(vcf)
+	println(sampleParametersDic, err)
 	if err != nil {
+		color.Red("Error getting sample names:%s\n", err)
 		return err
 	}
 	fmt.Printf("================================ SAMPLE SELECTION ==========================================\n\n")
@@ -218,11 +222,12 @@ func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
 	} else {
 		fmt.Println("Working with two bulks")
-		err = twobulk.TwoParentsTwoBulkRun(vcf, highParent, highParentDepth, lowParent, lowParentDepth, highBulk, highBulkDepth, lowBulk, lowBulkDepth)
+		err = twobulk.TwoParentsTwoBulkRun(vcf, highParentChoice-1, highParentDepth, lowParentChoice-1, lowParentDepth, highBulkChoice-1, highBulkDepth, lowBulkChoice-1, lowBulkDepth)
 		if err != nil {
 			return err
 		}
 
 	}
+	return nil
 
 }
