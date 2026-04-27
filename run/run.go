@@ -145,7 +145,7 @@ func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
 	} else {
 		fmt.Println("Working with two bulks")
-		twobulk.RunTwoBulkTwoParents(rdr, highParentChoice-1, highParentDepth, lowParentChoice-1, lowParentDepth, highBulkChoice-1, highBulkDepth, lowBulkChoice-1, lowBulkDepth)
+		twobulk.RunTwoBulkTwoParents(rdr, highParentChoice-1, highParentDepth, lowParentChoice-1, lowParentDepth, highBulkChoice-1, highBulkDepth, lowBulkChoice-1, lowBulkDepth, windowSize)
 		//if err != nil {
 		//	return err
 		//}

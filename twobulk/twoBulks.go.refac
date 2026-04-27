@@ -1,0 +1,475 @@
+// twoBulks.go
+// Refactored modular two-bulk / two-parent BSA pipeline
+// Logic preserved, structure simplified, ED upgraded to ED^4,
+// threshold simulation + QTL prediction added.
+
+package twobulk
+
+import (
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/brentp/vcfgo"
+)
+
+//////////////////////////////
+// DATA STRUCTURES
+//////////////////////////////
+
+type BSAstats struct {
+	CHROM string
+	POS   int64
+	REF   string
+	ALT   string
+
+	HighBulkL int
+	HighBulkH int
+	LowBulkL  int
+	LowBulkH  int
+
+	HighSI float64
+	LowSI  float64
+
+	DeltaSI float64
+	Gstat   float64
+	ED4     float64
+	BBLogBF float64
+
+	DeltaSIK float64
+	Gprime   float64
+	ED4K     float64
+	BBK      float64
+
+	EWMA    float64
+	CUSUM   float64
+	ScanLLR float64
+	SegMean float64
+}
+
+type ScanWindow struct {
+	Chr       string
+	Start     int64
+	End       int64
+	PeakPos   int64
+	PeakValue float64
+}
+
+type ThresholdSet struct {
+	Stat string
+	P95  float64
+	P99  float64
+	Max  float64
+}
+
+type QTLRegion struct {
+	Chr       string
+	Start     int64
+	End       int64
+	PeakPos   int64
+	PeakValue float64
+	Stat      string
+}
+
+//////////////////////////////
+// BASIC UTILITIES
+//////////////////////////////
+
+func ratio(num, den int) float64 {
+	if den == 0 {
+		return 0
+	}
+	return float64(num) / float64(den)
+}
+
+func mean(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range vals {
+		sum += v
+	}
+	return sum / float64(len(vals))
+}
+
+func std(vals []float64, avg float64) float64 {
+	if len(vals) < 2 {
+		return 0
+	}
+	ss := 0.0
+	for _, v := range vals {
+		d := v - avg
+		ss += d * d
+	}
+	return math.Sqrt(ss / float64(len(vals)-1))
+}
+
+func percentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sort.Float64s(vals)
+	idx := int((p / 100.0) * float64(len(vals)-1))
+	return vals[idx]
+}
+
+//////////////////////////////
+// VARIANT FILTERING
+//////////////////////////////
+
+func isInformativeVariant(v *vcfgo.Variant, highPar, lowPar, highBulk, lowBulk int, minDepth int) bool {
+	if len(v.Alt()) != 1 {
+		return false
+	}
+
+	hp := v.Samples[highPar]
+	lp := v.Samples[lowPar]
+	hb := v.Samples[highBulk]
+	lb := v.Samples[lowBulk]
+
+	if hp.DP < minDepth || lp.DP < minDepth || hb.DP < minDepth || lb.DP < minDepth {
+		return false
+	}
+
+	if len(hp.GT) == 0 || len(lp.GT) == 0 {
+		return false
+	}
+
+	if hp.GT[0] == lp.GT[0] {
+		return false
+	}
+
+	return true
+}
+
+//////////////////////////////
+// CORE STATISTICS
+//////////////////////////////
+
+func gStatistic(hAlt, hRef, lAlt, lRef int) float64 {
+	total := float64(hAlt + hRef + lAlt + lRef)
+	if total == 0 {
+		return 0
+	}
+
+	row1 := float64(hAlt + hRef)
+	row2 := float64(lAlt + lRef)
+	col1 := float64(hAlt + lAlt)
+	col2 := float64(hRef + lRef)
+
+	expected := []float64{
+		row1 * col1 / total,
+		row1 * col2 / total,
+		row2 * col1 / total,
+		row2 * col2 / total,
+	}
+
+	observed := []float64{
+		float64(hAlt),
+		float64(hRef),
+		float64(lAlt),
+		float64(lRef),
+	}
+
+	g := 0.0
+	for i := range observed {
+		if observed[i] > 0 && expected[i] > 0 {
+			g += observed[i] * math.Log(observed[i]/expected[i])
+		}
+	}
+
+	return 2 * g
+}
+
+func betaBinomialBF(hH, hL, lH, lL int) float64 {
+	return math.Log(float64((hH+1)*(lL+1))) - math.Log(float64((hL+1)*(lH+1)))
+}
+
+func calcED4(hL, lL float64) float64 {
+	diff := math.Abs(hL - lL)
+	return math.Pow(diff, 4)
+}
+
+//////////////////////////////
+// VCF SCAN
+//////////////////////////////
+
+func ScanVCF(vcfRdr *vcfgo.Reader, highPar, lowPar, highBulk, lowBulk, minDepth int) []BSAstats {
+	var stats []BSAstats
+	var mu sync.Mutex
+
+	variantChan := make(chan *vcfgo.Variant, 1000)
+	wg := sync.WaitGroup{}
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for v := range variantChan {
+				if !isInformativeVariant(v, highPar, lowPar, highBulk, lowBulk, minDepth) {
+					continue
+				}
+
+				hbRef, _ := v.Samples[highBulk].RefDepth()
+				hbAlt, _ := v.Samples[highBulk].AltDepths()
+				lbRef, _ := v.Samples[lowBulk].RefDepth()
+				lbAlt, _ := v.Samples[lowBulk].AltDepths()
+
+				if len(hbAlt) == 0 || len(lbAlt) == 0 {
+					continue
+				}
+
+				hH := hbAlt[0]
+				hL := hbRef
+				lH := lbAlt[0]
+				lL := lbRef
+
+				highSI := ratio(hH, hH+hL)
+				lowSI := ratio(lH, lH+lL)
+
+				stat := BSAstats{
+					CHROM:     v.Chromosome,
+					POS:       int64(v.Pos),
+					REF:       v.Reference,
+					ALT:       v.Alt()[0],
+					HighBulkH: hH,
+					HighBulkL: hL,
+					LowBulkH:  lH,
+					LowBulkL:  lL,
+					HighSI:    highSI,
+					LowSI:     lowSI,
+					DeltaSI:   highSI - lowSI,
+					Gstat:     gStatistic(hH, hL, lH, lL),
+					ED4:       calcED4(float64(hL), float64(lL)),
+					BBLogBF:   betaBinomialBF(hH, hL, lH, lL),
+				}
+
+				mu.Lock()
+				stats = append(stats, stat)
+				mu.Unlock()
+			}
+		}()
+	}
+
+	for v := vcfRdr.Read(); v != nil; v = vcfRdr.Read() {
+		variantChan <- v
+	}
+
+	close(variantChan)
+	wg.Wait()
+
+	return stats
+}
+
+//////////////////////////////
+// SMOOTHING
+//////////////////////////////
+
+func SmoothChromosome(snps []BSAstats, bandwidth int) {
+	for i := range snps {
+		var dSum, gSum, eSum, bSum float64
+		var weight float64
+
+		for j := range snps {
+			dist := math.Abs(float64(snps[i].POS - snps[j].POS))
+			if dist > float64(bandwidth) {
+				continue
+			}
+
+			w := math.Pow(1-math.Pow(dist/float64(bandwidth), 3), 3)
+
+			dSum += snps[j].DeltaSI * w
+			gSum += snps[j].Gstat * w
+			eSum += snps[j].ED4 * w
+			bSum += snps[j].BBLogBF * w
+			weight += w
+		}
+
+		if weight > 0 {
+			snps[i].DeltaSIK = dSum / weight
+			snps[i].Gprime = gSum / weight
+			snps[i].ED4K = eSum / weight
+			snps[i].BBK = bSum / weight
+		}
+	}
+}
+
+//////////////////////////////
+// CONTROL STATS
+//////////////////////////////
+
+func ComputeEWMA(snps []BSAstats, alpha float64) {
+	if len(snps) == 0 {
+		return
+	}
+
+	snps[0].EWMA = snps[0].DeltaSIK
+	for i := 1; i < len(snps); i++ {
+		snps[i].EWMA = alpha*snps[i].DeltaSIK + (1-alpha)*snps[i-1].EWMA
+	}
+}
+
+func ComputeCUSUM(snps []BSAstats) {
+	vals := make([]float64, len(snps))
+	for i := range snps {
+		vals[i] = snps[i].DeltaSIK
+	}
+
+	m := mean(vals)
+	s := std(vals, m)
+	if s == 0 {
+		return
+	}
+
+	cusum := 0.0
+	for i := range snps {
+		z := (snps[i].DeltaSIK - m) / s
+		cusum += z
+		snps[i].CUSUM = cusum
+	}
+}
+
+//////////////////////////////
+// THRESHOLD SIMULATION
+//////////////////////////////
+
+func SimulateThresholds(snps []BSAstats, iterations int) map[string]ThresholdSet {
+	statsMap := map[string][]float64{
+		"ED4": {},
+	}
+
+	for i := 0; i < iterations; i++ {
+		for _, s := range snps {
+			totalH := s.HighBulkH + s.HighBulkL
+			totalL := s.LowBulkH + s.LowBulkL
+
+			p := ratio(s.HighBulkH+s.LowBulkH, totalH+totalL)
+
+			hSim := 0
+			lSim := 0
+
+			for x := 0; x < totalH; x++ {
+				if rand.Float64() < p {
+					hSim++
+				}
+			}
+
+			for x := 0; x < totalL; x++ {
+				if rand.Float64() < p {
+					lSim++
+				}
+			}
+
+			ed4 := calcED4(float64(totalH-hSim), float64(totalL-lSim))
+			statsMap["ED4"] = append(statsMap["ED4"], ed4)
+		}
+	}
+
+	results := map[string]ThresholdSet{}
+
+	for stat, vals := range statsMap {
+		results[stat] = ThresholdSet{
+			Stat: stat,
+			P95:  percentile(vals, 95),
+			P99:  percentile(vals, 99),
+			Max:  percentile(vals, 99.9),
+		}
+	}
+
+	return results
+}
+
+//////////////////////////////
+// QTL PREDICTION
+//////////////////////////////
+
+func PredictQTLRegions(snps []BSAstats, threshold float64) []QTLRegion {
+	var qtls []QTLRegion
+
+	inRegion := false
+	var current QTLRegion
+
+	for _, s := range snps {
+		if s.ED4K >= threshold {
+			if !inRegion {
+				inRegion = true
+				current = QTLRegion{
+					Chr:       s.CHROM,
+					Start:     s.POS,
+					PeakPos:   s.POS,
+					PeakValue: s.ED4K,
+					Stat:      "ED4K",
+				}
+			}
+
+			if s.ED4K > current.PeakValue {
+				current.PeakValue = s.ED4K
+				current.PeakPos = s.POS
+			}
+
+			current.End = s.POS
+		} else if inRegion {
+			qtls = append(qtls, current)
+			inRegion = false
+		}
+	}
+
+	if inRegion {
+		qtls = append(qtls, current)
+	}
+
+	return qtls
+}
+
+//////////////////////////////
+// MAIN PIPELINE
+//////////////////////////////
+
+func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar, lowPar, highBulk, lowBulk, minDepth, bandwidth int) {
+	start := time.Now()
+
+	stats := ScanVCF(vcfRdr, highPar, lowPar, highBulk, lowBulk, minDepth)
+
+	byChr := map[string][]BSAstats{}
+	for _, s := range stats {
+		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+	}
+
+	var allQTLs []QTLRegion
+
+	for chr := range byChr {
+		sort.Slice(byChr[chr], func(i, j int) bool {
+			return byChr[chr][i].POS < byChr[chr][j].POS
+		})
+
+		SmoothChromosome(byChr[chr], bandwidth)
+		ComputeEWMA(byChr[chr], 0.2)
+		ComputeCUSUM(byChr[chr])
+
+		thresholds := SimulateThresholds(byChr[chr], 100)
+		qtls := PredictQTLRegions(byChr[chr], thresholds["ED4"].P99)
+
+		allQTLs = append(allQTLs, qtls...)
+	}
+
+	out, _ := os.Create("predicted_qtls.tsv")
+	defer out.Close()
+
+	fmt.Fprintln(out, "CHR\tSTART\tEND\tPEAKPOS\tPEAKVALUE\tSTAT")
+
+	for _, q := range allQTLs {
+		fmt.Fprintf(out, "%s\t%d\t%d\t%d\t%.4f\t%s\n",
+			q.Chr, q.Start, q.End, q.PeakPos, q.PeakValue, q.Stat)
+	}
+
+	fmt.Printf("Analysis complete in %s | Predicted QTLs: %d\n",
+		time.Since(start).Round(time.Millisecond), len(allQTLs))
+}

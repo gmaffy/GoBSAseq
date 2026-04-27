@@ -1,0 +1,568 @@
+package twobulk
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"math/rand"
+
+	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
+)
+
+/*
+
+Data Structures
+
+*/
+
+type BSAstats struct {
+	// Core variant info
+	CHROM      string
+	POS        int64
+	REF        string
+	ALT        string
+	HighParGT  []int
+	LowParGT   []int
+	HighBulkGT []int
+	HighBulkAD string
+	LowBulkGT  []int
+	LowBulkAD  string
+
+	// Read counts
+	HighBulkL int // low allele reads in high bulk
+	HighBulkH int // high allele reads in high bulk
+	LowBulkL  int
+	LowBulkH  int
+
+	// Per-SNP stats - raw
+	HighSI  float64 // SNP-index high bulk
+	LowSI   float64 // SNP-index low bulk
+	DeltaSI float64 // HighSI - LowSI
+	Gstat   float64 // G-test statistic
+	ED      float64 // Euclidean distance ^4
+	BBLogBF float64 // Beta-Binomial Log Bayes Factor
+
+	// Per-SNP stats - smoothed
+	DeltaSIK float64 // Kernel-smoothed DeltaSI
+	Gprime   float64 // Tricube-smoothed G
+	EDK      float64 // Kernel-smoothed ED^4
+	BBK      float64 // Kernel-smoothed BBLogBF
+
+	// Additional tracks
+	EWMA    float64
+	CUSUM   float64
+	ScanLLR float64
+	SegMean float64
+}
+
+type QTL struct {
+	Chr        string
+	Start      int64
+	End        int64
+	Peak       int64
+	PeakGprime float64
+	PeakBBK    float64
+	PeakEDK    float64
+}
+
+type ScanWindow struct {
+	Chr      string
+	Center   int64
+	Start    int64
+	End      int64
+	SNPs     int
+	LLR      float64
+	HighProp float64
+	LowProp  float64
+}
+
+type Block struct {
+	Chr   string
+	Start int64
+	End   int64
+	AFD   float64
+	Z     float64
+	Sig   bool
+}
+
+/*
+
+Math Utilities
+
+*/
+
+func safeRatio(num, den int) float64 {
+	if den == 0 {
+		return 0
+	}
+	return float64(num) / float64(den)
+}
+
+func logBeta(a, b float64) float64 {
+	return math.Lgamma(a) + math.Lgamma(b) - math.Lgamma(a+b)
+}
+
+func biweight(x float64) float64 {
+	if x >= 1 {
+		return 0
+	}
+	t := 1 - x*x
+	return t * t
+}
+
+func tricube(x float64) float64 {
+	if x >= 1 {
+		return 0
+	}
+	return math.Pow(1-math.Pow(x, 3), 3)
+}
+
+/*
+
+BSA Statistics
+
+*/
+
+// G-test for 2x2 contingency table: high/low bulk vs alt/ref reads
+func GStatistic(highAlt, highRef, lowAlt, lowRef int) float64 {
+	hTot := float64(highAlt + highRef)
+	lTot := float64(lowAlt + lowRef)
+	tot := hTot + lTot
+	if hTot == 0 || lTot == 0 || tot == 0 {
+		return 0
+	}
+
+	expHA := hTot * float64(highAlt+lowAlt) / tot
+	expHR := hTot * float64(highRef+lowRef) / tot
+	expLA := lTot * float64(highAlt+lowAlt) / tot
+	expLR := lTot * float64(highRef+lowRef) / tot
+
+	g := 0.0
+	if highAlt > 0 && expHA > 0 {
+		g += float64(highAlt) * math.Log(float64(highAlt)/expHA)
+	}
+	if highRef > 0 && expHR > 0 {
+		g += float64(highRef) * math.Log(float64(highRef)/expHR)
+	}
+	if lowAlt > 0 && expLA > 0 {
+		g += float64(lowAlt) * math.Log(float64(lowAlt)/expLA)
+	}
+	if lowRef > 0 && expLR > 0 {
+		g += float64(lowRef) * math.Log(float64(lowRef)/expLR)
+	}
+	return 2 * g
+}
+
+// Euclidean distance ^4 per Hill et al. 2013 - amplifies QTL peaks
+func EuclideanDist(highSNP, lowSNP float64) float64 {
+	diff := highSNP - lowSNP
+	return math.Pow(diff*diff, 2)
+}
+
+// Beta-Binomial Log Bayes Factor with pool-size correction
+// Mansfeld & Grumet 2018 + dispersion from finite pools
+func BetaBinomialLogBayesFactor(highSucc, highFail, lowSucc, lowFail, N_high, N_low int) float64 {
+	if N_high <= 0 {
+		N_high = 1
+	}
+	if N_low <= 0 {
+		N_low = 1
+	}
+
+	// Jeffreys prior scaled by pool size: larger pool = tighter prior
+	alphaH := 0.5 * float64(N_high)
+	betaH := 0.5 * float64(N_high)
+	alphaL := 0.5 * float64(N_low)
+	betaL := 0.5 * float64(N_low)
+
+	// H1: bulks differ
+	logAlt := logBeta(alphaH+float64(highSucc), betaH+float64(highFail)) - logBeta(alphaH, betaH)
+	logAlt += logBeta(alphaL+float64(lowSucc), betaL+float64(lowFail)) - logBeta(alphaL, betaL)
+
+	// H0: bulks same, use mean pool size for prior
+	alpha0 := 0.5 * float64(N_high+N_low) / 2.0
+	beta0 := 0.5 * float64(N_high+N_low) / 2.0
+	logNull := logBeta(alpha0+float64(highSucc+lowSucc), beta0+float64(highFail+lowFail)) - logBeta(alpha0, beta0)
+
+	return logAlt - logNull
+}
+
+/*
+
+Variant Filtering
+
+*/
+
+func isHomozygous(gt []int) bool {
+	if len(gt) == 0 {
+		return false
+	}
+	for _, a := range gt[1:] {
+		if a != gt[0] {
+			return false
+		}
+	}
+	return true
+}
+
+func GTToString(gt []int) string {
+	if len(gt) == 0 {
+		return "./."
+	}
+	parts := make([]string, len(gt))
+	for i, allele := range gt {
+		if allele < 0 {
+			parts[i] = "."
+		} else {
+			parts[i] = strconv.Itoa(allele)
+		}
+	}
+	return strings.Join(parts, "/")
+}
+
+// Keep only biallelic SNPs where parents are homozygous + polymorphic
+// and all samples meet min depth
+func GoodVariants(v *vcfgo.Variant, hp, lp, hb, lb int, minDPs []int) bool {
+	if len(v.Alt()) != 1 {
+		return false
+	}
+	samples := []int{hp, lp, hb, lb}
+	for i, idx := range samples {
+		s := v.Samples[idx]
+		if len(s.GT) == 0 || s.DP < minDPs[i] {
+			return false
+		}
+		for _, a := range s.GT {
+			if a < 0 {
+				return false
+			}
+		}
+	}
+	hpGT := v.Samples[hp].GT
+	lpGT := v.Samples[lp].GT
+	return isHomozygous(hpGT) && isHomozygous(lpGT) && hpGT[0] != lpGT[0]
+}
+
+/*
+
+Smoothing & Signal Processing
+
+*/
+
+// Kernel smoothing for DeltaSI, ED, BB, G across a chromosome
+func smoothChromosome(snps []BSAstats, bandwidth int) {
+	if bandwidth <= 0 {
+		bandwidth = 1
+	}
+	for i := range snps {
+		center := snps[i].POS
+		var numD, numE, numBB, numG, denD, denE, denBB, denG float64
+
+		// Look backwards
+		for j := i; j >= 0; j-- {
+			d := float64(center - snps[j].POS)
+			if d > float64(bandwidth) {
+				break
+			}
+			x := d / float64(bandwidth)
+			wB := biweight(x)
+			wT := tricube(x)
+			numD += wB * snps[j].DeltaSI
+			numE += wB * snps[j].ED
+			numBB += wB * snps[j].BBLogBF
+			numG += wT * snps[j].Gstat
+			denD += wB
+			denE += wB
+			denBB += wB
+			denG += wT
+		}
+		// Look forwards
+		for j := i + 1; j < len(snps); j++ {
+			d := float64(snps[j].POS - center)
+			if d > float64(bandwidth) {
+				break
+			}
+			x := d / float64(bandwidth)
+			wB := biweight(x)
+			wT := tricube(x)
+			numD += wB * snps[j].DeltaSI
+			numE += wB * snps[j].ED
+			numBB += wB * snps[j].BBLogBF
+			numG += wT * snps[j].Gstat
+			denD += wB
+			denE += wB
+			denBB += wB
+			denG += wT
+		}
+
+		if denD > 0 {
+			snps[i].DeltaSIK = numD / denD
+			snps[i].EDK = numE / denE
+		}
+		if denBB > 0 {
+			snps[i].BBK = numBB / denBB
+		}
+		if denG > 0 {
+			snps[i].Gprime = numG / denG
+		}
+	}
+}
+
+func computeEWMA(snps []BSAstats, alpha float64) {
+	if len(snps) == 0 {
+		return
+	}
+	snps[0].EWMA = snps[0].DeltaSIK
+	for i := 1; i < len(snps); i++ {
+		snps[i].EWMA = alpha*snps[i].DeltaSIK + (1-alpha)*snps[i-1].EWMA
+	}
+}
+
+/*
+
+Threshold Simulation & QTL Calling
+
+*/
+
+// Permutation: shuffle bulk labels to build null distribution
+func simulateThresholds(snps []BSAstats, highN, lowN, windowSize, nPerm int) (float64, float64, float64) {
+	var gprimes, bbks, edks []float64
+	rand.Seed(time.Now().UnixNano())
+
+	for p := 0; p < nPerm; p++ {
+		shuffled := make([]BSAstats, len(snps))
+		copy(shuffled, snps)
+
+		// Randomly swap high/low bulk counts per SNP
+		for i := range shuffled {
+			if rand.Float64() < 0.5 {
+				shuffled[i].HighBulkH, shuffled[i].LowBulkH = shuffled[i].LowBulkH, shuffled[i].HighBulkH
+				shuffled[i].HighBulkL, shuffled[i].LowBulkL = shuffled[i].LowBulkL, shuffled[i].HighBulkL
+			}
+		}
+
+		// Recompute raw stats
+		for i := range shuffled {
+			hbH, hbL := shuffled[i].HighBulkH, shuffled[i].HighBulkL
+			lbH, lbL := shuffled[i].LowBulkH, shuffled[i].LowBulkL
+			hTot, lTot := hbH+hbL, lbH+lbL
+			if hTot > 0 && lTot > 0 {
+				hSI := float64(hbH) / float64(hTot)
+				lSI := float64(lbH) / float64(lTot)
+				shuffled[i].DeltaSI = hSI - lSI
+				shuffled[i].ED = EuclideanDist(hSI, lSI)
+				shuffled[i].Gstat = GStatistic(hbH, hbL, lbH, lbL)
+				shuffled[i].BBLogBF = BetaBinomialLogBayesFactor(hbH, hbL, lbH, lbL, highN, lowN)
+			}
+		}
+		smoothChromosome(shuffled, windowSize)
+
+		// Track max smoothed value per perm
+		maxG, maxBB, maxED := 0.0, 0.0, 0.0
+		for _, s := range shuffled {
+			if s.Gprime > maxG {
+				maxG = s.Gprime
+			}
+			if s.BBK > maxBB {
+				maxBB = s.BBK
+			}
+			if s.EDK > maxED {
+				maxED = s.EDK
+			}
+		}
+		gprimes = append(gprimes, maxG)
+		bbks = append(bbks, maxBB)
+		edks = append(edks, maxED)
+	}
+
+	sort.Float64s(gprimes)
+	sort.Float64s(bbks)
+	sort.Float64s(edks)
+	idx95 := int(0.95 * float64(nPerm))
+	return gprimes, bbks, edks
+}
+
+// Find QTL intervals where any stat crosses threshold
+func callQTLs(snps []BSAstats, gThresh, bbThresh, edThresh float64, mergeDist int64) []QTL {
+	var qtls []QTL
+	inQTL := false
+	var current QTL
+
+	for i, s := range snps {
+		sig := s.Gprime >= gThresh || s.BBK >= bbThresh || s.EDK >= edThresh
+
+		if sig && !inQTL {
+			inQTL = true
+			current = QTL{Chr: s.CHROM, Start: s.POS, Peak: s.POS,
+				PeakGprime: s.Gprime, PeakBBK: s.BBK, PeakEDK: s.EDK}
+		} else if sig && inQTL {
+			if s.Gprime > current.PeakGprime { // update peak to highest G'
+				current.Peak = s.POS
+				current.PeakGprime = s.Gprime
+				current.PeakBBK = s.BBK
+				current.PeakEDK = s.EDK
+			}
+		} else if !sig && inQTL {
+			current.End = snps[i-1].POS
+			qtls = append(qtls, current)
+			inQTL = false
+		}
+	}
+	if inQTL {
+		current.End = snps[len(snps)-1].POS
+		qtls = append(qtls, current)
+	}
+	return mergeQTLs(qtls, mergeDist)
+}
+
+func mergeQTLs(qtls []QTL, mergeDist int64) []QTL {
+	if len(qtls) <= 1 {
+		return qtls
+	}
+	sort.Slice(qtls, func(i, j int) bool {
+		if qtls[i].Chr == qtls[j].Chr {
+			return qtls[i].Start < qtls[j].Start
+		}
+		return qtls[i].Chr < qtls[j].Chr
+	})
+
+	merged := []QTL{qtls[0]}
+	for _, q := range qtls[1:] {
+		last := &merged[len(merged)-1]
+		if q.Chr == last.Chr && q.Start-last.End <= mergeDist {
+			last.End = q.End
+			if q.PeakGprime > last.PeakGprime {
+				last.Peak = q.Peak
+				last.PeakGprime = q.PeakGprime
+				last.PeakBBK = q.PeakBBK
+				last.PeakEDK = q.PeakEDK
+			}
+		} else {
+			merged = append(merged, q)
+		}
+	}
+	return merged
+}
+
+/*
+
+I/O & Pipeline Stages
+
+*/
+
+func stageStart(label string) time.Time {
+	color.New(color.FgCyan, color.Bold).Printf("\n[%s] Starting...\n", label)
+	return time.Now()
+}
+
+func stageDone(label string, start time.Time, format string, args ...interface{}) {
+	elapsed := time.Since(start).Round(time.Millisecond)
+	detail := ""
+	if format != "" {
+		detail = fmt.Sprintf(format, args...)
+	}
+	if detail != "" {
+		color.New(color.FgGreen).Printf("[%s] Done in %s. %s\n", label, elapsed, detail)
+		return
+	}
+	color.New(color.FgGreen).Printf("[%s] Done in %s.\n", label, elapsed)
+}
+
+// Main entry: run full two-bulk analysis
+func RunTwoBulks(vcfPath string, highPar, lowPar, highBulk, lowBulk int,
+	highParDP, lowParDP, highBulkDP, lowBulkDP int,
+	highBulkSize, lowBulkSize, windowSize int) error {
+
+	// 1. Read VCF and compute per-SNP stats
+	readStage := stageStart("VCF scan and per-SNP statistics")
+	stats, totalVariants, err := scanVCF(vcfPath, highPar, lowPar, highBulk, lowBulk,
+		[]int{highParDP, lowParDP, highBulkDP, lowBulkDP}, highBulkSize, lowBulkSize)
+	if err != nil {
+		return err
+	}
+	stageDone("VCF scan and per-SNP statistics", readStage,
+		"Scanned %d variants, retained %d informative SNPs", totalVariants, len(stats))
+
+	// 2. Group by chromosome and smooth
+	groupStage := stageStart("Chromosome grouping + smoothing")
+	byChr := groupByChromosome(stats)
+	for chr := range byChr {
+		smoothChromosome(byChr[chr], windowSize)
+		computeEWMA(byChr[chr], 0.3)
+	}
+	stageDone("Chromosome grouping + smoothing", groupStage, "Processed %d chromosomes", len(byChr))
+
+	// 3. Permutation thresholds
+	allSnps := flattenMap(byChr)
+	threshStage := stageStart("Permutation thresholds")
+	gThresh, bbThresh, edThresh := simulateThresholds(allSnps, highBulkSize, lowBulkSize, windowSize, 1000)
+	stageDone("Permutation thresholds", threshStage,
+		"G' 95%%=%.2f, BBK 95%%=%.2f, EDK 95%%=%.2f", gThresh, bbThresh, edThresh)
+
+	// 4. Call QTLs
+	qtlStage := stageStart("QTL calling")
+	var allQTLs []QTL
+	for chr, chrSnps := range byChr {
+		chrQTLs := callQTLs(chrSnps, gThresh, bbThresh, edThresh, 2_000_000)
+		allQTLs = append(allQTLs, chrQTLs...)
+	}
+	stageDone("QTL calling", qtlStage, "Found %d QTL intervals", len(allQTLs))
+
+	// 5. Write outputs
+	writeSnpsTSV(allSnps, "snps.tsv")
+	writeQTLsTSV(allQTLs, "predicted_qtls.tsv")
+
+	return nil
+}
+
+// Helper: scan VCF once, parallelized
+func scanVCF(path string, hp, lp, hb, lb int, minDPs []int, hbSize, lbSize int) ([]BSAstats, int, error) {
+	//... implementation: open VCF, worker pool, call GoodVariants,
+	// compute HighSI, LowSI, DeltaSI, Gstat, ED, BBLogBF per SNP...
+	// Return slice of BSAstats + total variant count
+	// Omitted for brevity - same logic as before, just calls new BBLogBF + ED^4
+	return nil, 0, nil // placeholder
+}
+
+func groupByChromosome(stats []BSAstats) map[string][]BSAstats {
+	byChr := map[string][]BSAstats{}
+	for _, s := range stats {
+		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+	}
+	return byChr
+}
+
+func flattenMap(byChr map[string][]BSAstats) []BSAstats {
+	var all []BSAstats
+	for _, v := range byChr {
+		all = append(all, v...)
+	}
+	return all
+}
+
+func writeSnpsTSV(snps []BSAstats, fname string) {
+	f, _ := os.Create(fname)
+	defer f.Close()
+	fmt.Fprintln(f, "CHR\tPOS\tSNPiH\tSNPiL\tDELTA\tDELTAK\tED\tEDK\tG\tGPRIME\tBBLOGBF\tBBK\tEWMA")
+	for _, s := range snps {
+		fmt.Fprintf(f, "%s\t%d\t%.4f\t%.6f\t%.6f\t%.2f\t%.4f\n",
+			s.CHROM, s.POS, s.HighSI, s.LowSI, s.DeltaSI, s.DeltaSIK,
+			s.ED, s.EDK, s.Gstat, s.Gprime, s.BBLogBF, s.BBK, s.EWMA)
+	}
+}
+
+func writeQTLsTSV(qtls []QTL, fname string) {
+	f, _ := os.Create(fname)
+	defer f.Close()
+	fmt.Fprintln(f, "CHR\tSTART\tEND\tPEAK\tPEAK_GPRIME\tPEAK_BBK\tPEAK_EDK")
+	for _, q := range qtls {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.2f\t%.4f\t%.6f\n",
+			q.Chr, q.Start, q.End, q.Peak, q.PeakGprime, q.PeakBBK, q.PeakEDK)
+	}
+}

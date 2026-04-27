@@ -10,10 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/brentp/vcfgo"
-	"github.com/fatih/color"
 )
 
 type Block struct {
@@ -45,12 +43,12 @@ type ChangePoint struct {
 }
 
 type BSAstats struct {
-	CHROM      string
-	POS        int64
-	REF        string
-	ALT        string
-	HighParGT  []int
-	LowParGT   []int
+	CHROM     string
+	POS       int64
+	REF       string
+	ALT       string
+	HighParGT []int
+	LowParGT  []int
 	HighBulkGT []int
 	HighBulkAD string
 	LowBulkGT  []int
@@ -83,24 +81,6 @@ type plotSeries struct {
 	Label  string
 	Color  string
 	Values []float64
-}
-
-func stageStart(label string) time.Time {
-	color.New(color.FgCyan, color.Bold).Printf("\n[%s] Starting...\n", label)
-	return time.Now()
-}
-
-func stageDone(label string, start time.Time, format string, args ...interface{}) {
-	elapsed := time.Since(start).Round(time.Millisecond)
-	detail := ""
-	if format != "" {
-		detail = fmt.Sprintf(format, args...)
-	}
-	if detail != "" {
-		color.New(color.FgGreen).Printf("[%s] Done in %s. %s\n", label, elapsed, detail)
-		return
-	}
-	color.New(color.FgGreen).Printf("[%s] Done in %s.\n", label, elapsed)
 }
 
 func GTToString(gt []int) string {
@@ -999,22 +979,12 @@ func writePlots(path string, byChr map[string][]BSAstats, blocks []Block, window
 }
 
 func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int, windowSize int) {
-	overallStart := time.Now()
-	color.New(color.FgHiWhite, color.Bold).Println("\n==================== TWO-BULK BSA ANALYSIS ====================")
-	fmt.Printf("Workers: %d | Kernel window: %d bp\n", runtime.NumCPU(), windowSize)
-	fmt.Printf("Parent depth thresholds: high=%d low=%d | Bulk depth thresholds: high=%d low=%d\n",
-		highParDP, lowParDP, highBulkDP, lowBulkDP)
-
 	variantChan := make(chan *vcfgo.Variant, 1000)
 
 	numWorkers := runtime.NumCPU()
 	var workerWG sync.WaitGroup
 	var mu sync.Mutex
 	var stats []BSAstats
-	var totalVariants int
-	var passedVariants int
-
-	readStage := stageStart("VCF scan and per-SNP statistics")
 
 	for i := 0; i < numWorkers; i++ {
 		workerWG.Add(1)
@@ -1100,7 +1070,6 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 				}
 
 				mu.Lock()
-				passedVariants++
 				stats = append(stats, stat)
 				mu.Unlock()
 			}
@@ -1108,22 +1077,16 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 	}
 
 	for variant := vcfRdr.Read(); variant != nil; variant = vcfRdr.Read() {
-		totalVariants++
 		variantChan <- variant
 	}
 	close(variantChan)
 	workerWG.Wait()
-	stageDone("VCF scan and per-SNP statistics", readStage,
-		"Scanned %d variants and retained %d informative SNPs.", totalVariants, passedVariants)
 
-	groupStage := stageStart("Chromosome grouping")
 	byChr := map[string][]BSAstats{}
 	for _, s := range stats {
 		byChr[s.CHROM] = append(byChr[s.CHROM], s)
 	}
-	stageDone("Chromosome grouping", groupStage, "Prepared %d chromosomes for downstream analysis.", len(byChr))
 
-	postStage := stageStart("Smoothing, scan statistics, and changepoints")
 	windowSizes := uniqueWindowSizes(windowSize)
 	var allScans []ScanWindow
 	var allChanges []ChangePoint
@@ -1138,12 +1101,7 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 		computeCUSUM(byChr[chr], 0.5)
 		allScans = append(allScans, scanChromosome(byChr[chr], windowSizes)...)
 		allChanges = append(allChanges, detectChangePoints(byChr[chr], 12)...)
-		fmt.Printf("  %-18s SNPs=%6d | scan peaks=%4d | changepoints=%3d\n",
-			chr, len(byChr[chr]), len(filterScansByChr(allScans, chr)), len(filterChangesByChr(allChanges, chr)))
 	}
-	stageDone("Smoothing, scan statistics, and changepoints", postStage,
-		"Computed adaptive windows %v, yielding %d scan peaks and %d changepoints.",
-		windowSizes, len(allScans), len(allChanges))
 
 	chroms := make([]string, 0, len(byChr))
 	for chr := range byChr {
@@ -1156,7 +1114,6 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 		allSnps = append(allSnps, byChr[chr]...)
 	}
 
-	snpWriteStage := stageStart("Write snps.tsv")
 	snpsOut, err := os.Create("snps.tsv")
 	if err != nil {
 		fmt.Printf("could not create snps.tsv: %v\n", err)
@@ -1171,9 +1128,7 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 			s.DeltaSI, s.DeltaSIK, s.ED, s.EDK, s.Gstat, s.Gprime,
 			s.BBLogBF, s.BBK, s.EWMA, s.CUSUM, s.ScanLLR, s.SegMean)
 	}
-	stageDone("Write snps.tsv", snpWriteStage, "Wrote %d SNP rows.", len(allSnps))
 
-	blockStage := stageStart("BRM blocks")
 	blocks := brmBlocks(allSnps, 100000, 3.0)
 	blkOut, err := os.Create("brm_blocks.tsv")
 	if err != nil {
@@ -1187,15 +1142,7 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 		fmt.Fprintf(blkOut, "%s\t%d\t%d\t%.4f\t%.2f\t%v\n",
 			b.Chr, b.Start, b.End, b.AFD, b.Z, b.Sig)
 	}
-	sigBlocks := 0
-	for _, block := range blocks {
-		if block.Sig {
-			sigBlocks++
-		}
-	}
-	stageDone("BRM blocks", blockStage, "Wrote %d blocks, %d of them significant.", len(blocks), sigBlocks)
 
-	reportStage := stageStart("Reports and plotting")
 	if err := writeScanWindows("scan_windows.tsv", allScans); err != nil {
 		fmt.Printf("could not create scan_windows.tsv: %v\n", err)
 	}
@@ -1205,10 +1152,4 @@ func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowP
 	if err := writePlots("plots.html", byChr, blocks, allScans, allChanges); err != nil {
 		fmt.Printf("could not create plots.html: %v\n", err)
 	}
-	stageDone("Reports and plotting", reportStage,
-		"Wrote scan_windows.tsv, changepoints.tsv, and plots.html.")
-
-	color.New(color.FgHiWhite, color.Bold).Printf("\nAnalysis complete in %s.\n", time.Since(overallStart).Round(time.Millisecond))
-	fmt.Printf("Summary: informative SNPs=%d | chromosomes=%d | scan peaks=%d | changepoints=%d | significant BRM blocks=%d\n",
-		len(allSnps), len(chroms), len(allScans), len(allChanges), sigBlocks)
 }
