@@ -7,7 +7,6 @@ import (
 	"os"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,33 +15,7 @@ import (
 	"github.com/fatih/color"
 )
 
-type Block struct {
-	Chr   string
-	Start int64
-	End   int64
-	AFD   float64
-	Z     float64
-	Sig   bool
-}
-
-type ScanWindow struct {
-	Chr      string
-	Center   int64
-	Start    int64
-	End      int64
-	SNPs     int
-	LLR      float64
-	HighProp float64
-	LowProp  float64
-}
-
-type ChangePoint struct {
-	Chr       string
-	Pos       int64
-	LeftMean  float64
-	RightMean float64
-	Score     float64
-}
+// --- Types ---
 
 type BSAstats struct {
 	CHROM      string
@@ -79,11 +52,325 @@ type BSAstats struct {
 	SegMean float64
 }
 
+type Block struct {
+	Chr   string
+	Start int64
+	End   int64
+	AFD   float64
+	Z     float64
+	Sig   bool
+}
+
+type ScanWindow struct {
+	Chr      string
+	Center   int64
+	Start    int64
+	End      int64
+	SNPs     int
+	LLR      float64
+	HighProp float64
+	LowProp  float64
+}
+
+type ChangePoint struct {
+	Chr       string
+	Pos       int64
+	LeftMean  float64
+	RightMean float64
+	Score     float64
+}
+
+type QTL struct {
+	Chr       string
+	Start     int64
+	End       int64
+	PeakPos   int64
+	PeakScore float64
+	Method    string
+}
+
 type plotSeries struct {
 	Label  string
 	Color  string
 	Values []float64
 }
+
+// --- Analysis Engine ---
+
+type Analyzer struct {
+	WindowSize int
+	HighPar    int
+	HighParDP  int
+	LowPar     int
+	LowParDP   int
+	HighBulk   int
+	HighBulkDP int
+	LowBulk    int
+	LowBulkDP  int
+
+	Stats      []BSAstats
+	ByChr      map[string][]BSAstats
+	Scans      []ScanWindow
+	Changes    []ChangePoint
+	Blocks     []Block
+	QTLs       []QTL
+}
+
+func NewAnalyzer(windowSize int) *Analyzer {
+	return &Analyzer{
+		WindowSize: windowSize,
+		ByChr:      make(map[string][]BSAstats),
+	}
+}
+
+func (a *Analyzer) Run(vcfRdr *vcfgo.Reader) {
+	overallStart := time.Now()
+	color.New(color.FgHiWhite, color.Bold).Println("\n==================== TWO-BULK BSA ANALYSIS ====================")
+	fmt.Printf("Workers: %d | Kernel window: %d bp\n", runtime.NumCPU(), a.WindowSize)
+
+	a.CollectStats(vcfRdr)
+	a.GroupAndSort()
+	a.ProcessChromosomes()
+	a.ComputeBlocks()
+	a.IdentifyQTLs()
+	a.WriteOutputs()
+
+	color.New(color.FgHiWhite, color.Bold).Printf("\nAnalysis complete in %s.\n", time.Since(overallStart).Round(time.Millisecond))
+}
+
+func (a *Analyzer) CollectStats(vcfRdr *vcfgo.Reader) {
+	stage := stageStart("VCF scan and per-SNP statistics")
+	var total, passed int
+	var mu sync.Mutex
+	variantChan := make(chan *vcfgo.Variant, 1000)
+	var wg sync.WaitGroup
+
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for v := range variantChan {
+				if !a.isInformative(v) {
+					continue
+				}
+				stat := a.computeSNPStats(v)
+				if stat != nil {
+					mu.Lock()
+					a.Stats = append(a.Stats, *stat)
+					passed++
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	for v := vcfRdr.Read(); v != nil; v = vcfRdr.Read() {
+		total++
+		variantChan <- v
+	}
+	close(variantChan)
+	wg.Wait()
+	stageDone("VCF scan and per-SNP statistics", stage, "Scanned %d variants, retained %d SNPs.", total, passed)
+}
+
+func (a *Analyzer) isInformative(v *vcfgo.Variant) bool {
+	if len(v.Alt()) != 1 {
+		return false
+	}
+	indices := []int{a.HighPar, a.LowPar, a.HighBulk, a.LowBulk}
+	for _, idx := range indices {
+		if idx >= len(v.Samples) || len(v.Samples[idx].GT) == 0 {
+			return false
+		}
+		for _, allele := range v.Samples[idx].GT {
+			if allele < 0 {
+				return false
+			}
+		}
+	}
+
+	hp := v.Samples[a.HighPar]
+	lp := v.Samples[a.LowPar]
+	hb := v.Samples[a.HighBulk]
+	lb := v.Samples[a.LowBulk]
+
+	if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) || hp.GT[0] == lp.GT[0] {
+		return false
+	}
+	if hp.DP < a.HighParDP || lp.DP < a.LowParDP || hb.DP < a.HighBulkDP || lb.DP < a.LowBulkDP {
+		return false
+	}
+	return true
+}
+
+func (a *Analyzer) computeSNPStats(v *vcfgo.Variant) *BSAstats {
+	hb := v.Samples[a.HighBulk]
+	lb := v.Samples[a.LowBulk]
+	if hb.DP == 0 || lb.DP == 0 {
+		return nil
+	}
+
+	hbRef, _ := hb.RefDepth()
+	hbAlts, _ := hb.AltDepths()
+	lbRef, _ := lb.RefDepth()
+	lbAlts, _ := lb.AltDepths()
+	if len(hbAlts) == 0 || len(lbAlts) == 0 {
+		return nil
+	}
+
+	lpGT := v.Samples[a.LowPar].GT
+	var hbL, hbH, lbL, lbH int
+	if hb.GT[0] == lpGT[0] {
+		hbL, hbH = hbRef, hbAlts[0]
+	} else {
+		hbL, hbH = hbAlts[0], hbRef
+	}
+	if lb.GT[0] == lpGT[0] {
+		lbL, lbH = lbRef, lbAlts[0]
+	} else {
+		lbL, lbH = lbAlts[0], lbRef
+	}
+
+	hSI := safeRatio(hbH, hb.DP)
+	lSI := safeRatio(lbH, lb.DP)
+	deltaSI := hSI - lSI
+
+	return &BSAstats{
+		CHROM:      v.Chromosome,
+		POS:        int64(v.Pos),
+		REF:        v.Reference,
+		ALT:        v.Alt()[0],
+		HighParGT:  v.Samples[a.HighPar].GT,
+		LowParGT:   v.Samples[a.LowPar].GT,
+		HighBulkGT: hb.GT,
+		HighBulkAD: fmt.Sprintf("%v,%v", hbRef, hbAlts[0]),
+		LowBulkGT:  lb.GT,
+		LowBulkAD:  fmt.Sprintf("%v,%v", lbRef, lbAlts[0]),
+		HighBulkL:  hbL,
+		HighBulkH:  hbH,
+		LowBulkL:   lbL,
+		LowBulkH:   lbH,
+		HighSI:     hSI,
+		LowSI:      lSI,
+		DeltaSI:    deltaSI,
+		Gstat:      GStatistic(hbAlts[0], hbRef, lbAlts[0], lbRef),
+		ED:         math.Pow(deltaSI, 4), // ED^4 update
+		BBLogBF:    BetaBinomialLogBayesFactor(hbH, hbL, lbH, lbL, 0.5, 0.5),
+	}
+}
+
+func (a *Analyzer) GroupAndSort() {
+	for _, s := range a.Stats {
+		a.ByChr[s.CHROM] = append(a.ByChr[s.CHROM], s)
+	}
+	for chr := range a.ByChr {
+		sort.Slice(a.ByChr[chr], func(i, j int) bool {
+			return a.ByChr[chr][i].POS < a.ByChr[chr][j].POS
+		})
+	}
+}
+
+func (a *Analyzer) ProcessChromosomes() {
+	stage := stageStart("Smoothing, scan statistics, and changepoints")
+	winSizes := uniqueWindowSizes(a.WindowSize)
+
+	for chr, snps := range a.ByChr {
+		smoothChromosome(snps, a.WindowSize)
+		computeEWMA(snps, 0.2)
+		computeCUSUM(snps, 0.5)
+		a.Scans = append(a.Scans, scanChromosome(snps, winSizes)...)
+		a.Changes = append(a.Changes, detectChangePoints(snps, 12)...)
+		fmt.Printf("  %-18s SNPs=%6d | scan peaks=%4d | changepoints=%3d\n",
+			chr, len(snps), len(filterScansByChr(a.Scans, chr)), len(filterChangesByChr(a.Changes, chr)))
+	}
+	stageDone("Smoothing, scan statistics, and changepoints", stage, "Processed %d chromosomes.", len(a.ByChr))
+}
+
+func (a *Analyzer) ComputeBlocks() {
+	a.Blocks = brmBlocks(a.Stats, 100000, 3.0)
+}
+
+func (a *Analyzer) IdentifyQTLs() {
+	// Simple QTL identification based on Gprime and EDK thresholds
+	// For Gprime, use a threshold of 5.0 (approx p < 0.01)
+	// For EDK, we use a top percentile or fixed threshold.
+	const gThresh = 5.0
+	const edThresh = 0.05 // Example threshold for ED^4
+
+	for chr, snps := range a.ByChr {
+		// Identify contiguous regions above Gprime threshold
+		inQTL := false
+		var currentQTL QTL
+		for _, s := range snps {
+			if s.Gprime >= gThresh {
+				if !inQTL {
+					inQTL = true
+					currentQTL = QTL{Chr: chr, Start: s.POS, Method: "Gprime"}
+					currentQTL.PeakScore = s.Gprime
+					currentQTL.PeakPos = s.POS
+				} else {
+					if s.Gprime > currentQTL.PeakScore {
+						currentQTL.PeakScore = s.Gprime
+						currentQTL.PeakPos = s.POS
+					}
+				}
+				currentQTL.End = s.POS
+			} else {
+				if inQTL {
+					a.QTLs = append(a.QTLs, currentQTL)
+					inQTL = false
+				}
+			}
+		}
+		if inQTL {
+			a.QTLs = append(a.QTLs, currentQTL)
+		}
+
+		// Identify regions above ED^4 threshold
+		inQTL = false
+		for _, s := range snps {
+			if s.EDK >= edThresh {
+				if !inQTL {
+					inQTL = true
+					currentQTL = QTL{Chr: chr, Start: s.POS, Method: "ED4"}
+					currentQTL.PeakScore = s.EDK
+					currentQTL.PeakPos = s.POS
+				} else {
+					if s.EDK > currentQTL.PeakScore {
+						currentQTL.PeakScore = s.EDK
+						currentQTL.PeakPos = s.POS
+					}
+				}
+				currentQTL.End = s.POS
+			} else {
+				if inQTL {
+					a.QTLs = append(a.QTLs, currentQTL)
+					inQTL = false
+				}
+			}
+		}
+		if inQTL {
+			a.QTLs = append(a.QTLs, currentQTL)
+		}
+	}
+}
+
+func (a *Analyzer) WriteOutputs() {
+	// snps.tsv
+	writeSNPs("snps.tsv", a.Stats)
+	// brm_blocks.tsv
+	writeBlocks("brm_blocks.tsv", a.Blocks)
+	// scan_windows.tsv
+	writeScanWindows("scan_windows.tsv", a.Scans)
+	// changepoints.tsv
+	writeChangePoints("changepoints.tsv", a.Changes)
+	// qtls.tsv
+	writeQTLs("qtls.tsv", a.QTLs)
+	// plots.html
+	writePlots("plots.html", a.ByChr, a.Blocks, a.Scans, a.Changes)
+}
+
+// --- Helper Functions (Consolidated/Reduced) ---
 
 func stageStart(label string) time.Time {
 	color.New(color.FgCyan, color.Bold).Printf("\n[%s] Starting...\n", label)
@@ -103,115 +390,13 @@ func stageDone(label string, start time.Time, format string, args ...interface{}
 	color.New(color.FgGreen).Printf("[%s] Done in %s.\n", label, elapsed)
 }
 
-func GTToString(gt []int) string {
-	if len(gt) == 0 {
-		return "./."
-	}
-
-	parts := make([]string, len(gt))
-	for i, allele := range gt {
-		if allele < 0 {
-			parts[i] = "."
-		} else {
-			parts[i] = strconv.Itoa(allele)
-		}
-	}
-
-	return strings.Join(parts, "/")
-}
-
 func isHomozygous(gt []int) bool {
-	if len(gt) == 0 {
-		return false
-	}
 	for _, a := range gt[1:] {
 		if a != gt[0] {
 			return false
 		}
 	}
 	return true
-}
-
-func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
-	highBulkTotal := float64(highBulkAlt + highBulkRef)
-	lowBulkTotal := float64(lowBulkAlt + lowBulkRef)
-	total := highBulkTotal + lowBulkTotal
-
-	if highBulkTotal == 0 || lowBulkTotal == 0 || total == 0 {
-		return 0
-	}
-
-	expHighAlt := highBulkTotal * float64(highBulkAlt+lowBulkAlt) / total
-	expHighRef := highBulkTotal * float64(highBulkRef+lowBulkRef) / total
-	expLowAlt := lowBulkTotal * float64(highBulkAlt+lowBulkAlt) / total
-	expLowRef := lowBulkTotal * float64(highBulkRef+lowBulkRef) / total
-
-	g := 0.0
-	if highBulkAlt > 0 && expHighAlt > 0 {
-		g += float64(highBulkAlt) * math.Log(float64(highBulkAlt)/expHighAlt)
-	}
-	if highBulkRef > 0 && expHighRef > 0 {
-		g += float64(highBulkRef) * math.Log(float64(highBulkRef)/expHighRef)
-	}
-	if lowBulkAlt > 0 && expLowAlt > 0 {
-		g += float64(lowBulkAlt) * math.Log(float64(lowBulkAlt)/expLowAlt)
-	}
-	if lowBulkRef > 0 && expLowRef > 0 {
-		g += float64(lowBulkRef) * math.Log(float64(lowBulkRef)/expLowRef)
-	}
-
-	return 2 * g
-}
-
-func EuclideanDist(highSNP, lowSNP float64) float64 {
-	diff := highSNP - lowSNP
-	return math.Sqrt(diff * diff)
-}
-
-func GoodVariants(v *vcfgo.Variant, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int) bool {
-	indices := []int{highPar, lowPar, highBulk, lowBulk}
-	if len(v.Alt()) != 1 {
-		return false
-	}
-
-	for _, idx := range indices {
-		s := v.Samples[idx]
-		if len(s.GT) == 0 {
-			return false
-		}
-		for _, allele := range s.GT {
-			if allele < 0 {
-				return false
-			}
-		}
-	}
-
-	hpGT := v.Samples[highPar].GT
-	lpGT := v.Samples[lowPar].GT
-
-	hpDP := v.Samples[highPar].DP
-	lpDP := v.Samples[lowPar].DP
-	hbDP := v.Samples[highBulk].DP
-	lbDP := v.Samples[lowBulk].DP
-
-	if !isHomozygous(hpGT) || !isHomozygous(lpGT) {
-		return false
-	}
-	if hpGT[0] == lpGT[0] {
-		return false
-	}
-	if hpDP < highParDP || lpDP < lowParDP || hbDP < highBulkDP || lbDP < lowBulkDP {
-		return false
-	}
-
-	return true
-}
-
-func logBeta(a, b float64) float64 {
-	lga, _ := math.Lgamma(a)
-	lgb, _ := math.Lgamma(b)
-	lgab, _ := math.Lgamma(a + b)
-	return lga + lgb - lgab
 }
 
 func safeRatio(num, den int) float64 {
@@ -221,165 +406,123 @@ func safeRatio(num, den int) float64 {
 	return float64(num) / float64(den)
 }
 
-func xlogy(count int, p float64) float64 {
-	if count == 0 {
+func GStatistic(hAlt, hRef, lAlt, lRef int) float64 {
+	hTot := float64(hAlt + hRef)
+	lTot := float64(lAlt + lRef)
+	tot := hTot + lTot
+	if hTot == 0 || lTot == 0 {
 		return 0
 	}
-	if p <= 0 {
-		return math.Inf(-1)
-	}
-	if p >= 1 {
-		if count > 0 {
-			return 0
+
+	expHAlt := hTot * float64(hAlt+lAlt) / tot
+	expHRef := hTot * float64(hRef+lRef) / tot
+	expLAlt := lTot * float64(hAlt+lAlt) / tot
+	expLRef := lTot * float64(hRef+lRef) / tot
+
+	g := 0.0
+	term := func(obs int, exp float64) {
+		if obs > 0 && exp > 0 {
+			g += float64(obs) * math.Log(float64(obs)/exp)
 		}
-		return math.Inf(-1)
 	}
-	return float64(count) * math.Log(p)
+	term(hAlt, expHAlt)
+	term(hRef, expHRef)
+	term(lAlt, expLAlt)
+	term(lRef, expLRef)
+	return 2 * g
 }
 
-func binomialLogLikelihood(success, total int) float64 {
-	if total == 0 {
-		return 0
+func BetaBinomialLogBayesFactor(hS, hF, lS, lF int, alpha, beta float64) float64 {
+	lBeta := func(a, b float64) float64 {
+		ga, _ := math.Lgamma(a)
+		gb, _ := math.Lgamma(b)
+		gab, _ := math.Lgamma(a + b)
+		return ga + gb - gab
 	}
-	p := safeRatio(success, total)
-	return xlogy(success, p) + xlogy(total-success, 1-p)
-}
-
-func binomialLLR(highSuccess, highTotal, lowSuccess, lowTotal int) float64 {
-	if highTotal == 0 || lowTotal == 0 {
-		return 0
-	}
-	combinedSuccess := highSuccess + lowSuccess
-	combinedTotal := highTotal + lowTotal
-
-	llAlt := binomialLogLikelihood(highSuccess, highTotal) + binomialLogLikelihood(lowSuccess, lowTotal)
-	llNull := binomialLogLikelihood(combinedSuccess, combinedTotal)
-	if math.IsInf(llAlt, -1) || math.IsInf(llNull, -1) {
-		return 0
-	}
-
-	llr := 2 * (llAlt - llNull)
-	if llr < 0 {
-		return 0
-	}
-	return llr
-}
-
-func BetaBinomialLogBayesFactor(highSuccess, highFail, lowSuccess, lowFail int, alpha, beta float64) float64 {
-	logPriorNorm := logBeta(alpha, beta)
-	logAlt := logBeta(alpha+float64(highSuccess), beta+float64(highFail)) - logPriorNorm
-	logAlt += logBeta(alpha+float64(lowSuccess), beta+float64(lowFail)) - logPriorNorm
-
-	logNull := logBeta(alpha+float64(highSuccess+lowSuccess), beta+float64(highFail+lowFail)) - logPriorNorm
+	logPrior := lBeta(alpha, beta)
+	logAlt := (lBeta(alpha+float64(hS), beta+float64(hF)) - logPrior) + (lBeta(alpha+float64(lS), beta+float64(lF)) - logPrior)
+	logNull := lBeta(alpha+float64(hS+lS), beta+float64(hF+lF)) - logPrior
 	return logAlt - logNull
-}
-
-func biweight(x float64) float64 {
-	if x >= 1 {
-		return 0
-	}
-	t := 1 - x*x
-	return t * t
-}
-
-func tricube(x float64) float64 {
-	if x >= 1 {
-		return 0
-	}
-	return math.Pow(1-math.Pow(x, 3), 3)
 }
 
 func smoothChromosome(snps []BSAstats, bandwidth int) {
 	if bandwidth <= 0 {
 		bandwidth = 1
 	}
+	biweight := func(x float64) float64 {
+		if x >= 1 {
+			return 0
+		}
+		t := 1 - x*x
+		return t * t
+	}
+	tricube := func(x float64) float64 {
+		if x >= 1 {
+			return 0
+		}
+		return math.Pow(1-math.Pow(x, 3), 3)
+	}
 
 	for i := range snps {
 		center := snps[i].POS
-		var numD, numE, numG, numBB float64
-		var denD, denE, denG, denBB float64
+		var nD, nE, nG, nBB, dD, dE, dG, dBB float64
 
+		// Search backwards
 		for j := i; j >= 0; j-- {
-			d := float64(center - snps[j].POS)
-			if d > float64(bandwidth) {
+			dist := float64(center - snps[j].POS)
+			if dist > float64(bandwidth) {
 				break
 			}
-			x := d / float64(bandwidth)
+			x := dist / float64(bandwidth)
 			wB := biweight(x)
 			wT := tricube(x)
 
-			numD += wB * snps[j].DeltaSI
-			numE += wB * snps[j].ED
-			numBB += wB * snps[j].BBLogBF
-			numG += wT * snps[j].Gstat
-			denD += wB
-			denE += wB
-			denBB += wB
-			denG += wT
+			nD += wB * snps[j].DeltaSI
+			nE += wB * snps[j].ED
+			nBB += wB * snps[j].BBLogBF
+			nG += wT * snps[j].Gstat
+			dD += wB
+			dE += wB
+			dBB += wB
+			dG += wT
 		}
-
+		// Search forwards
 		for j := i + 1; j < len(snps); j++ {
-			d := float64(snps[j].POS - center)
-			if d > float64(bandwidth) {
+			dist := float64(snps[j].POS - center)
+			if dist > float64(bandwidth) {
 				break
 			}
-			x := d / float64(bandwidth)
+			x := dist / float64(bandwidth)
 			wB := biweight(x)
 			wT := tricube(x)
 
-			numD += wB * snps[j].DeltaSI
-			numE += wB * snps[j].ED
-			numBB += wB * snps[j].BBLogBF
-			numG += wT * snps[j].Gstat
-			denD += wB
-			denE += wB
-			denBB += wB
-			denG += wT
+			nD += wB * snps[j].DeltaSI
+			nE += wB * snps[j].ED
+			nBB += wB * snps[j].BBLogBF
+			nG += wT * snps[j].Gstat
+			dD += wB
+			dE += wB
+			dBB += wB
+			dG += wT
 		}
 
-		if denD > 0 {
-			snps[i].DeltaSIK = numD / denD
-			snps[i].EDK = numE / denE
+		if dD > 0 {
+			snps[i].DeltaSIK = nD / dD
+			snps[i].EDK = nE / dE
 		}
-		if denBB > 0 {
-			snps[i].BBK = numBB / denBB
+		if dBB > 0 {
+			snps[i].BBK = nBB / dBB
 		}
-		if denG > 0 {
-			snps[i].Gprime = numG / denG
+		if dG > 0 {
+			snps[i].Gprime = nG / dG
 		}
 	}
-}
-
-func meanStdFromStats(snps []BSAstats, pick func(BSAstats) float64) (float64, float64) {
-	if len(snps) == 0 {
-		return 0, 0
-	}
-
-	sum := 0.0
-	for _, s := range snps {
-		sum += pick(s)
-	}
-	mean := sum / float64(len(snps))
-
-	var ss float64
-	for _, s := range snps {
-		d := pick(s) - mean
-		ss += d * d
-	}
-	if len(snps) == 1 {
-		return mean, 0
-	}
-	return mean, math.Sqrt(ss / float64(len(snps)-1))
 }
 
 func computeEWMA(snps []BSAstats, alpha float64) {
 	if len(snps) == 0 {
 		return
 	}
-	if alpha <= 0 || alpha >= 1 {
-		alpha = 0.2
-	}
-
 	snps[0].EWMA = snps[0].DeltaSI
 	for i := 1; i < len(snps); i++ {
 		snps[i].EWMA = alpha*snps[i].DeltaSI + (1-alpha)*snps[i-1].EWMA
@@ -390,20 +533,22 @@ func computeCUSUM(snps []BSAstats, reference float64) {
 	if len(snps) == 0 {
 		return
 	}
-
-	mean, sd := meanStdFromStats(snps, func(s BSAstats) float64 { return s.DeltaSI })
+	var sum float64
+	for _, s := range snps {
+		sum += s.DeltaSI
+	}
+	mean := sum / float64(len(snps))
+	var ss float64
+	for _, s := range snps {
+		d := s.DeltaSI - mean
+		ss += d * d
+	}
+	sd := math.Sqrt(ss / float64(len(snps)))
 	if sd == 0 {
-		for i := range snps {
-			snps[i].CUSUM = 0
-		}
 		return
 	}
-	if reference <= 0 {
-		reference = 0.5
-	}
 
-	pos := 0.0
-	neg := 0.0
+	pos, neg := 0.0, 0.0
 	for i := range snps {
 		x := (snps[i].DeltaSI - mean) / sd
 		pos = math.Max(0, pos+x-reference)
@@ -417,23 +562,20 @@ func computeCUSUM(snps []BSAstats, reference float64) {
 }
 
 func brmBlocks(snps []BSAstats, blockSize int64, zThresh float64) []Block {
-	byChr := map[string][]BSAstats{}
+	byChr := make(map[string][]BSAstats)
 	for _, s := range snps {
 		byChr[s.CHROM] = append(byChr[s.CHROM], s)
 	}
 
 	var blocks []Block
 	for chr, list := range byChr {
-		sort.Slice(list, func(i, j int) bool {
-			return list[i].POS < list[j].POS
-		})
-
+		sort.Slice(list, func(i, j int) bool { return list[i].POS < list[j].POS })
 		for i := 0; i < len(list); {
 			start := list[i].POS
 			end := start + blockSize
 			var sum float64
 			var n int
-
+			blockStartIdx := i
 			for i < len(list) && list[i].POS < end {
 				sum += list[i].DeltaSI
 				n++
@@ -442,473 +584,238 @@ func brmBlocks(snps []BSAstats, blockSize int64, zThresh float64) []Block {
 			if n == 0 {
 				continue
 			}
-
 			afd := sum / float64(n)
 			var variance float64
-			blockStart := i - n
-			for k := blockStart; k < i; k++ {
+			for k := blockStartIdx; k < i; k++ {
 				diff := list[k].DeltaSI - afd
 				variance += diff * diff
 			}
-
 			z := 0.0
 			if n > 1 {
-				stddev := math.Sqrt(variance / float64(n-1))
-				if stddev > 0 {
-					z = afd / (stddev / math.Sqrt(float64(n)))
+				std := math.Sqrt(variance / float64(n-1))
+				if std > 0 {
+					z = afd / (std / math.Sqrt(float64(n)))
 				}
 			}
-
-			blocks = append(blocks, Block{
-				Chr:   chr,
-				Start: start,
-				End:   end,
-				AFD:   afd,
-				Z:     z,
-				Sig:   math.Abs(z) >= zThresh,
-			})
+			blocks = append(blocks, Block{Chr: chr, Start: start, End: end, AFD: afd, Z: z, Sig: math.Abs(z) >= zThresh})
 		}
 	}
-
 	return blocks
 }
 
-func uniqueWindowSizes(windowSize int) []int64 {
-	if windowSize <= 0 {
-		windowSize = 1
-	}
-
-	candidates := []int64{
-		int64(maxInt(windowSize/4, 10000)),
-		int64(maxInt(windowSize/2, 25000)),
-		int64(windowSize),
-	}
-
-	seen := map[int64]bool{}
-	var sizes []int64
-	for _, size := range candidates {
-		if size <= 0 || seen[size] {
-			continue
-		}
-		seen[size] = true
-		sizes = append(sizes, size)
-	}
-	sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
-	return sizes
-}
-
 func scanChromosome(snps []BSAstats, windowSizes []int64) []ScanWindow {
-	if len(snps) == 0 {
+	n := len(snps)
+	if n < 2 {
 		return nil
 	}
-
-	n := len(snps)
-	positions := make([]int64, n)
-	highSuccess := make([]int, n+1)
-	highTotal := make([]int, n+1)
-	lowSuccess := make([]int, n+1)
-	lowTotal := make([]int, n+1)
-
+	pos := make([]int64, n)
+	hS, hT, lS, lT := make([]int, n+1), make([]int, n+1), make([]int, n+1), make([]int, n+1)
 	for i, s := range snps {
-		positions[i] = s.POS
-		highSuccess[i+1] = highSuccess[i] + s.HighBulkH
-		highTotal[i+1] = highTotal[i] + s.HighBulkH + s.HighBulkL
-		lowSuccess[i+1] = lowSuccess[i] + s.LowBulkH
-		lowTotal[i+1] = lowTotal[i] + s.LowBulkH + s.LowBulkL
+		pos[i] = s.POS
+		hS[i+1] = hS[i] + s.HighBulkH
+		hT[i+1] = hT[i] + s.HighBulkH + s.HighBulkL
+		lS[i+1] = lS[i] + s.LowBulkH
+		lT[i+1] = lT[i] + s.LowBulkH + s.LowBulkL
 	}
 
-	bestWindows := make([]ScanWindow, n)
+	bestWin := make([]ScanWindow, n)
 	for i, s := range snps {
 		best := ScanWindow{Chr: s.CHROM, Center: s.POS}
-
 		for _, size := range windowSizes {
-			half := size / 2
-			leftPos := s.POS - half
-			rightPos := s.POS + half
-
-			left := sort.Search(n, func(j int) bool { return positions[j] >= leftPos })
-			right := sort.Search(n, func(j int) bool { return positions[j] > rightPos })
-			if right-left < 2 {
+			lPos, rPos := s.POS-size/2, s.POS+size/2
+			lIdx := sort.Search(n, func(j int) bool { return pos[j] >= lPos })
+			rIdx := sort.Search(n, func(j int) bool { return pos[j] > rPos })
+			if rIdx-lIdx < 2 {
 				continue
 			}
-
-			hSucc := highSuccess[right] - highSuccess[left]
-			hTot := highTotal[right] - highTotal[left]
-			lSucc := lowSuccess[right] - lowSuccess[left]
-			lTot := lowTotal[right] - lowTotal[left]
+			hSucc, hTot := hS[rIdx]-hS[lIdx], hT[rIdx]-hT[lIdx]
+			lSucc, lTot := lS[rIdx]-lS[lIdx], lT[rIdx]-lT[lIdx]
 			llr := binomialLLR(hSucc, hTot, lSucc, lTot)
-
 			if llr > best.LLR {
-				best = ScanWindow{
-					Chr:      s.CHROM,
-					Center:   s.POS,
-					Start:    positions[left],
-					End:      positions[right-1],
-					SNPs:     right - left,
-					LLR:      llr,
-					HighProp: safeRatio(hSucc, hTot),
-					LowProp:  safeRatio(lSucc, lTot),
-				}
+				best = ScanWindow{Chr: s.CHROM, Center: s.POS, Start: pos[lIdx], End: pos[rIdx-1], SNPs: rIdx - lIdx, LLR: llr, HighProp: safeRatio(hSucc, hTot), LowProp: safeRatio(lSucc, lTot)}
 			}
 		}
-
 		snps[i].ScanLLR = best.LLR
-		bestWindows[i] = best
+		bestWin[i] = best
 	}
 
-	unique := map[string]ScanWindow{}
-	for i, win := range bestWindows {
-		if win.LLR <= 0 {
+	var windows []ScanWindow
+	for i, w := range bestWin {
+		if w.LLR <= 0 {
 			continue
 		}
-		leftOK := i == 0 || bestWindows[i].LLR >= bestWindows[i-1].LLR
-		rightOK := i == len(bestWindows)-1 || bestWindows[i].LLR >= bestWindows[i+1].LLR
-		if !leftOK || !rightOK {
-			continue
-		}
-
-		key := fmt.Sprintf("%s:%d:%d", win.Chr, win.Start, win.End)
-		if prior, ok := unique[key]; !ok || win.LLR > prior.LLR {
-			unique[key] = win
+		if (i == 0 || w.LLR >= bestWin[i-1].LLR) && (i == n-1 || w.LLR >= bestWin[i+1].LLR) {
+			windows = append(windows, w)
 		}
 	}
-
-	windows := make([]ScanWindow, 0, len(unique))
-	for _, win := range unique {
-		windows = append(windows, win)
-	}
-	sort.Slice(windows, func(i, j int) bool {
-		if windows[i].Chr != windows[j].Chr {
-			return windows[i].Chr < windows[j].Chr
-		}
-		if windows[i].LLR != windows[j].LLR {
-			return windows[i].LLR > windows[j].LLR
-		}
-		return windows[i].Start < windows[j].Start
-	})
-
 	return windows
 }
 
-func detectChangePoints(snps []BSAstats, minSize int) []ChangePoint {
-	if len(snps) == 0 {
-		return nil
+func binomialLLR(hS, hT, lS, lT int) float64 {
+	if hT == 0 || lT == 0 {
+		return 0
 	}
-	if minSize < 5 {
-		minSize = 5
-	}
-
-	values := make([]float64, len(snps))
-	for i, s := range snps {
-		values[i] = s.DeltaSIK
-		if values[i] == 0 {
-			values[i] = s.DeltaSI
-		}
-	}
-
-	sum := make([]float64, len(values)+1)
-	sumSq := make([]float64, len(values)+1)
-	for i, v := range values {
-		sum[i+1] = sum[i] + v
-		sumSq[i+1] = sumSq[i] + v*v
-	}
-
-	segmentMean := func(lo, hi int) float64 {
-		if hi <= lo {
+	logL := func(s, t int) float64 {
+		if t == 0 {
 			return 0
 		}
-		return (sum[hi] - sum[lo]) / float64(hi-lo)
+		p := float64(s) / float64(t)
+		res := 0.0
+		if s > 0 && p > 0 {
+			res += float64(s) * math.Log(p)
+		}
+		if t-s > 0 && 1-p > 0 {
+			res += float64(t-s) * math.Log(1-p)
+		}
+		return res
 	}
-	segmentSSE := func(lo, hi int) float64 {
+	llAlt := logL(hS, hT) + logL(lS, lT)
+	llNull := logL(hS+lS, hT+lT)
+	return math.Max(0, 2*(llAlt-llNull))
+}
+
+func detectChangePoints(snps []BSAstats, minSize int) []ChangePoint {
+	n := len(snps)
+	if n < 2*minSize {
+		return nil
+	}
+	vals := make([]float64, n)
+	for i, s := range snps {
+		vals[i] = s.DeltaSIK
+	}
+	sum, sumSq := make([]float64, n+1), make([]float64, n+1)
+	for i, v := range vals {
+		sum[i+1], sumSq[i+1] = sum[i]+v, sumSq[i]+v*v
+	}
+	sse := func(lo, hi int) float64 {
 		if hi-lo <= 1 {
 			return 0
 		}
-		total := sum[hi] - sum[lo]
-		totalSq := sumSq[hi] - sumSq[lo]
-		return totalSq - (total*total)/float64(hi-lo)
+		s, s2 := sum[hi]-sum[lo], sumSq[hi]-sumSq[lo]
+		return s2 - (s*s)/float64(hi-lo)
 	}
 
-	_, sd := meanStdFromStats(snps, func(s BSAstats) float64 { return s.DeltaSIK })
-	if sd == 0 {
-		_, sd = meanStdFromStats(snps, func(s BSAstats) float64 { return s.DeltaSI })
+	var ssTotal float64
+	m := sum[n] / float64(n)
+	for _, v := range vals {
+		ssTotal += (v - m) * (v - m)
 	}
-	penalty := math.Max(0.02, 2*sd*sd*math.Log(float64(len(values))+1))
+	sd := math.Sqrt(ssTotal / float64(n))
+	penalty := math.Max(0.02, 2*sd*sd*math.Log(float64(n)+1))
 
 	var cps []int
-	var split func(lo, hi int)
+	var split func(int, int)
 	split = func(lo, hi int) {
 		if hi-lo < 2*minSize {
 			return
 		}
-
-		base := segmentSSE(lo, hi)
-		bestIdx := -1
-		bestGain := 0.0
-
+		base, bestIdx, bestGain := sse(lo, hi), -1, 0.0
 		for k := lo + minSize; k <= hi-minSize; k++ {
-			gain := base - segmentSSE(lo, k) - segmentSSE(k, hi)
+			gain := base - sse(lo, k) - sse(k, hi)
 			if gain > bestGain {
-				bestGain = gain
-				bestIdx = k
+				bestGain, bestIdx = gain, k
 			}
 		}
-
-		if bestIdx == -1 || bestGain < penalty {
-			return
+		if bestIdx != -1 && bestGain > penalty {
+			cps = append(cps, bestIdx)
+			split(lo, bestIdx)
+			split(bestIdx, hi)
 		}
-
-		cps = append(cps, bestIdx)
-		split(lo, bestIdx)
-		split(bestIdx, hi)
 	}
-	split(0, len(values))
-
+	split(0, n)
 	sort.Ints(cps)
-	bounds := make([]int, 0, len(cps)+2)
-	bounds = append(bounds, 0)
-	bounds = append(bounds, cps...)
-	bounds = append(bounds, len(values))
 
-	means := make([]float64, 0, len(bounds)-1)
+	bounds := append([]int{0}, cps...)
+	bounds = append(bounds, n)
+	var changes []ChangePoint
 	for i := 0; i < len(bounds)-1; i++ {
-		lo := bounds[i]
-		hi := bounds[i+1]
-		mean := segmentMean(lo, hi)
-		means = append(means, mean)
+		lo, hi := bounds[i], bounds[i+1]
+		mean := (sum[hi] - sum[lo]) / float64(hi-lo)
 		for j := lo; j < hi; j++ {
 			snps[j].SegMean = mean
 		}
+		if i < len(bounds)-2 {
+			cpIdx := bounds[i+1]
+			nextMean := (sum[bounds[i+2]] - sum[bounds[i+1]]) / float64(bounds[i+2]-bounds[i+1])
+			changes = append(changes, ChangePoint{Chr: snps[cpIdx].CHROM, Pos: snps[cpIdx].POS, LeftMean: mean, RightMean: nextMean, Score: math.Abs(nextMean - mean)})
+		}
 	}
-
-	changes := make([]ChangePoint, 0, len(cps))
-	for i, cp := range cps {
-		changes = append(changes, ChangePoint{
-			Chr:       snps[cp].CHROM,
-			Pos:       snps[cp].POS,
-			LeftMean:  means[i],
-			RightMean: means[i+1],
-			Score:     math.Abs(means[i+1] - means[i]),
-		})
-	}
-
 	return changes
 }
 
-func maxInt(a, b int) int {
-	if a > b {
-		return a
+func uniqueWindowSizes(base int) []int64 {
+	sizes := []int64{int64(base / 4), int64(base / 2), int64(base)}
+	m := make(map[int64]bool)
+	var res []int64
+	for _, s := range sizes {
+		if s > 0 && !m[s] {
+			m[s], res = true, append(res, s)
+		}
 	}
-	return b
+	sort.Slice(res, func(i, j int) bool { return res[i] < res[j] })
+	return res
 }
 
-func buildSeries(snps []BSAstats, label, color string, pick func(BSAstats) float64) plotSeries {
-	values := make([]float64, len(snps))
-	for i, s := range snps {
-		values[i] = pick(s)
-	}
-	return plotSeries{Label: label, Color: color, Values: values}
-}
-
-func finiteMinMax(series []plotSeries) (float64, float64) {
-	minVal := math.Inf(1)
-	maxVal := math.Inf(-1)
-
-	for _, line := range series {
-		for _, v := range line.Values {
-			if math.IsNaN(v) || math.IsInf(v, 0) {
-				continue
-			}
-			if v < minVal {
-				minVal = v
-			}
-			if v > maxVal {
-				maxVal = v
-			}
+func filterScansByChr(scans []ScanWindow, chr string) []ScanWindow {
+	var res []ScanWindow
+	for _, s := range scans {
+		if s.Chr == chr {
+			res = append(res, s)
 		}
 	}
-
-	if math.IsInf(minVal, 1) || math.IsInf(maxVal, -1) {
-		return -1, 1
-	}
-	if minVal == maxVal {
-		padding := math.Max(1, math.Abs(minVal)*0.25)
-		return minVal - padding, maxVal + padding
-	}
-
-	padding := (maxVal - minVal) * 0.1
-	if padding == 0 {
-		padding = 1
-	}
-	return minVal - padding, maxVal + padding
-}
-
-func polylinePoints(positions []int64, values []float64, minX, maxX int64, minY, maxY float64, width, height int, margin float64) string {
-	var points []string
-	xSpan := float64(maxX - minX)
-	if xSpan == 0 {
-		xSpan = 1
-	}
-	ySpan := maxY - minY
-	if ySpan == 0 {
-		ySpan = 1
-	}
-
-	plotWidth := float64(width) - 2*margin
-	plotHeight := float64(height) - 2*margin
-
-	for i, pos := range positions {
-		v := values[i]
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			continue
-		}
-		x := margin + (float64(pos-minX)/xSpan)*plotWidth
-		y := float64(height) - margin - ((v-minY)/ySpan)*plotHeight
-		points = append(points, fmt.Sprintf("%.2f,%.2f", x, y))
-	}
-
-	return strings.Join(points, " ")
-}
-
-func drawPlot(title string, snps []BSAstats, series []plotSeries, blocks []Block, windows []ScanWindow, changes []ChangePoint) string {
-	const width = 1100
-	const height = 280
-	const margin = 48.0
-
-	if len(snps) == 0 {
-		return ""
-	}
-
-	positions := make([]int64, len(snps))
-	for i, s := range snps {
-		positions[i] = s.POS
-	}
-
-	minX := positions[0]
-	maxX := positions[len(positions)-1]
-	minY, maxY := finiteMinMax(series)
-
-	xSpan := float64(maxX - minX)
-	if xSpan == 0 {
-		xSpan = 1
-	}
-	ySpan := maxY - minY
-	if ySpan == 0 {
-		ySpan = 1
-	}
-	plotWidth := float64(width) - 2*margin
-	plotHeight := float64(height) - 2*margin
-	scaleX := func(pos int64) float64 {
-		return margin + (float64(pos-minX)/xSpan)*plotWidth
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "<div class=\"plot\"><div class=\"plot-title\">%s</div>", html.EscapeString(title))
-	fmt.Fprintf(&b, "<svg viewBox=\"0 0 %d %d\" role=\"img\" aria-label=\"%s\">", width, height, html.EscapeString(title))
-	fmt.Fprintf(&b, "<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#ffffff\"/>", width, height)
-
-	for _, block := range blocks {
-		if !block.Sig {
-			continue
-		}
-		x := scaleX(block.Start)
-		w := scaleX(block.End) - x
-		if w < 1 {
-			w = 1
-		}
-		fmt.Fprintf(&b, "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#dcfce7\" opacity=\"0.45\"/>", x, margin, w, plotHeight)
-	}
-
-	for i, win := range windows {
-		if i >= 5 {
-			break
-		}
-		x := scaleX(win.Start)
-		w := scaleX(win.End) - x
-		if w < 1 {
-			w = 1
-		}
-		fmt.Fprintf(&b, "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#fde68a\" opacity=\"0.22\"/>", x, margin, w, plotHeight)
-	}
-
-	fmt.Fprintf(&b, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>", margin, margin, margin, float64(height)-margin)
-	fmt.Fprintf(&b, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#cbd5e1\" stroke-width=\"1\"/>", margin, float64(height)-margin, float64(width)-margin, float64(height)-margin)
-	fmt.Fprintf(&b, "<text x=\"%.2f\" y=\"18\" fill=\"#334155\" font-size=\"12\">%.3f</text>", margin, maxY)
-	fmt.Fprintf(&b, "<text x=\"%.2f\" y=\"%d\" fill=\"#334155\" font-size=\"12\">%.3f</text>", margin, height-10, minY)
-	fmt.Fprintf(&b, "<text x=\"%.2f\" y=\"%d\" fill=\"#334155\" font-size=\"12\">%d</text>", margin, height-10, minX)
-	fmt.Fprintf(&b, "<text x=\"%.2f\" y=\"%d\" fill=\"#334155\" font-size=\"12\" text-anchor=\"end\">%d</text>", float64(width)-margin, height-10, maxX)
-
-	for _, cp := range changes {
-		x := scaleX(cp.Pos)
-		fmt.Fprintf(&b, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#7c3aed\" stroke-dasharray=\"5 4\" stroke-width=\"1.25\" opacity=\"0.75\"/>", x, margin, x, float64(height)-margin)
-	}
-
-	for _, line := range series {
-		points := polylinePoints(positions, line.Values, minX, maxX, minY, maxY, width, height, margin)
-		if points == "" {
-			continue
-		}
-		fmt.Fprintf(&b, "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"2\" points=\"%s\"/>", line.Color, points)
-	}
-
-	legendX := margin
-	legendY := 28.0
-	for _, line := range series {
-		fmt.Fprintf(&b, "<rect x=\"%.2f\" y=\"%.2f\" width=\"10\" height=\"10\" fill=\"%s\" rx=\"2\"/>", legendX, legendY-9, line.Color)
-		fmt.Fprintf(&b, "<text x=\"%.2f\" y=\"%.2f\" fill=\"#0f172a\" font-size=\"12\">%s</text>", legendX+16, legendY, html.EscapeString(line.Label))
-		legendX += 110
-	}
-
-	fmt.Fprintf(&b, "</svg></div>")
-	return b.String()
-}
-
-func filterBlocksByChr(blocks []Block, chr string) []Block {
-	var filtered []Block
-	for _, block := range blocks {
-		if block.Chr == chr {
-			filtered = append(filtered, block)
-		}
-	}
-	return filtered
-}
-
-func filterScansByChr(windows []ScanWindow, chr string) []ScanWindow {
-	var filtered []ScanWindow
-	for _, win := range windows {
-		if win.Chr == chr {
-			filtered = append(filtered, win)
-		}
-	}
-	sort.Slice(filtered, func(i, j int) bool {
-		if filtered[i].LLR != filtered[j].LLR {
-			return filtered[i].LLR > filtered[j].LLR
-		}
-		return filtered[i].Start < filtered[j].Start
-	})
-	return filtered
+	return res
 }
 
 func filterChangesByChr(changes []ChangePoint, chr string) []ChangePoint {
-	var filtered []ChangePoint
-	for _, change := range changes {
-		if change.Chr == chr {
-			filtered = append(filtered, change)
+	var res []ChangePoint
+	for _, c := range changes {
+		if c.Chr == chr {
+			res = append(res, c)
 		}
 	}
-	return filtered
+	return res
 }
 
-func writeScanWindows(path string, windows []ScanWindow) error {
+func filterBlocksByChr(blocks []Block, chr string) []Block {
+	var res []Block
+	for _, b := range blocks {
+		if b.Chr == chr {
+			res = append(res, b)
+		}
+	}
+	return res
+}
+
+// --- IO Functions ---
+
+func writeSNPs(path string, stats []BSAstats) {
+	f, _ := os.Create(path)
+	defer f.Close()
+	fmt.Fprintln(f, "CHR\tPOS\tSNPiH\tSNPiL\tDELTA\tDELTAK\tED\tEDK\tG\tGPRIME\tBBLOGBF\tBBK\tEWMA\tCUSUM\tSCANLLR\tSEGMEAN")
+	for _, s := range stats {
+		fmt.Fprintf(f, "%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n",
+			s.CHROM, s.POS, s.HighSI, s.LowSI, s.DeltaSI, s.DeltaSIK, s.ED, s.EDK, s.Gstat, s.Gprime, s.BBLogBF, s.BBK, s.EWMA, s.CUSUM, s.ScanLLR, s.SegMean)
+	}
+}
+
+func writeBlocks(path string, blocks []Block) {
+	f, _ := os.Create(path)
+	defer f.Close()
+	fmt.Fprintln(f, "CHR\tSTART\tEND\tAFD\tZ\tSIGNIFICANT")
+	for _, b := range blocks {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%.4f\t%.2f\t%v\n", b.Chr, b.Start, b.End, b.AFD, b.Z, b.Sig)
+	}
+}
+
+func writeScanWindows(path string, scans []ScanWindow) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	fmt.Fprintln(f, "CHR\tCENTER\tSTART\tEND\tSNPS\tLLR\tHIGHPROP\tLOWPROP")
-	for _, win := range windows {
-		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\n",
-			win.Chr, win.Center, win.Start, win.End, win.SNPs, win.LLR, win.HighProp, win.LowProp)
+	for _, w := range scans {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%d\t%.4f\t%.4f\t%.4f\n", w.Chr, w.Center, w.Start, w.End, w.SNPs, w.LLR, w.HighProp, w.LowProp)
 	}
 	return nil
 }
@@ -919,16 +826,35 @@ func writeChangePoints(path string, changes []ChangePoint) error {
 		return err
 	}
 	defer f.Close()
-
 	fmt.Fprintln(f, "CHR\tPOS\tLEFTMEAN\tRIGHTMEAN\tSHIFT")
-	for _, change := range changes {
-		fmt.Fprintf(f, "%s\t%d\t%.4f\t%.4f\t%.4f\n",
-			change.Chr, change.Pos, change.LeftMean, change.RightMean, change.Score)
+	for _, c := range changes {
+		fmt.Fprintf(f, "%s\t%d\t%.4f\t%.4f\t%.4f\n", c.Chr, c.Pos, c.LeftMean, c.RightMean, c.Score)
 	}
 	return nil
 }
 
-func writePlots(path string, byChr map[string][]BSAstats, blocks []Block, windows []ScanWindow, changes []ChangePoint) error {
+func writeQTLs(path string, qtls []QTL) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Fprintln(f, "CHR\tSTART\tEND\tPEAK_POS\tPEAK_SCORE\tMETHOD")
+	for _, q := range qtls {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.4f\t%s\n", q.Chr, q.Start, q.End, q.PeakPos, q.PeakScore, q.Method)
+	}
+	return nil
+}
+
+func buildSeries(snps []BSAstats, label, color string, pick func(BSAstats) float64) plotSeries {
+	vals := make([]float64, len(snps))
+	for i, s := range snps {
+		vals[i] = pick(s)
+	}
+	return plotSeries{Label: label, Color: color, Values: vals}
+}
+
+func writePlots(path string, byChr map[string][]BSAstats, blocks []Block, scans []ScanWindow, changes []ChangePoint) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -941,274 +867,115 @@ func writePlots(path string, byChr map[string][]BSAstats, blocks []Block, window
 	}
 	sort.Strings(chroms)
 
-	fmt.Fprintln(f, "<!doctype html>")
-	fmt.Fprintln(f, "<html><head><meta charset=\"utf-8\"><title>GoBSAseq report</title>")
-	fmt.Fprintln(f, "<style>")
-	fmt.Fprintln(f, "body{font-family:Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:24px;} h1,h2{margin:0 0 12px;} p{color:#334155;} .section{margin:24px 0 40px;} .grid{display:grid;grid-template-columns:1fr;gap:18px;} .plot{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:12px;box-shadow:0 1px 2px rgba(15,23,42,.05);} .plot-title{font-weight:600;margin-bottom:8px;} table{border-collapse:collapse;margin-top:12px;width:100%;background:#fff;} th,td{border:1px solid #e2e8f0;padding:6px 8px;text-align:left;font-size:12px;} th{background:#f1f5f9;} code{background:#e2e8f0;padding:1px 4px;border-radius:4px;}")
-	fmt.Fprintln(f, "</style></head><body>")
-	fmt.Fprintln(f, "<h1>GoBSAseq two-bulk report</h1>")
-	fmt.Fprintln(f, "<p>Tracks include the original BSA statistics plus a beta-binomial Bayes factor, EWMA and CUSUM control-chart signals, a scan-statistic log-likelihood ratio, and changepoint-derived segment means.</p>")
+	fmt.Fprintln(f, "<!doctype html><html><head><meta charset=\"utf-8\"><title>GoBSAseq report</title><style>body{font-family:Arial,sans-serif;background:#f8fafc;color:#0f172a;margin:24px;} .section{margin:24px 0 40px;} .plot{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:12px;box-shadow:0 1px 2px rgba(15,23,42,.05);margin-bottom:12px;} .plot-title{font-weight:600;margin-bottom:8px;} table{border-collapse:collapse;width:100%;background:#fff;} th,td{border:1px solid #e2e8f0;padding:6px 8px;text-align:left;font-size:12px;} th{background:#f1f5f9;}</style></head><body><h1>GoBSAseq two-bulk report</h1>")
 
 	for _, chr := range chroms {
 		snps := byChr[chr]
-		chrBlocks := filterBlocksByChr(blocks, chr)
-		chrScans := filterScansByChr(windows, chr)
-		chrChanges := filterChangesByChr(changes, chr)
-
-		fmt.Fprintf(f, "<div class=\"section\"><h2>%s</h2><p>%d SNPs, %d scan peaks, %d changepoints.</p><div class=\"grid\">",
-			html.EscapeString(chr), len(snps), len(chrScans), len(chrChanges))
+		fmt.Fprintf(f, "<div class=\"section\"><h2>%s</h2>", html.EscapeString(chr))
 
 		deltaPlot := []plotSeries{
 			buildSeries(snps, "Delta", "#94a3b8", func(s BSAstats) float64 { return s.DeltaSI }),
 			buildSeries(snps, "Smoothed Delta", "#2563eb", func(s BSAstats) float64 { return s.DeltaSIK }),
 			buildSeries(snps, "Segment Mean", "#7c3aed", func(s BSAstats) float64 { return s.SegMean }),
 		}
-		fmt.Fprintln(f, drawPlot("Delta-oriented signals", snps, deltaPlot, chrBlocks, nil, chrChanges))
+		fmt.Fprintln(f, drawPlot("Delta-oriented signals", snps, deltaPlot, filterBlocksByChr(blocks, chr), nil, filterChangesByChr(changes, chr)))
 
 		evidencePlot := []plotSeries{
 			buildSeries(snps, "G-prime", "#dc2626", func(s BSAstats) float64 { return s.Gprime }),
 			buildSeries(snps, "BB smooth", "#0f766e", func(s BSAstats) float64 { return s.BBK }),
 			buildSeries(snps, "Scan LLR", "#d97706", func(s BSAstats) float64 { return s.ScanLLR }),
 		}
-		fmt.Fprintln(f, drawPlot("Evidence tracks", snps, evidencePlot, chrBlocks, chrScans, chrChanges))
+		fmt.Fprintln(f, drawPlot("Evidence tracks", snps, evidencePlot, filterBlocksByChr(blocks, chr), filterScansByChr(scans, chr), filterChangesByChr(changes, chr)))
 
 		controlPlot := []plotSeries{
-			buildSeries(snps, "ED smooth", "#059669", func(s BSAstats) float64 { return s.EDK }),
+			buildSeries(snps, "ED4 smooth", "#059669", func(s BSAstats) float64 { return s.EDK }),
 			buildSeries(snps, "EWMA", "#0891b2", func(s BSAstats) float64 { return s.EWMA }),
 			buildSeries(snps, "CUSUM", "#ea580c", func(s BSAstats) float64 { return s.CUSUM }),
 		}
-		fmt.Fprintln(f, drawPlot("Control and distance tracks", snps, controlPlot, chrBlocks, nil, chrChanges))
-
-		if len(chrScans) > 0 {
-			fmt.Fprintln(f, "<table><thead><tr><th>Top scan windows</th><th>Start</th><th>End</th><th>SNPs</th><th>LLR</th><th>High prop</th><th>Low prop</th></tr></thead><tbody>")
-			for i, win := range chrScans {
-				if i >= 10 {
-					break
-				}
-				fmt.Fprintf(f, "<tr><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%.4f</td><td>%.4f</td><td>%.4f</td></tr>",
-					i+1, win.Start, win.End, win.SNPs, win.LLR, win.HighProp, win.LowProp)
-			}
-			fmt.Fprintln(f, "</tbody></table>")
-		}
-
-		fmt.Fprintln(f, "</div></div>")
+		fmt.Fprintln(f, drawPlot("Control and distance tracks", snps, controlPlot, filterBlocksByChr(blocks, chr), nil, filterChangesByChr(changes, chr)))
+		fmt.Fprintln(f, "</div>")
 	}
-
 	fmt.Fprintln(f, "</body></html>")
 	return nil
 }
 
-func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int, windowSize int) {
-	overallStart := time.Now()
-	color.New(color.FgHiWhite, color.Bold).Println("\n==================== TWO-BULK BSA ANALYSIS ====================")
-	fmt.Printf("Workers: %d | Kernel window: %d bp\n", runtime.NumCPU(), windowSize)
-	fmt.Printf("Parent depth thresholds: high=%d low=%d | Bulk depth thresholds: high=%d low=%d\n",
-		highParDP, lowParDP, highBulkDP, lowBulkDP)
+func drawPlot(title string, snps []BSAstats, series []plotSeries, blocks []Block, windows []ScanWindow, changes []ChangePoint) string {
+	const (
+		width  = 1100
+		height = 280
+		margin = 48.0
+	)
+	if len(snps) == 0 {
+		return ""
+	}
 
-	variantChan := make(chan *vcfgo.Variant, 1000)
-
-	numWorkers := runtime.NumCPU()
-	var workerWG sync.WaitGroup
-	var mu sync.Mutex
-	var stats []BSAstats
-	var totalVariants int
-	var passedVariants int
-
-	readStage := stageStart("VCF scan and per-SNP statistics")
-
-	for i := 0; i < numWorkers; i++ {
-		workerWG.Add(1)
-
-		go func() {
-			defer workerWG.Done()
-
-			for variant := range variantChan {
-				if !GoodVariants(
-					variant,
-					highPar, highParDP,
-					lowPar, lowParDP,
-					highBulk, highBulkDP,
-					lowBulk, lowBulkDP,
-				) {
-					continue
+	minX, maxX := snps[0].POS, snps[len(snps)-1].POS
+	minY, maxY := math.Inf(1), math.Inf(-1)
+	for _, s := range series {
+		for _, v := range s.Values {
+			if !math.IsNaN(v) && !math.IsInf(v, 0) {
+				if v < minY {
+					minY = v
 				}
-
-				lpGT := variant.Samples[lowPar].GT
-				hbGT := variant.Samples[highBulk].GT
-				lbGT := variant.Samples[lowBulk].GT
-
-				hbDP := variant.Samples[highBulk].DP
-				lbDP := variant.Samples[lowBulk].DP
-				if hbDP == 0 || lbDP == 0 {
-					continue
+				if v > maxY {
+					maxY = v
 				}
-
-				hbRefDep, _ := variant.Samples[highBulk].RefDepth()
-				hbAltDeps, _ := variant.Samples[highBulk].AltDepths()
-				lbRefDep, _ := variant.Samples[lowBulk].RefDepth()
-				lbAltDeps, _ := variant.Samples[lowBulk].AltDepths()
-
-				if len(hbAltDeps) == 0 || len(lbAltDeps) == 0 {
-					continue
-				}
-
-				var hbL, hbH, lbL, lbH int
-				if hbGT[0] == lpGT[0] {
-					hbL = hbRefDep
-					hbH = hbAltDeps[0]
-				} else {
-					hbL = hbAltDeps[0]
-					hbH = hbRefDep
-				}
-
-				if lbGT[0] == lpGT[0] {
-					lbL = lbRefDep
-					lbH = lbAltDeps[0]
-				} else {
-					lbL = lbAltDeps[0]
-					lbH = lbRefDep
-				}
-
-				hSI := safeRatio(hbH, hbDP)
-				lSI := safeRatio(lbH, lbDP)
-				deltaSI := hSI - lSI
-				gstat := GStatistic(hbAltDeps[0], hbRefDep, lbAltDeps[0], lbRefDep)
-				ed := EuclideanDist(float64(hbL), float64(lbL))
-				bbLogBF := BetaBinomialLogBayesFactor(hbH, hbL, lbH, lbL, 0.5, 0.5)
-
-				stat := BSAstats{
-					CHROM:      variant.Chromosome,
-					POS:        int64(variant.Pos),
-					REF:        variant.Reference,
-					ALT:        variant.Alt()[0],
-					HighParGT:  variant.Samples[highPar].GT,
-					LowParGT:   variant.Samples[lowPar].GT,
-					HighBulkGT: variant.Samples[highBulk].GT,
-					HighBulkAD: fmt.Sprintf("%v,%v", hbRefDep, hbAltDeps[0]),
-					LowBulkGT:  variant.Samples[lowBulk].GT,
-					LowBulkAD:  fmt.Sprintf("%v,%v", lbRefDep, lbAltDeps[0]),
-					HighBulkL:  hbL,
-					HighBulkH:  hbH,
-					LowBulkL:   lbL,
-					LowBulkH:   lbH,
-					HighSI:     hSI,
-					LowSI:      lSI,
-					DeltaSI:    deltaSI,
-					Gstat:      gstat,
-					ED:         ed,
-					BBLogBF:    bbLogBF,
-				}
-
-				mu.Lock()
-				passedVariants++
-				stats = append(stats, stat)
-				mu.Unlock()
 			}
-		}()
-	}
-
-	for variant := vcfRdr.Read(); variant != nil; variant = vcfRdr.Read() {
-		totalVariants++
-		variantChan <- variant
-	}
-	close(variantChan)
-	workerWG.Wait()
-	stageDone("VCF scan and per-SNP statistics", readStage,
-		"Scanned %d variants and retained %d informative SNPs.", totalVariants, passedVariants)
-
-	groupStage := stageStart("Chromosome grouping")
-	byChr := map[string][]BSAstats{}
-	for _, s := range stats {
-		byChr[s.CHROM] = append(byChr[s.CHROM], s)
-	}
-	stageDone("Chromosome grouping", groupStage, "Prepared %d chromosomes for downstream analysis.", len(byChr))
-
-	postStage := stageStart("Smoothing, scan statistics, and changepoints")
-	windowSizes := uniqueWindowSizes(windowSize)
-	var allScans []ScanWindow
-	var allChanges []ChangePoint
-
-	for chr := range byChr {
-		sort.Slice(byChr[chr], func(i, j int) bool {
-			return byChr[chr][i].POS < byChr[chr][j].POS
-		})
-
-		smoothChromosome(byChr[chr], windowSize)
-		computeEWMA(byChr[chr], 0.2)
-		computeCUSUM(byChr[chr], 0.5)
-		allScans = append(allScans, scanChromosome(byChr[chr], windowSizes)...)
-		allChanges = append(allChanges, detectChangePoints(byChr[chr], 12)...)
-		fmt.Printf("  %-18s SNPs=%6d | scan peaks=%4d | changepoints=%3d\n",
-			chr, len(byChr[chr]), len(filterScansByChr(allScans, chr)), len(filterChangesByChr(allChanges, chr)))
-	}
-	stageDone("Smoothing, scan statistics, and changepoints", postStage,
-		"Computed adaptive windows %v, yielding %d scan peaks and %d changepoints.",
-		windowSizes, len(allScans), len(allChanges))
-
-	chroms := make([]string, 0, len(byChr))
-	for chr := range byChr {
-		chroms = append(chroms, chr)
-	}
-	sort.Strings(chroms)
-
-	var allSnps []BSAstats
-	for _, chr := range chroms {
-		allSnps = append(allSnps, byChr[chr]...)
-	}
-
-	snpWriteStage := stageStart("Write snps.tsv")
-	snpsOut, err := os.Create("snps.tsv")
-	if err != nil {
-		fmt.Printf("could not create snps.tsv: %v\n", err)
-		return
-	}
-	defer snpsOut.Close()
-
-	fmt.Fprintln(snpsOut, "CHR\tPOS\tSNPiH\tSNPiL\tDELTA\tDELTAK\tED\tEDK\tG\tGPRIME\tBBLOGBF\tBBK\tEWMA\tCUSUM\tSCANLLR\tSEGMEAN")
-	for _, s := range allSnps {
-		fmt.Fprintf(snpsOut, "%s\t%d\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.2f\t%.2f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\n",
-			s.CHROM, s.POS, s.HighSI, s.LowSI,
-			s.DeltaSI, s.DeltaSIK, s.ED, s.EDK, s.Gstat, s.Gprime,
-			s.BBLogBF, s.BBK, s.EWMA, s.CUSUM, s.ScanLLR, s.SegMean)
-	}
-	stageDone("Write snps.tsv", snpWriteStage, "Wrote %d SNP rows.", len(allSnps))
-
-	blockStage := stageStart("BRM blocks")
-	blocks := brmBlocks(allSnps, 100000, 3.0)
-	blkOut, err := os.Create("brm_blocks.tsv")
-	if err != nil {
-		fmt.Printf("could not create brm_blocks.tsv: %v\n", err)
-		return
-	}
-	defer blkOut.Close()
-
-	fmt.Fprintln(blkOut, "CHR\tSTART\tEND\tAFD\tZ\tSIGNIFICANT")
-	for _, b := range blocks {
-		fmt.Fprintf(blkOut, "%s\t%d\t%d\t%.4f\t%.2f\t%v\n",
-			b.Chr, b.Start, b.End, b.AFD, b.Z, b.Sig)
-	}
-	sigBlocks := 0
-	for _, block := range blocks {
-		if block.Sig {
-			sigBlocks++
 		}
 	}
-	stageDone("BRM blocks", blockStage, "Wrote %d blocks, %d of them significant.", len(blocks), sigBlocks)
+	if math.IsInf(minY, 1) {
+		minY, maxY = -1, 1
+	}
+	pad := (maxY - minY) * 0.1
+	if pad == 0 {
+		pad = 1
+	}
+	minY, maxY = minY-pad, maxY+pad
 
-	reportStage := stageStart("Reports and plotting")
-	if err := writeScanWindows("scan_windows.tsv", allScans); err != nil {
-		fmt.Printf("could not create scan_windows.tsv: %v\n", err)
-	}
-	if err := writeChangePoints("changepoints.tsv", allChanges); err != nil {
-		fmt.Printf("could not create changepoints.tsv: %v\n", err)
-	}
-	if err := writePlots("plots.html", byChr, blocks, allScans, allChanges); err != nil {
-		fmt.Printf("could not create plots.html: %v\n", err)
-	}
-	stageDone("Reports and plotting", reportStage,
-		"Wrote scan_windows.tsv, changepoints.tsv, and plots.html.")
+	scaleX := func(p int64) float64 { return margin + float64(p-minX)/float64(maxX-minX)*(width-2*margin) }
+	scaleY := func(v float64) float64 { return height - margin - (v-minY)/(maxY-minY)*(height-2*margin) }
 
-	color.New(color.FgHiWhite, color.Bold).Printf("\nAnalysis complete in %s.\n", time.Since(overallStart).Round(time.Millisecond))
-	fmt.Printf("Summary: informative SNPs=%d | chromosomes=%d | scan peaks=%d | changepoints=%d | significant BRM blocks=%d\n",
-		len(allSnps), len(chroms), len(allScans), len(allChanges), sigBlocks)
+	var b strings.Builder
+	fmt.Fprintf(&b, "<div class=\"plot\"><div class=\"plot-title\">%s</div><svg viewBox=\"0 0 %d %d\">", html.EscapeString(title), width, height)
+	fmt.Fprintf(&b, "<rect x=\"0\" y=\"0\" width=\"%d\" height=\"%d\" fill=\"#fff\"/>", width, height)
+
+	for _, blk := range blocks {
+		if blk.Sig {
+			x := scaleX(blk.Start)
+			w := scaleX(blk.End) - x
+			fmt.Fprintf(&b, "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#dcfce7\" opacity=\"0.4\"/>", x, margin, math.Max(1, w), height-2*margin)
+		}
+	}
+	for i, w := range windows {
+		if i < 5 {
+			x := scaleX(w.Start)
+			fmt.Fprintf(&b, "<rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"#fde68a\" opacity=\"0.2\"/>", x, margin, math.Max(1, scaleX(w.End)-x), height-2*margin)
+		}
+	}
+	for _, cp := range changes {
+		x := scaleX(cp.Pos)
+		fmt.Fprintf(&b, "<line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"#7c3aed\" stroke-dasharray=\"5 4\" opacity=\"0.6\"/>", x, margin, x, height-margin)
+	}
+
+	for _, s := range series {
+		var pts []string
+		for i, v := range s.Values {
+			if !math.IsNaN(v) && !math.IsInf(v, 0) {
+				pts = append(pts, fmt.Sprintf("%.2f,%.2f", scaleX(snps[i].POS), scaleY(v)))
+			}
+		}
+		fmt.Fprintf(&b, "<polyline fill=\"none\" stroke=\"%s\" stroke-width=\"1.5\" points=\"%s\"/>", s.Color, strings.Join(pts, " "))
+	}
+	fmt.Fprintf(&b, "</svg></div>")
+	return b.String()
+}
+
+// RunTwoBulkTwoParents is the entry point, now using the Analyzer struct
+func RunTwoBulkTwoParents(vcfRdr *vcfgo.Reader, highPar int, highParDP int, lowPar int, lowParDP int, highBulk int, highBulkDP int, lowBulk int, lowBulkDP int, windowSize int) {
+	a := NewAnalyzer(windowSize)
+	a.HighPar, a.HighParDP = highPar, highParDP
+	a.LowPar, a.LowParDP = lowPar, lowParDP
+	a.HighBulk, a.HighBulkDP = highBulk, highBulkDP
+	a.LowBulk, a.LowBulkDP = lowBulk, lowBulkDP
+	a.Run(vcfRdr)
 }
