@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/brentp/vcfgo"
@@ -40,7 +41,7 @@ func openVCF(path string) (io.Reader, func(), error) {
 	return f, cleanup, nil
 }
 
-func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int) error {
+func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
 	fmt.Printf("VCF: %s\n", vcf)
 	fmt.Printf("High Parent Depth: %d\n", highParentDepth)
 	fmt.Printf("Low Parent Depth: %d\n", lowParentDepth)
@@ -52,6 +53,13 @@ func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int
 	fmt.Printf("Low Bulk Size: %d\n", lowBulkSize)
 	fmt.Printf("One Bulk Size: %d\n", oneBulkSize)
 	fmt.Printf("Window Size: %d\n", windowSize)
+	fmt.Printf("Population: %s\n", population)
+	fmt.Printf("Recurrent: %v\n", recurrent)
+	fmt.Printf("Simulations: %d\n", rep)
+	fmt.Printf("Alpha: %v\n", alpha)
+	fmt.Printf("Min QTL Length: %d\n", minQTL)
+	fmt.Printf("Merge Distance: %d\n", mergeDist)
+	fmt.Printf("Output Dir/Prefix: %s\n", outputDir)
 
 	color.Cyan("\n========================================== SAMPLE SELECTION =================================================\n\n")
 
@@ -137,6 +145,27 @@ func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int
 	lowBulk := sampleNamesDic[lowBulkChoice]
 	fmt.Printf("LOW bulk is: %s \n\n", lowBulk)
 
+	// Ensure output directory exists
+	if outputDir != "" {
+		dir := filepath.Dir(outputDir)
+		if dir != "." {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create output directory: %w", err)
+			}
+		}
+	}
+
+	config := twobulk.AnalysisConfig{
+		Population:       twobulk.PopulationType(strings.ToUpper(population)),
+		BCAltIsRecurrent: recurrent,
+		WindowSize:       windowSize,
+		NSimulations:     rep,
+		Alpha:            alpha,
+		MinQTLWidth:      minQTL,
+		MergeDistance:    mergeDist,
+		OutputFile:       outputDir,
+	}
+
 	if lowBulkChoice != 0 && highBulkChoice != 0 && highParentChoice == 0 && lowParentChoice == 0 {
 		fmt.Println("Running bulks only")
 	} else if lowBulkChoice == 0 && highBulkChoice != 0 && lowParentChoice != 0 && highParentChoice != 0 {
@@ -145,7 +174,7 @@ func Run(vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
 	} else {
 		fmt.Println("Working with two bulks")
-		twobulk.RunTwoBulkTwoParents(rdr, highParentChoice-1, highParentDepth, lowParentChoice-1, lowParentDepth, highBulkChoice-1, highBulkDepth, lowBulkChoice-1, lowBulkDepth, windowSize)
+		twobulk.RunTwoBulkTwoParentsWithConfig(rdr, highParentChoice-1, highParentDepth, lowParentChoice-1, lowParentDepth, highBulkChoice-1, highBulkDepth, lowBulkChoice-1, lowBulkDepth, config)
 		//if err != nil {
 		//	return err
 		//}

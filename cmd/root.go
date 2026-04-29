@@ -35,20 +35,18 @@ var rootCmd = &cobra.Command{
 		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
+		population, _ := cmd.Flags().GetString("population")
+		recurrent, _ := cmd.Flags().GetBool("recurrent")
+		rep, _ := cmd.Flags().GetInt("rep")
+		alpha, _ := cmd.Flags().GetFloat64("alpha")
+		minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
+		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
+		outputDir, _ := cmd.Flags().GetString("out")
 
-		//parentsLst := strings.Split(parents, ",")
-		//bulksLst := strings.Split(bulks, ",")
+		//bulksDepthLst := strings.Split(bulksDepth, ",")
 		bulksDepthLst := strings.Split(bulksDepth, ",")
 		bulkSizesLst := strings.Split(bulkSizes, ",")
 		parentsDepthLst := strings.Split(parentsDepth, ",")
-
-		//highPar := ""
-		//lowPar := ""
-		//onePar := ""
-		//
-		//highBulk := ""
-		//lowBulk := ""
-		//oneBulk := ""
 
 		highBulkDepth := 0
 		lowBulkDepth := 0
@@ -62,34 +60,6 @@ var rootCmd = &cobra.Command{
 		winSize := 0
 
 		var err error
-
-		// =========================================== Get Parent ================================================== //
-		//if parents != "" {
-		//	if len(parentsLst) > 2 {
-		//		color.Red("parents is supposed to be in the form a,b or just a (where a and b are parent names as they appear in the vcf)")
-		//		return
-		//
-		//	} else if len(parentsLst) == 1 {
-		//		onePar = parentsLst[0]
-		//	} else {
-		//		highPar = parentsLst[0]
-		//		lowPar = parentsLst[1]
-		//
-		//	}
-		//}
-		//
-		//// ============================================= Get Bulks ================================================== //
-		//if bulks != "" {
-		//	if len(bulksLst) > 2 {
-		//		color.Red("bulks is supposed to be in the form a,b or just a (where a and b are bulk sample names as they appear in the vcf)")
-		//		return
-		//	} else if len(bulksLst) == 1 {
-		//		oneBulk = bulksLst[0]
-		//	} else {
-		//		highBulk = bulksLst[0]
-		//		lowBulk = bulksLst[1]
-		//	}
-		//}
 
 		// ========================================== Get bulk depths =============================================== //
 		if len(bulksDepthLst) > 2 {
@@ -162,7 +132,7 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		err = run.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize)
+		err = run.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize, population, recurrent, rep, alpha, minQTL, mergeDist, outputDir)
 		if err != nil {
 			return
 		}
@@ -187,4 +157,11 @@ func init() {
 	rootCmd.Flags().StringP("bulks-depth", "b", "40,40", "Low Parent Min Depth")
 	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "High Bulk Min Depth")
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
+	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
+	rootCmd.Flags().Bool("recurrent", false, "BCAltIsRecurrent: if true, alt allele is recurrent in BC")
+	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
+	rootCmd.Flags().Float64("alpha", 0.05, "Significance level")
+	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
+	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
+	rootCmd.Flags().StringP("out", "o", "bsaseq_results", "Output directory/prefix")
 }
