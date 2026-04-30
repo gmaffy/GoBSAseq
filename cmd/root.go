@@ -15,7 +15,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// rootCmd represents the base command when called without any subcommands
+
+
 var rootCmd = &cobra.Command{
 	Use:   "GoBSAseq",
 	Short: "Pipeline for BSAseq analysis implemented in Go",
@@ -29,24 +30,34 @@ var rootCmd = &cobra.Command{
 		}
 
 		variant, _ := cmd.Flags().GetString("variant")
-		//parents, _ := cmd.Flags().GetString("parents")
-		//bulks, _ := cmd.Flags().GetString("bulks")
+
+		parents, _ := cmd.Flags().GetString("parents")
+		bulks, _ := cmd.Flags().GetString("bulks")
 		parentsDepth, _ := cmd.Flags().GetString("parents-depth")
 		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
+		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
-		recurrent, _ := cmd.Flags().GetBool("recurrent")
 		rep, _ := cmd.Flags().GetInt("rep")
 		alpha, _ := cmd.Flags().GetFloat64("alpha")
 		minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
 		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
 
-		//bulksDepthLst := strings.Split(bulksDepth, ",")
+		parentNamesLst := strings.Split(parents, ",")
+		bulkNamesLst := strings.Split(bulks, ",")
 		bulksDepthLst := strings.Split(bulksDepth, ",")
 		bulkSizesLst := strings.Split(bulkSizes, ",")
 		parentsDepthLst := strings.Split(parentsDepth, ",")
+
+		highParentName := ""
+		lowParentName := ""
+		oneParentName := ""
+
+		highBulkName := ""
+		lowBulkName := ""
+		oneBulkName := ""
 
 		highBulkDepth := 0
 		lowBulkDepth := 0
@@ -61,69 +72,112 @@ var rootCmd = &cobra.Command{
 
 		var err error
 
-		// ========================================== Get bulk depths =============================================== //
-		if len(bulksDepthLst) > 2 {
-			color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
-			return
-		} else if len(bulksDepthLst) == 1 {
-			oneBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
-			if err != nil {
-				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+		// ========================================== Get parents =================================================== //
+		if len(parentNamesLst) > 0 {
+			if len(parentNamesLst) > 2 {
+				color.Red("parents is supposed to be in the form a,b (where a and b are integers)")
 				return
+			} else if len(parentNamesLst) == 1 {
+				oneParentName = parentNamesLst[0]
+
+			} else {
+				highParentName = parentNamesLst[0]
+				lowParentName = parentNamesLst[1]
 			}
 
-		} else {
-			highBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
-			if err != nil {
-				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+		}
+
+		// ========================================== Get Bulk Names =============================================== //
+		if len(bulkNamesLst) > 0 {
+			if len(bulkNamesLst) > 2 {
+				color.Red("bulks is supposed to be in the form a,b (where a and b are integers)")
 				return
-			}
-			lowBulkDepth, err = strconv.Atoi(bulksDepthLst[1])
-			if err != nil {
-				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
-				return
+			} else if len(bulkNamesLst) == 1 {
+				oneBulkName = bulkNamesLst[0]
+
+			} else {
+				highBulkName = bulkNamesLst[0]
+				lowBulkName = bulkNamesLst[1]
 			}
 		}
 
-		// =========================================== Get Parent Depths============================================= //
-		if len(parentsDepthLst) > 2 {
-			color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
-			return
-		} else if len(parentsDepthLst) == 1 {
-			oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
 
-		} else {
-			highParentDepth, err = strconv.Atoi(parentsDepthLst[0])
-			if err != nil {
+		// ========================================== Get bulk depths =============================================== //
+		if len(bulksDepth) > 0 {
+			if len(bulksDepthLst) > 2 {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			} else if len(bulksDepthLst) == 1 {
+				oneBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
+				if err != nil {
+					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+
+			} else {
+				highBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
+				if err != nil {
+					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+				lowBulkDepth, err = strconv.Atoi(bulksDepthLst[1])
+				if err != nil {
+					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+			}
+		}
+
+
+		// =========================================== Get Parent Depths============================================= //
+
+		if len(parentsDepthLst) > 0 {
+			if len(parentsDepthLst) > 2 {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
+			} else if len(parentsDepth) == 1 {
+				oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
+				if err != nil {
+					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+			} else {
+				highParentDepth, err = strconv.Atoi(parentsDepthLst[0])
+				if err != nil {
+					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+				lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
+				if err != nil {
+					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+				}
+
 			}
-			lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
-			if err != nil {
-				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
-			}
+
 		}
 
 		// ========================================== Get Bulk Sizes ================================================ //
-
-		if len(bulkSizesLst) > 2 {
-			color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
-			return
-		} else if len(bulkSizesLst) == 1 {
-			oneBulkSize, err = strconv.Atoi(bulkSizesLst[0])
-
-		} else {
-			highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
-			if err != nil {
+		if len(bulkSizesLst) > 0 {
+			if len(bulkSizesLst) > 2 {
 				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
 				return
-			}
-			lowBulkSize, err = strconv.Atoi(bulkSizesLst[1])
-			if err != nil {
-				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
-				return
+			} else if len(bulkSizesLst) == 1 {
+				oneBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+
+			} else {
+				highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+				if err != nil {
+					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
+				lowBulkSize, err = strconv.Atoi(bulkSizesLst[1])
+				if err != nil {
+					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
 			}
 		}
+
 
 		// ============================================== window size ================================================//
 		winSize, err = strconv.Atoi(fmt.Sprintf("%d", windowSize))
@@ -132,7 +186,48 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		err = run.Run(variant, highParentDepth, lowParentDepth, oneParentDepth, highBulkDepth, lowBulkDepth, oneBulkDepth, highBulkSize, lowBulkSize, oneBulkSize, winSize, population, recurrent, rep, alpha, minQTL, mergeDist, outputDir)
+		// ============================================= Step size ================================================ //
+		step, err := strconv.Atoi(fmt.Sprintf("%d", stepSize))
+		if err != nil {
+			color.Red("stepSize is supposed to be an integer")
+			return
+		}
+
+		config := run.AnalysisConfig {
+			VCF:			  variant,
+			Population:       population,
+			WindowSize:       winSize,
+			StepSize:         step,
+			Rep:     rep,
+			Alpha:            alpha,
+			MinQTLWidth:      minQTL,
+			MergeDistance:    mergeDist,
+			OutputFile:       outputDir,
+			HighParentIdx:    -1,
+			HighParentName:   highParentName,
+			HighParentDepth:  highParentDepth,
+			LowParentIdx:    -1,
+			LowParentName:   lowParentName,
+			LowParentDepth:  lowParentDepth,
+			OneParentIdx:    -1,
+			OneParentName:   oneParentName,
+			OneParentDepth:  oneParentDepth,
+			HighBulkIdx:    -1,
+			HighBulkName:   highBulkName,
+			HighBulkDepth:  highBulkDepth,
+			HighBulkSize:   highBulkSize,
+			LowBulkIdx:    -1,
+			LowBulkName:   lowBulkName,
+			LowBulkDepth:  lowBulkDepth,
+			LowBulkSize:   lowBulkSize,
+			OneBulkIdx:    -1,
+			OneBulkName:   oneBulkName,
+			OneBulkDepth:  oneBulkDepth,
+			OneBulkSize:   oneBulkSize,
+		}
+
+
+		err = run.Run(config)
 		if err != nil {
 			return
 		}
@@ -157,6 +252,7 @@ func init() {
 	rootCmd.Flags().StringP("bulks-depth", "b", "40,40", "Low Parent Min Depth")
 	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "High Bulk Min Depth")
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
+	rootCmd.Flags().Int64P("step-size", "s", 100000, "Step Size")
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
 	rootCmd.Flags().Bool("recurrent", false, "BCAltIsRecurrent: if true, alt allele is recurrent in BC")
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
