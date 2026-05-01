@@ -1,0 +1,310 @@
+package run
+
+import (
+	"compress/gzip"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
+)
+
+type AnalysisConfig struct {
+	VCF string
+	// Parameters for the analysis
+	Population      string
+	WindowSize      int
+	StepSize        int
+	Rep             int
+	Alpha           float64
+	MinQTLWidth     int64
+	MergeDistance   int64
+	OutputFile      string
+	HighParentIdx   int
+	HighParentName  string
+	HighParentDepth int
+
+	LowParentIdx   int
+	LowParentName  string
+	LowParentDepth int
+
+	OneParentIdx   int
+	OneParentName  string
+	OneParentDepth int
+
+	HighBulkIdx   int
+	HighBulkName  string
+	HighBulkDepth int
+	HighBulkSize  int
+
+	LowBulkIdx   int
+	LowBulkName  string
+	LowBulkDepth int
+	LowBulkSize  int
+	OneBulkIdx   int
+	OneBulkName  string
+	OneBulkDepth int
+	OneBulkSize  int
+}
+
+func openVCF(path string) (io.Reader, func(), error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cleanup := func() { f.Close() }
+
+	if strings.HasSuffix(path, ".gz") {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			f.Close()
+			return nil, nil, err
+		}
+		cleanup = func() {
+			gz.Close()
+			f.Close()
+		}
+		return gz, cleanup, nil
+	}
+
+	return f, cleanup, nil
+}
+
+// printConfig prints a neatly aligned parameter summary.
+func printConfig(cfg AnalysisConfig) {
+	bold := color.New(color.Bold).SprintFunc()
+	cyan := color.New(color.FgCyan).SprintFunc()
+
+	fmt.Printf("\n%s\n\n", bold(cyan("  =================== Parameters ===================")))
+
+	rows := [][]string{
+		{"VCF", cfg.VCF},
+		{"Population", cfg.Population},
+		{"Window size", fmt.Sprintf("%d", cfg.WindowSize)},
+		{"Step size", fmt.Sprintf("%d", cfg.StepSize)},
+		{"Simulations", fmt.Sprintf("%d", cfg.Rep)},
+		{"Alpha", fmt.Sprintf("%v", cfg.Alpha)},
+		{"Min QTL length", fmt.Sprintf("%d", cfg.MinQTLWidth)},
+		{"Merge distance", fmt.Sprintf("%d", cfg.MergeDistance)},
+		{"Output dir/prefix", cfg.OutputFile},
+		{"High parent depth", fmt.Sprintf("%d", cfg.HighParentDepth)},
+		{"Low parent depth", fmt.Sprintf("%d", cfg.LowParentDepth)},
+		{"One parent depth", fmt.Sprintf("%d", cfg.OneParentDepth)},
+		{"High bulk depth", fmt.Sprintf("%d", cfg.HighBulkDepth)},
+		{"Low bulk depth", fmt.Sprintf("%d", cfg.LowBulkDepth)},
+		{"One bulk depth", fmt.Sprintf("%d", cfg.OneBulkDepth)},
+		{"High bulk size", fmt.Sprintf("%d", cfg.HighBulkSize)},
+		{"Low bulk size", fmt.Sprintf("%d", cfg.LowBulkSize)},
+		{"One bulk size", fmt.Sprintf("%d", cfg.OneBulkSize)},
+	}
+
+	for _, r := range rows {
+		fmt.Printf("  %-22s %s\n", r[0]+":", r[1])
+	}
+	fmt.Println()
+}
+
+// printSelectionSummary prints a summary table of all resolved sample assignments.
+func printSelectionSummary(cfg AnalysisConfig) {
+	bold := color.New(color.Bold).SprintFunc()
+	cyan := color.New(color.FgCyan).SprintFunc()
+
+	fmt.Printf("\n%s\n\n", bold(cyan("  ================ Selection summary ================")))
+
+	rows := [][]string{
+		{"High parent", cfg.HighParentName},
+		{"Low parent", cfg.LowParentName},
+		{"One parent", cfg.OneParentName},
+		{"High bulk", cfg.HighBulkName},
+		{"Low bulk", cfg.LowBulkName},
+		{"One bulk", cfg.OneBulkName},
+	}
+
+	for _, r := range rows {
+		name := r[1]
+		if name == "" {
+			name = "-"
+		}
+		fmt.Printf("  %-16s %s\n", r[0]+":", name)
+	}
+	fmt.Println()
+}
+
+// buildChoices returns a sorted list of sample name strings from the map,
+// omitting any names listed in exclude.
+func buildChoices(sampleNamesDic map[int]string, exclude []string) []string {
+	keys := slices.Sorted(maps.Keys(sampleNamesDic))
+	var choices []string
+	for _, k := range keys {
+		name := sampleNamesDic[k]
+		if !slices.Contains(exclude, name) {
+			choices = append(choices, name)
+		}
+	}
+	return choices
+}
+
+// selectSample presents an interactive select prompt and returns the chosen name.
+// Names in exclude are hidden from the list. The chosen name is removed from
+// sampleNamesDic so subsequent prompts don't repeat it, unless "None" is chosen.
+func selectSample(label string, sampleNamesDic map[int]string, exclude []string) (string, error) {
+	choices := buildChoices(sampleNamesDic, exclude)
+	if len(choices) == 0 {
+		return "", fmt.Errorf("no samples available to assign to %s", label)
+	}
+
+	var answer string
+	prompt := &survey.Select{
+		Message: "Select " + label + ":",
+		Options: choices,
+	}
+	if err := survey.AskOne(prompt, &answer, survey.WithValidator(survey.Required)); err != nil {
+		return "", err
+	}
+
+	// Remove chosen name from the map so it can't be picked again,
+	// unless it's "None" which may be selected by multiple slots.
+	if answer != "None" {
+		for k, v := range sampleNamesDic {
+			if v == answer {
+				delete(sampleNamesDic, k)
+				break
+			}
+		}
+	}
+
+	color.Green("  + %s -> %s\n", label, answer)
+	return answer, nil
+}
+
+func Run(cfg AnalysisConfig) error {
+	samples := []string{
+		cfg.HighParentName, cfg.LowParentName, cfg.OneParentName,
+		cfg.HighBulkName, cfg.LowBulkName, cfg.OneBulkName,
+	}
+	fmt.Printf("Samples: %v\n", samples)
+
+	printConfig(cfg)
+
+	f, cleanup, err := openVCF(cfg.VCF)
+	if err != nil {
+		panic(err)
+	}
+	defer cleanup()
+
+	rdr, err := vcfgo.NewReader(f, false)
+	if err != nil {
+		panic(err)
+	}
+
+	sampleNames := rdr.Header.SampleNames
+	sampleNamesDic := make(map[int]string)
+	sampleNamesDic[0] = "None"
+	for i := range sampleNames {
+		sampleNamesDic[i+1] = sampleNames[i]
+	}
+
+	// -- Parent selection -----------------------------------------------------
+	color.Cyan("\n  --- Parent selection -------------------------------------------\n\n")
+
+	if cfg.HighParentName == "" && cfg.LowParentName == "" && cfg.OneParentName == "" {
+		cfg.HighParentName, err = selectSample("HIGH PARENT", sampleNamesDic, nil)
+		if err != nil {
+			return err
+		}
+		cfg.LowParentName, err = selectSample("LOW PARENT", sampleNamesDic, []string{cfg.HighParentName})
+		if err != nil {
+			return err
+		}
+
+	} else if cfg.HighParentName != "" && cfg.LowParentName != "" {
+		color.Green("  + HIGH PARENT -> %s\n", cfg.HighParentName)
+		color.Green("  + LOW PARENT  -> %s\n\n", cfg.LowParentName)
+
+		if !slices.Contains(sampleNames, cfg.HighParentName) {
+			color.Yellow("  ! HIGH PARENT %q not found in VCF -- please re-select.\n", cfg.HighParentName)
+			cfg.HighParentName, err = selectSample("HIGH PARENT", sampleNamesDic, nil)
+			if err != nil {
+				return err
+			}
+		} else if cfg.HighParentName != "None" {
+			for k, v := range sampleNamesDic {
+				if v == cfg.HighParentName {
+					delete(sampleNamesDic, k)
+					break
+				}
+			}
+		}
+
+		if !slices.Contains(sampleNames, cfg.LowParentName) {
+			color.Yellow("  ! LOW PARENT %q not found in VCF -- please re-select.\n", cfg.LowParentName)
+			cfg.LowParentName, err = selectSample("LOW PARENT", sampleNamesDic, []string{cfg.HighParentName})
+			if err != nil {
+				return err
+			}
+		} else if cfg.LowParentName != "None" {
+			for k, v := range sampleNamesDic {
+				if v == cfg.LowParentName {
+					delete(sampleNamesDic, k)
+					break
+				}
+			}
+		}
+	}
+
+	// -- Bulk selection -------------------------------------------------------
+	color.Cyan("\n  --- Bulk selection ---------------------------------------------\n\n")
+
+	if cfg.HighBulkName == "" && cfg.LowBulkName == "" && cfg.OneBulkName == "" {
+		cfg.HighBulkName, err = selectSample("HIGH BULK", sampleNamesDic,
+			[]string{cfg.HighParentName, cfg.LowParentName})
+		if err != nil {
+			return err
+		}
+		cfg.LowBulkName, err = selectSample("LOW BULK", sampleNamesDic,
+			[]string{cfg.HighParentName, cfg.LowParentName, cfg.HighBulkName})
+		if err != nil {
+			return err
+		}
+	}
+
+	printSelectionSummary(cfg)
+
+	// -- Ensure output directory exists ---------------------------------------
+	if cfg.OutputFile != "" {
+		dir := filepath.Dir(cfg.OutputFile)
+		if dir != "." {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create output directory: %w", err)
+			}
+		}
+	}
+
+	// -- Dispatch -------------------------------------------------------------
+	highSet := cfg.HighBulkName != "" && cfg.HighBulkName != "None"
+	lowSet := cfg.LowBulkName != "" && cfg.LowBulkName != "None"
+	highParSet := cfg.HighParentName != "" && cfg.HighParentName != "None"
+	lowParSet := cfg.LowParentName != "" && cfg.LowParentName != "None"
+
+	fmt.Println()
+	switch {
+	case highSet && lowSet && !highParSet && !lowParSet:
+		color.Cyan("  -> Bulks only (no parents)\n")
+	case highSet && !lowSet && highParSet && lowParSet:
+		color.Cyan("  -> One-bulk BSA-seq (HIGH bulk)\n")
+	case !highSet && lowSet && highParSet && lowParSet:
+		color.Cyan("  -> One-bulk BSA-seq (LOW bulk)\n")
+	default:
+		color.Cyan("  -> Two-bulk analysis\n")
+	}
+	fmt.Println()
+
+	return nil
+}
