@@ -10,19 +10,17 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/common"
 	"github.com/gmaffy/GoBSAseq/run"
 
 	"github.com/spf13/cobra"
 )
 
-
-
 var rootCmd = &cobra.Command{
 	Use:   "GoBSAseq",
 	Short: "Pipeline for BSAseq analysis implemented in Go",
 	Long:  `Pipeline for BSAseq analysis implemented in Go.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
+
 	Run: func(cmd *cobra.Command, args []string) {
 		if !cmd.Flags().Changed("variant") {
 			cmd.Help()
@@ -101,7 +99,6 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-
 		// ========================================== Get bulk depths =============================================== //
 		if len(bulksDepth) > 0 {
 			if len(bulksDepthLst) > 2 {
@@ -127,7 +124,6 @@ var rootCmd = &cobra.Command{
 				}
 			}
 		}
-
 
 		// =========================================== Get Parent Depths============================================= //
 
@@ -178,7 +174,6 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-
 		// ============================================== window size ================================================//
 		winSize, err = strconv.Atoi(fmt.Sprintf("%d", windowSize))
 		if err != nil {
@@ -193,39 +188,38 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		config := run.AnalysisConfig {
-			VCF:			  variant,
-			Population:       population,
-			WindowSize:       winSize,
-			StepSize:         step,
-			Rep:     rep,
-			Alpha:            alpha,
-			MinQTLWidth:      minQTL,
-			MergeDistance:    mergeDist,
-			OutputFile:       outputDir,
-			HighParentIdx:    -1,
-			HighParentName:   highParentName,
-			HighParentDepth:  highParentDepth,
-			LowParentIdx:    -1,
-			LowParentName:   lowParentName,
-			LowParentDepth:  lowParentDepth,
-			OneParentIdx:    -1,
-			OneParentName:   oneParentName,
-			OneParentDepth:  oneParentDepth,
-			HighBulkIdx:    -1,
-			HighBulkName:   highBulkName,
-			HighBulkDepth:  highBulkDepth,
-			HighBulkSize:   highBulkSize,
-			LowBulkIdx:    -1,
-			LowBulkName:   lowBulkName,
-			LowBulkDepth:  lowBulkDepth,
-			LowBulkSize:   lowBulkSize,
-			OneBulkIdx:    -1,
-			OneBulkName:   oneBulkName,
-			OneBulkDepth:  oneBulkDepth,
-			OneBulkSize:   oneBulkSize,
+		config := common.AnalysisConfig{
+			VCF:           variant,
+			Population:    population,
+			WindowSize:    winSize,
+			StepSize:      step,
+			Rep:           rep,
+			Alpha:         alpha,
+			MinQTLWidth:   minQTL,
+			MergeDistance: mergeDist,
+			OutputFile:    outputDir,
+			//HighParentIdx:    -1,
+			HighParentName:  highParentName,
+			HighParentDepth: highParentDepth,
+			//LowParentIdx:    -1,
+			LowParentName:  lowParentName,
+			LowParentDepth: lowParentDepth,
+			//OneParentIdx:    -1,
+			OneParentName:  oneParentName,
+			OneParentDepth: oneParentDepth,
+			//HighBulkIdx:    -1,
+			HighBulkName:  highBulkName,
+			HighBulkDepth: highBulkDepth,
+			HighBulkSize:  highBulkSize,
+			//LowBulkIdx:    -1,
+			LowBulkName:  lowBulkName,
+			LowBulkDepth: lowBulkDepth,
+			LowBulkSize:  lowBulkSize,
+			//OneBulkIdx:    -1,
+			OneBulkName:  oneBulkName,
+			OneBulkDepth: oneBulkDepth,
+			OneBulkSize:  oneBulkSize,
 		}
-
 
 		err = run.Run(config)
 		if err != nil {
@@ -235,8 +229,6 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
