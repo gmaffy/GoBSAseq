@@ -65,7 +65,7 @@ func Run(cfg utils.AnalysisConfig) error { //, vcf string, highParentDepth int, 
 	fmt.Printf("Population: %s\n", cfg.Population)
 	//fmt.Printf("Recurrent: %v\n")
 	fmt.Printf("Simulations: %d\n", cfg.Rep)
-	fmt.Printf("Alpha: %v\n", cfg.Alpha)
+	fmt.Printf("Alphas: %v\n", cfg.Alphas)
 	fmt.Printf("Min QTL Length: %d\n", cfg.MinQTLWidth)
 	fmt.Printf("Merge Distance: %d\n", cfg.MergeDistance)
 	fmt.Printf("Output Dir/Prefix: %s\n", cfg.OutputFile)

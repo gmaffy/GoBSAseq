@@ -12,7 +12,7 @@ type AnalysisConfig struct {
 	WindowSize    int
 	StepSize      int
 	Rep           int
-	Alpha         float64
+	Alphas        []float64
 	MinQTLWidth   int64
 	MergeDistance int64
 	OutputFile    string

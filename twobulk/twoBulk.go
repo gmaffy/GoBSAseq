@@ -46,14 +46,16 @@ type BSAstats struct {
 }
 
 type SmoothedStats struct {
-	CHROM   string
-	POS     int64
-	DeltaSI float64
-	Gstat   float64
-	ED      float64
-	LOD     float64
-	BBLogBF float64
-	NumSNPs int
+	CHROM          string
+	POS            int64
+	DeltaSI        float64
+	Gstat          float64
+	ED             float64
+	LOD            float64
+	BBLogBF        float64
+	NumSNPs        int
+	MeanHighBulkDP int
+	MeanLowBulkDP  int
 }
 
 // Thresholds holds the genome-wide significance thresholds derived from
@@ -251,6 +253,7 @@ func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []Smoothed
 		var sumWeightDeltaSI, sumWeightED float64
 		var sumGstat, sumLOD, sumBBLogBF float64
 		var nSNPs int
+		var sumHighDP, sumLowDP float64
 
 		for _, s := range stats {
 			if s.POS < windowStart || s.POS > windowEnd {
@@ -272,6 +275,9 @@ func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []Smoothed
 			sumGstat += s.Gstat * wDeltaSI
 			sumLOD += s.LOD * wDeltaSI
 			sumBBLogBF += s.BBLogBF * wDeltaSI
+
+			sumHighDP += float64(s.HighBulkL + s.HighBulkH)
+			sumLowDP += float64(s.LowBulkL + s.LowBulkH)
 		}
 
 		if nSNPs == 0 {
@@ -279,9 +285,11 @@ func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []Smoothed
 		}
 
 		sm := SmoothedStats{
-			CHROM:   chrom,
-			POS:     center,
-			NumSNPs: nSNPs,
+			CHROM:          chrom,
+			POS:            center,
+			NumSNPs:        nSNPs,
+			MeanHighBulkDP: int(sumHighDP / float64(nSNPs)),
+			MeanLowBulkDP:  int(sumLowDP / float64(nSNPs)),
 		}
 
 		if sumWeightDeltaSI > 0 {
@@ -348,99 +356,6 @@ func quantile(sorted []float64, q float64) float64 {
 	return sorted[lo]*(1-frac) + sorted[hi]*frac
 }
 
-// calcThresholds runs nReps permutations in parallel. Each permutation records
-// the genome-wide maximum smoothed value for each stat (max-statistic approach),
-// which controls FWER across all windows without a separate multiple-testing
-// correction step. The (1-alpha) quantile of those maxima is returned.
-func calcThresholds(chromStats map[string][]BSAstats, windowSize, stepSize int64, nReps int, alpha float64) Thresholds {
-	type maxima struct {
-		deltaSI, gstat, ed, lod, bbLogBF float64
-	}
-
-	// Flatten all SNPs for permutation; chromosome labels are preserved inside
-	// each BSAstats so smoothChromosome can re-partition them after the swap.
-	var allStats []BSAstats
-	for _, s := range chromStats {
-		allStats = append(allStats, s...)
-	}
-
-	results := make([]maxima, nReps)
-	repChan := make(chan int, nReps)
-	for r := 0; r < nReps; r++ {
-		repChan <- r
-	}
-	close(repChan)
-
-	numWorkers := runtime.NumCPU()
-	var wg sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-			for r := range repChan {
-				permAll := permuteSNPs(allStats, rng)
-
-				// re-partition permuted SNPs back into chromosomes
-				permChrom := make(map[string][]BSAstats)
-				for _, s := range permAll {
-					permChrom[s.CHROM] = append(permChrom[s.CHROM], s)
-				}
-
-				var mx maxima
-				for _, stats := range permChrom {
-					for _, sm := range smoothChromosome(stats, windowSize, stepSize) {
-						if math.Abs(sm.DeltaSI) > mx.deltaSI {
-							mx.deltaSI = math.Abs(sm.DeltaSI)
-						}
-						if sm.Gstat > mx.gstat {
-							mx.gstat = sm.Gstat
-						}
-						if sm.ED > mx.ed {
-							mx.ed = sm.ED
-						}
-						if sm.LOD > mx.lod {
-							mx.lod = sm.LOD
-						}
-						if sm.BBLogBF > mx.bbLogBF {
-							mx.bbLogBF = sm.BBLogBF
-						}
-					}
-				}
-				results[r] = mx
-			}
-		}()
-	}
-	wg.Wait()
-
-	// Collect each stat's maxima into sorted slices then take the quantile
-	ds := make([]float64, nReps)
-	gs := make([]float64, nReps)
-	ed := make([]float64, nReps)
-	ls := make([]float64, nReps)
-	bb := make([]float64, nReps)
-	for i, m := range results {
-		ds[i] = m.deltaSI
-		gs[i] = m.gstat
-		ed[i] = m.ed
-		ls[i] = m.lod
-		bb[i] = m.bbLogBF
-	}
-	sort.Float64s(ds)
-	sort.Float64s(gs)
-	sort.Float64s(ed)
-	sort.Float64s(ls)
-	sort.Float64s(bb)
-
-	q := 1.0 - alpha
-	return Thresholds{
-		DeltaSI: quantile(ds, q),
-		Gstat:   quantile(gs, q),
-		ED:      quantile(ed, q),
-		LOD:     quantile(ls, q),
-		BBLogBF: quantile(bb, q),
-	}
-}
 
 func writeRawTSV(filename string, statsChan <-chan BSAstats) error {
 	f, err := os.Create(filename)
@@ -464,10 +379,7 @@ func writeRawTSV(filename string, statsChan <-chan BSAstats) error {
 	return nil
 }
 
-// writeSmoothedTSV writes smoothed windows with thresholds as comment lines at
-// the top of the file. Comment lines are prefixed with # so standard TSV parsers
-// and R/Python tools that skip comments can read the data columns unchanged.
-func writeSmoothedTSV(filename string, data []SmoothedStats, thresh Thresholds) error {
+func writeSmoothedTSV(filename string, data []SmoothedStats, tr *ThresholdsResult) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -477,17 +389,47 @@ func writeSmoothedTSV(filename string, data []SmoothedStats, thresh Thresholds) 
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
-	fmt.Fprintf(w, "#Threshold_DeltaSI\t%.6f\n", thresh.DeltaSI)
-	fmt.Fprintf(w, "#Threshold_Gstat\t%.6f\n", thresh.Gstat)
-	fmt.Fprintf(w, "#Threshold_ED\t%.6f\n", thresh.ED)
-	fmt.Fprintf(w, "#Threshold_LOD\t%.6f\n", thresh.LOD)
-	fmt.Fprintf(w, "#Threshold_BBLogBF\t%.6f\n", thresh.BBLogBF)
+	// Build Header
+	header := "CHROM\tPOS\tDeltaSI\tGstat\tED\tLOD\tBBLogBF\tNumSNPs\tMeanHighDP\tMeanLowDP"
+	stats := []string{"DeltaSI", "Gstat", "ED", "LOD", "BBLogBF"}
+	options := []string{"Opt1_MaxNoChr0", "Opt2_MaxPerChr", "Opt3_DepthCI", "Opt4_FDR", "Opt5_ZScore"}
 
-	fmt.Fprintln(w, "CHROM\tPOS\tDeltaSI\tGstat\tED\tLOD\tBBLogBF\tNumSNPs")
+	for _, alpha := range tr.Alphas {
+		for _, opt := range options {
+			for _, stat := range stats {
+				header += fmt.Sprintf("\t%s_%s_a%g", opt, stat, alpha)
+			}
+		}
+	}
+	fmt.Fprintln(w, header)
 
 	for _, d := range data {
-		fmt.Fprintf(w, "%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
-			d.CHROM, d.POS, d.DeltaSI, d.Gstat, d.ED, d.LOD, d.BBLogBF, d.NumSNPs)
+		row := fmt.Sprintf("%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d\t%d",
+			d.CHROM, d.POS, d.DeltaSI, d.Gstat, d.ED, d.LOD, d.BBLogBF, d.NumSNPs, d.MeanHighBulkDP, d.MeanLowBulkDP)
+
+		for _, alpha := range tr.Alphas {
+			// Opt1
+			t1 := tr.Opt1[alpha]
+			row += fmt.Sprintf("\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f", t1.DeltaSI, t1.Gstat, t1.ED, t1.LOD, t1.BBLogBF)
+
+			// Opt2
+			t2 := tr.Opt2[d.CHROM][alpha]
+			row += fmt.Sprintf("\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f", t2.DeltaSI, t2.Gstat, t2.ED, t2.LOD, t2.BBLogBF)
+
+			// Opt3
+			t3Map := tr.getOpt3Threshold(d.MeanHighBulkDP, d.MeanLowBulkDP)
+			t3 := t3Map[alpha]
+			row += fmt.Sprintf("\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f", t3.DeltaSI, t3.Gstat, t3.ED, t3.LOD, t3.BBLogBF)
+
+			// Opt4
+			t4 := tr.Opt4[alpha]
+			row += fmt.Sprintf("\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f", t4.DeltaSI, t4.Gstat, t4.ED, t4.LOD, t4.BBLogBF)
+
+			// Opt5
+			t5 := tr.Opt5[alpha]
+			row += fmt.Sprintf("\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f", t5.DeltaSI, t5.Gstat, t5.ED, t5.LOD, t5.BBLogBF)
+		}
+		fmt.Fprintln(w, row)
 	}
 	return nil
 }
@@ -507,7 +449,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	windowSize := int64(cfg.WindowSize)
 	stepSize := int64(cfg.StepSize)
 	nReps := cfg.Rep
-	alpha := cfg.Alpha
+	alphas := cfg.Alphas
 
 	overallStart := time.Now()
 	variantChan := make(chan *vcfgo.Variant, 10000)
@@ -639,14 +581,10 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 		allSmoothed = append(allSmoothed, smoothed...)
 	}
 
-	color.Cyan("\n============================ Calculating Thresholds (%d permutations, alpha=%.3f) =============================\n\n", nReps, alpha)
-	thresh := calcThresholds(chromStats, windowSize, stepSize, nReps, alpha)
+	color.Cyan("\n============================ Calculating Thresholds (%d permutations) =============================\n\n", nReps)
+	thresh := calcThresholdsMulti(chromStats, allSmoothed, windowSize, stepSize, nReps, alphas)
 
-	color.Green("  DeltaSI threshold : %.6f", thresh.DeltaSI)
-	color.Green("  Gstat   threshold : %.6f", thresh.Gstat)
-	color.Green("  ED      threshold : %.6f", thresh.ED)
-	color.Green("  LOD     threshold : %.6f", thresh.LOD)
-	color.Green("  BBLogBF threshold : %.6f", thresh.BBLogBF)
+	color.Green("Threshold calculations complete.")
 
 	color.Cyan("\n============================ Writing Smoothed TSV =============================\n\n")
 	if err := writeSmoothedTSV(outPrefix+".smooth.tsv", allSmoothed, thresh); err != nil {
