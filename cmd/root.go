@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/common"
 	"github.com/gmaffy/GoBSAseq/run"
+	"github.com/gmaffy/GoBSAseq/utils"
 
 	"github.com/spf13/cobra"
 )
@@ -188,7 +188,7 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		config := common.AnalysisConfig{
+		config := utils.AnalysisConfig{
 			VCF:           variant,
 			Population:    population,
 			WindowSize:    winSize,
@@ -225,7 +225,7 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return
 		}
-		fmt.Printf("variant: %s\n", variant)
+		//fmt.Printf("variant: %s\n", variant)
 	},
 }
 
