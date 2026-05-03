@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,10 @@ import (
 	"gonum.org/v1/gonum/stat"
 	"gonum.org/v1/gonum/stat/distuv"
 )
+
+// =============================================================================
+// Structs
+// =============================================================================
 
 type BSAstats struct {
 	CHROM      string
@@ -62,37 +67,92 @@ type SmoothedStats struct {
 	MeanLowBulkDP  int
 }
 
+// Thresholds holds significance thresholds derived from binomial simulation
+// at a given depth pair. All values are quantile-based (p99 upper tail, p95
+// upper tail, p99 lower tail, p95 lower tail where applicable).
 type Thresholds struct {
+	// DeltaSI thresholds
 	DsiP99  float64
 	DsiP95  float64
 	DsiMp99 float64
 	DsiMp95 float64
 
+	// G-statistic thresholds (upper tail only)
 	GsP99 float64
 	GsP95 float64
 
+	// ED thresholds (upper tail only — ED is always positive)
 	EdP99 float64
 	EdP95 float64
 
+	// LOD thresholds (upper tail only)
 	LodP99 float64
 	LodP95 float64
 
+	// Beta-binomial log Bayes factor thresholds (upper tail only)
 	BbP99 float64
 	BbP95 float64
 
+	// High-bulk SNP-index thresholds
 	HighP99  float64
 	HighP95  float64
 	HighMp99 float64
 	HighMp95 float64
 
+	// Low-bulk SNP-index thresholds
 	LowP99  float64
 	LowP95  float64
 	LowMp99 float64
 	LowMp95 float64
 }
 
-var thresholdCache sync.Map
+// =============================================================================
+// Population structure — expected allele frequency under the null
+// =============================================================================
 
+// simulateAF returns the mean expected allele frequency under the null
+// (no QTL) for a given cross type and bulk size. It mirrors the original
+// simulateAF from twoBulks.go:
+//
+//	F2  — each individual carries the alt allele with probability 0.5
+//	      (heterozygosity 0.5, so expected AF in bulk = 0.5)
+//	BC  — backcross: expected AF = 0.25
+//	RIL — recombinant inbred lines: expected AF = 0.5 (fixed lines, still
+//	      0.5 across the population)
+//
+// The function draws `rep` binomial samples of size `bulkSize` under the
+// cross-specific null probability, then returns their mean — giving a
+// simulation-stable estimate of the null AF rather than the bare
+// theoretical value.
+func simulateAF(popStructure string, bulkSize float64, rep int) float64 {
+	var nullP float64
+	switch strings.ToUpper(popStructure) {
+	case "BC", "BACKCROSS":
+		nullP = 0.25
+	case "RIL":
+		nullP = 0.5
+	default: // "F2" and anything else
+		nullP = 0.5
+	}
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	dist := distuv.Binomial{N: bulkSize, P: nullP, Src: rng}
+
+	sum := 0.0
+	for i := 0; i < rep; i++ {
+		sum += dist.Rand() / bulkSize
+	}
+	return sum / float64(rep)
+}
+
+// =============================================================================
+// Threshold cache (keyed by "highDP_lowDP_highSmAF_lowSmAF")
+// =============================================================================
+
+var thresholdCache sync.Map // map[string]Thresholds
+
+// calcThresholds runs a binomial simulation (rep draws) for the given depth
+// pair and allele frequencies and returns quantile-based thresholds.
 func calcThresholds(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) Thresholds {
 	src := rand.NewSource(time.Now().UnixNano())
 	rng := rand.New(src)
@@ -165,6 +225,7 @@ func calcThresholds(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep in
 	}
 }
 
+// calcThresholdsCached looks up or computes thresholds for a depth pair.
 func calcThresholdsCached(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) Thresholds {
 	key := fmt.Sprintf("%d_%d_%.6f_%.6f", highBulkDP, lowBulkDP, highSmAF, lowSmAF)
 	if v, ok := thresholdCache.Load(key); ok {
@@ -175,6 +236,8 @@ func calcThresholdsCached(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, 
 	return t
 }
 
+// calcAllThresholds pre-computes thresholds for every unique (highDP, lowDP)
+// pair found in allSmoothed. It shows a progress bar and uses a worker pool.
 func calcAllThresholds(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, rep int) {
 	// Collect unique depth pairs
 	type depthPair struct{ h, l int }
@@ -231,6 +294,12 @@ func calcAllThresholds(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, r
 	fmt.Println() // newline after progress bar
 }
 
+// =============================================================================
+// Math helpers
+// =============================================================================
+
+// gStatisticFloat mirrors gStatistic from twoBulkUtils but accepts float64
+// so simulation draws can be passed directly without casting.
 func gStatisticFloat(hAlt, hRef, lAlt, lRef float64) float64 {
 	n1 := hAlt + hRef
 	n2 := lAlt + lRef
@@ -366,6 +435,10 @@ func betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail int) float64 {
 	return (logAlt - logNull) / math.Log(10)
 }
 
+// =============================================================================
+// Variant filtering
+// =============================================================================
+
 func GoodVariants(v *vcfgo.Variant, highPar, highParDP, lowPar, lowParDP, highBulk, highBulkDP, lowBulk, lowBulkDP int) bool {
 	indices := []int{highPar, lowPar, highBulk, lowBulk}
 	if len(v.Alt()) != 1 {
@@ -399,6 +472,10 @@ func GoodVariants(v *vcfgo.Variant, highPar, highParDP, lowPar, lowParDP, highBu
 	}
 	return true
 }
+
+// =============================================================================
+// Smoothing
+// =============================================================================
 
 func tricubeWeight(d, D float64) float64 {
 	if d >= D {
@@ -494,6 +571,10 @@ func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []Smoothed
 	return smoothed
 }
 
+// =============================================================================
+// Output writers
+// =============================================================================
+
 func writeRawTSV(filename string, statsChan <-chan BSAstats) error {
 	f, err := os.Create(filename)
 	if err != nil {
@@ -564,6 +645,10 @@ func writeSmoothedTSV(filename string, data []SmoothedStats, highSmAF, lowSmAF f
 	return nil
 }
 
+// =============================================================================
+// Main entry point
+// =============================================================================
+
 func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	highParIdx := cfg.HighParentIdx
 	highParDP := cfg.HighParentDepth
@@ -581,6 +666,9 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	rep := cfg.Rep
 	pop := cfg.Population
 
+	// Smoothed allele frequencies used for the binomial null model.
+	// These represent the expected allele frequency under the null (no QTL)
+	// for the high and low bulk respectively.
 	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
 	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
 
@@ -592,6 +680,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	numWorkers := runtime.NumCPU()
 	var workerWG sync.WaitGroup
 
+	// Start raw TSV writer goroutine
 	var rawWG sync.WaitGroup
 	rawWG.Add(1)
 	go func() {

@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -39,7 +40,7 @@ func calcThresholdsMulti(chromStats map[string][]BSAstats, allSmoothed []Smoothe
 	var valsD, valsG, valsE, valsL, valsB []float64
 
 	for _, sm := range allSmoothed {
-		if sm.CHROM == "0" || sm.CHROM == "chr0" || sm.CHROM == "Un" {
+		if strings.HasSuffix(sm.CHROM, "00") || sm.CHROM == "chr0" || sm.CHROM == "Un" {
 			continue
 		}
 		sumD += math.Abs(sm.DeltaSI)
@@ -167,7 +168,7 @@ func calcThresholdsMulti(chromStats map[string][]BSAstats, allSmoothed []Smoothe
 					chrMax[chrom] = mxChr
 
 					// Option 1 excludes Chr 0
-					if chrom != "0" && chrom != "chr0" && chrom != "Un" {
+					if strings.HasSuffix(chrom, "00") && chrom != "chr0" && chrom != "Un" {
 						if mxChr.deltaSI > mxOpt1.deltaSI {
 							mxOpt1.deltaSI = mxChr.deltaSI
 						}
