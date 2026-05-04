@@ -6,7 +6,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 
@@ -68,7 +67,7 @@ func Run(cfg utils.AnalysisConfig) error { //, vcf string, highParentDepth int, 
 	fmt.Printf("Alphas: %v\n", cfg.Alphas)
 	fmt.Printf("Min QTL Length: %d\n", cfg.MinQTLWidth)
 	fmt.Printf("Merge Distance: %d\n", cfg.MergeDistance)
-	fmt.Printf("Output Dir/Prefix: %s\n", cfg.OutputFile)
+	fmt.Printf("Output Dir: %s\n", cfg.OutputDir)
 
 	f, cleanup, err := openVCF(cfg.VCF)
 	if err != nil {
@@ -297,12 +296,10 @@ func Run(cfg utils.AnalysisConfig) error { //, vcf string, highParentDepth int, 
 	}
 
 	// Ensure output directory exists
-	if cfg.OutputFile != "" {
-		dir := filepath.Dir(cfg.OutputFile)
-		if dir != "." {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create output directory: %w", err)
-			}
+
+	if cfg.OutputDir != "." {
+		if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
+			return fmt.Errorf("failed to create output directory: %w", err)
 		}
 	}
 

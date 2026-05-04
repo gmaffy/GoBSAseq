@@ -18,7 +18,7 @@ type AnalysisConfig struct {
 	Alphas        []float64
 	MinQTLWidth   int64
 	MergeDistance int64
-	OutputFile    string
+	OutputDir     string
 	//SampleNames      []string // for TSV header
 	HighParentIdx   int
 	HighParentName  string
@@ -47,7 +47,6 @@ type AnalysisConfig struct {
 	OneBulkDepth int
 	OneBulkSize  int
 }
-
 
 func SimulateAF(popStruc string, bulkSize float64, rep int) float64 {
 

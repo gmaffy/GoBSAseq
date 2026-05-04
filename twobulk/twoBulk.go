@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"sync"
@@ -121,7 +122,7 @@ func calcThresholds(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep in
 		highSIArr[i] = hSI
 		lowSIArr[i] = lSI
 		dsiArr[i] = math.Round((hSI-lSI)*1e6) / 1e6
-		gsArr[i] = math.Round(gStatisticFloat(hAlt, hRef, lAlt, lRef)*1e6) / 1e6
+		gsArr[i] = math.Round(GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
 		edArr[i] = math.Round(math.Abs(hSI-lSI)*1e6) / 1e6
 		lodArr[i] = math.Round(lod(int(hRef), int(hAlt), int(lRef), int(lAlt))*1e6) / 1e6
 		bbArr[i] = math.Round(betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
@@ -574,7 +575,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	lowBulkIdx := cfg.LowBulkIdx
 	lowBulkDP := cfg.LowBulkDepth
 	vcfRdr := cfg.Rdr
-	outPrefix := cfg.OutputFile
+	outDir := cfg.OutputDir
 
 	windowSize := int64(cfg.WindowSize)
 	stepSize := int64(cfg.StepSize)
@@ -596,7 +597,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	rawWG.Add(1)
 	go func() {
 		defer rawWG.Done()
-		if err := writeRawTSV(outPrefix+".raw.tsv", rawWriteChan); err != nil {
+		if err := writeRawTSV(filepath.Join(outDir, "GoBSAseq.raw.tsv"), rawWriteChan); err != nil {
 			color.Red("Error writing raw TSV: %v", err)
 		}
 	}()
@@ -635,48 +636,72 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 				}
 
 				var hbL, hbH, lbL, lbH int
-				lpAllele := 0
-				if len(lpGT) > 0 {
-					lpAllele = lpGT[0]
-				}
-				hbAllele := 0
-				if len(hbGT) > 0 {
-					hbAllele = hbGT[0]
-				}
-				lbAllele := 0
-				if len(lbGT) > 0 {
-					lbAllele = lbGT[0]
-				}
-
-				if hbAllele == lpAllele {
+				if hbGT[0] == lpGT[0] {
 					hbL, hbH = hbRefDep, hbAltDeps[0]
 				} else {
 					hbL, hbH = hbAltDeps[0], hbRefDep
 				}
-				if lbAllele == lpAllele {
+				if lbGT[0] == lpGT[0] {
 					lbL, lbH = lbRefDep, lbAltDeps[0]
 				} else {
 					lbL, lbH = lbAltDeps[0], lbRefDep
 				}
 
-				hSI, lSI := float64(hbH)/float64(hbDP), float64(lbH)/float64(lbDP)
+				//var hbL, hbH, lbL, lbH int
+				//lpAllele := 0
+				//if len(lpGT) > 0 {
+				//	lpAllele = lpGT[0]
+				//}
+				//hbAllele := 0
+				//if len(hbGT) > 0 {
+				//	hbAllele = hbGT[0]
+				//}
+				//lbAllele := 0
+				//if len(lbGT) > 0 {
+				//	lbAllele = lbGT[0]
+				//}
+				//
+				//if hbAllele == lpAllele {
+				//	hbL, hbH = hbRefDep, hbAltDeps[0]
+				//} else {
+				//	hbL, hbH = hbAltDeps[0], hbRefDep
+				//}
+				//if lbAllele == lpAllele {
+				//	lbL, lbH = lbRefDep, lbAltDeps[0]
+				//} else {
+				//	lbL, lbH = lbAltDeps[0], lbRefDep
+				//}
+
+				hSI := float64(hbH) / float64(hbDP)
+				lSI := float64(lbH) / float64(lbDP)
 				minDepth := hbDP
 				if lbDP < minDepth {
 					minDepth = lbDP
 				}
 
 				s := BSAstats{
-					CHROM: variant.Chromosome, POS: int64(variant.Pos), REF: variant.Reference, ALT: variant.Alt()[0],
-					HighParGT: variant.Samples[highParIdx].GT, LowParGT: variant.Samples[lowParIdx].GT,
-					HighBulkGT: variant.Samples[highBulkIdx].GT, HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[0]),
-					LowBulkGT: variant.Samples[lowBulkIdx].GT, LowBulkAD: fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[0]),
-					HighBulkL: hbL, HighBulkH: hbH, LowBulkL: lbL, LowBulkH: lbH,
-					HighSI: hSI, LowSI: lSI, DeltaSI: hSI - lSI,
-					Gstat:   GStatistic(hbH, hbL, lbH, lbL),
-					ED:      math.Abs(hSI - lSI),
-					LOD:     lod(hbL, hbH, lbL, lbH),
-					BBLogBF: betaBinomialLogBF(hbH, hbL, lbH, lbL),
-					Depth:   minDepth,
+					CHROM:      variant.Chromosome,
+					POS:        int64(variant.Pos),
+					REF:        variant.Reference,
+					ALT:        variant.Alt()[0],
+					HighParGT:  variant.Samples[highParIdx].GT,
+					LowParGT:   variant.Samples[lowParIdx].GT,
+					HighBulkGT: variant.Samples[highBulkIdx].GT,
+					HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[0]),
+					LowBulkGT:  variant.Samples[lowBulkIdx].GT,
+					LowBulkAD:  fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[0]),
+					HighBulkL:  hbL,
+					HighBulkH:  hbH,
+					LowBulkL:   lbL,
+					LowBulkH:   lbH,
+					HighSI:     math.Round((hSI)*1e6) / 1e6,
+					LowSI:      math.Round((lSI)*1e6) / 1e6,
+					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
+					Gstat:      math.Round((GStatistic(hbH, hbL, lbH, lbL))*1e6) / 1e6,
+					ED:         math.Round((math.Abs(hSI-lSI))*1e6) / 1e6,
+					LOD:        math.Round((lod(hbL, hbH, lbL, lbH))*1e6) / 1e6,
+					BBLogBF:    math.Round((betaBinomialLogBF(hbH, hbL, lbH, lbL))*1e6) / 1e6,
+					Depth:      minDepth,
 				}
 				statsChan <- s
 				rawWriteChan <- s
@@ -714,16 +739,27 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 		allSmoothed = append(allSmoothed, smoothed...)
 	}
 
-	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) =============================\n\n", rep)
+	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
 	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
-	color.Green("Threshold calculations complete.")
+	color.Green("\nThreshold calculations complete.")
 
-	color.Cyan("\n============================ Writing Smoothed TSV =============================\n\n")
-	if err := writeSmoothedTSV(outPrefix+".smooth.tsv", allSmoothed, highSmAF, lowSmAF, rep); err != nil {
+	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
+	if err := writeSmoothedTSV(filepath.Join(outDir, "GoBSAseq.smooth.tsv"), allSmoothed, highSmAF, lowSmAF, rep); err != nil {
 		color.Red("Error writing smoothed TSV: %v", err)
 	} else {
-		color.Green("Wrote %d smoothed windows to %s.smooth.tsv", len(allSmoothed), outPrefix)
+		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), filepath.Join(outDir, "GoBSAseq.smooth.tsv"))
 	}
-	color.Green("Raw stats written to %s.raw.tsv", outPrefix)
+	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
 	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
+
+	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
+	htmlFile := filepath.Join(outDir, "GoBSAseq_InteractivePlots.html")
+	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
+
+	if err := GenerateHtmlPlotsAndQTL(allSmoothed, highSmAF, lowSmAF, rep, htmlFile, qtlFile); err != nil {
+		color.Red("Error generating Plots and QTLs: %v", err)
+	} else {
+		color.Green("Interactive HTML plots written to %s", htmlFile)
+		color.Green("QTL tabular results written to %s", qtlFile)
+	}
 }

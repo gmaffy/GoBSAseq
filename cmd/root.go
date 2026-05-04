@@ -197,7 +197,7 @@ var rootCmd = &cobra.Command{
 			Alphas:        alphas,
 			MinQTLWidth:   minQTL,
 			MergeDistance: mergeDist,
-			OutputFile:    outputDir,
+			OutputDir:     outputDir,
 			//HighParentIdx:    -1,
 			HighParentName:  highParentName,
 			HighParentDepth: highParentDepth,
@@ -251,5 +251,5 @@ func init() {
 	rootCmd.Flags().Float64Slice("alpha", []float64{0.05, 0.01}, "Significance levels (comma-separated)")
 	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
 	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
-	rootCmd.Flags().StringP("out", "o", "bsaseq_results", "Output directory/prefix")
+	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
 }
