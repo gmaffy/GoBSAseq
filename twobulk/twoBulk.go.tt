@@ -1,0 +1,1207 @@
+package twobulk
+
+import (
+	"bufio"
+	"fmt"
+	"math"
+	"math/rand"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
+	"github.com/go-echarts/go-echarts/v2/charts"
+	"github.com/go-echarts/go-echarts/v2/components"
+	"github.com/go-echarts/go-echarts/v2/opts"
+	"github.com/go-echarts/go-echarts/v2/types"
+	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/schollz/progressbar/v3"
+	"gonum.org/v1/gonum/stat"
+	"gonum.org/v1/gonum/stat/distuv"
+)
+
+// BSAstats holds the raw statistics for a single SNP
+type BSAstats struct {
+	CHROM      string
+	POS        int64
+	REF        string
+	ALT        string
+	HighParGT  []int
+	LowParGT   []int
+	HighBulkGT []int
+	HighBulkAD string
+	LowBulkGT  []int
+	LowBulkAD  string
+
+	HighBulkL int
+	HighBulkH int
+	LowBulkL  int
+	LowBulkH  int
+	HighSI    float64
+	LowSI     float64
+
+	DeltaSI float64
+	Gstat   float64
+	ED      float64
+	LOD     float64
+	BBLogBF float64
+
+	Depth int
+}
+
+// SmoothedStats holds the averaged statistics for a genomic window
+type SmoothedStats struct {
+	CHROM          string
+	POS            int64
+	DeltaSI        float64
+	Gstat          float64
+	ED             float64
+	LOD            float64
+	BBLogBF        float64
+	HighSI         float64
+	LowSI          float64
+	NumSNPs        int
+	MeanHighBulkDP int
+	MeanLowBulkDP  int
+}
+
+// Thresholds holds the significance levels for each statistic
+type Thresholds struct {
+	DsiP99  float64
+	DsiP95  float64
+	DsiMp99 float64
+	DsiMp95 float64
+
+	GsP99 float64
+	GsP95 float64
+
+	EdP99 float64
+	EdP95 float64
+
+	LodP99 float64
+	LodP95 float64
+
+	BbP99 float64
+	BbP95 float64
+
+	HighP99  float64
+	HighP95  float64
+	HighMp99 float64
+	HighMp95 float64
+
+	LowP99  float64
+	LowP95  float64
+	LowMp99 float64
+	LowMp95 float64
+}
+
+// QTLRecord holds the detected QTL bounds and peaks
+type QTLRecord struct {
+	Chrom string
+	Start int64
+	Stop  int64
+	Peak  float64
+	Stat  string
+	CI    string
+}
+
+var thresholdCache sync.Map
+
+// RunTwoBulkTwoParents is the main entry point for the two-bulk two-parent analysis
+func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
+	highParIdx := cfg.HighParentIdx
+	highParDP := cfg.HighParentDepth
+	lowParIdx := cfg.LowParentIdx
+	lowParDP := cfg.LowParentDepth
+	highBulkIdx := cfg.HighBulkIdx
+	highBulkDP := cfg.HighBulkDepth
+	lowBulkIdx := cfg.LowBulkIdx
+	lowBulkDP := cfg.LowBulkDepth
+	vcfRdr := cfg.Rdr
+	outDir := cfg.OutputDir
+
+	windowSize := int64(cfg.WindowSize)
+	stepSize := int64(cfg.StepSize)
+	rep := cfg.Rep
+	pop := cfg.Population
+
+	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
+	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
+
+	overallStart := time.Now()
+	variantChan := make(chan *vcfgo.Variant, 10000)
+	statsChan := make(chan BSAstats, 10000)
+	rawWriteChan := make(chan BSAstats, 10000)
+
+	numWorkers := runtime.NumCPU()
+	var workerWG sync.WaitGroup
+
+	var rawWG sync.WaitGroup
+	rawWG.Add(1)
+	go func() {
+		defer rawWG.Done()
+		if err := writeRawTSV(filepath.Join(outDir, "GoBSAseq.raw.tsv"), rawWriteChan); err != nil {
+			color.Red("Error writing raw TSV: %v", err)
+		}
+	}()
+
+	color.Cyan("============================ Calculating Statistics =============================\n\n")
+	bar := progressbar.Default(-1, "Processing variants")
+
+	for i := 0; i < numWorkers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for variant := range variantChan {
+				if !GoodVariants(variant, highParIdx, highParDP, lowParIdx, lowParDP, highBulkIdx, highBulkDP, lowBulkIdx, lowBulkDP) {
+					bar.Add(1)
+					continue
+				}
+
+				lpGT := variant.Samples[lowParIdx].GT
+				hbGT := variant.Samples[highBulkIdx].GT
+				lbGT := variant.Samples[lowBulkIdx].GT
+				hbDP, lbDP := variant.Samples[highBulkIdx].DP, variant.Samples[lowBulkIdx].DP
+
+				if hbDP == 0 || lbDP == 0 {
+					bar.Add(1)
+					continue
+				}
+
+				hbRefDep, _ := variant.Samples[highBulkIdx].RefDepth()
+				hbAltDeps, _ := variant.Samples[highBulkIdx].AltDepths()
+				lbRefDep, _ := variant.Samples[lowBulkIdx].RefDepth()
+				lbAltDeps, _ := variant.Samples[lowBulkIdx].AltDepths()
+
+				if len(hbAltDeps) == 0 || len(lbAltDeps) == 0 {
+					bar.Add(1)
+					continue
+				}
+
+				var hbL, hbH, lbL, lbH int
+				if hbGT[0] == lpGT[0] {
+					hbL, hbH = hbRefDep, hbAltDeps[0]
+				} else {
+					hbL, hbH = hbAltDeps[0], hbRefDep
+				}
+				if lbGT[0] == lpGT[0] {
+					lbL, lbH = lbRefDep, lbAltDeps[0]
+				} else {
+					lbL, lbH = lbAltDeps[0], lbRefDep
+				}
+
+				hSI := float64(hbH) / float64(hbDP)
+				lSI := float64(lbH) / float64(lbDP)
+				minDepth := hbDP
+				if lbDP < minDepth {
+					minDepth = lbDP
+				}
+
+				s := BSAstats{
+					CHROM:      variant.Chromosome,
+					POS:        int64(variant.Pos),
+					REF:        variant.Reference,
+					ALT:        variant.Alt()[0],
+					HighParGT:  variant.Samples[highParIdx].GT,
+					LowParGT:   variant.Samples[lowParIdx].GT,
+					HighBulkGT: variant.Samples[highBulkIdx].GT,
+					HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[0]),
+					LowBulkGT:  variant.Samples[lowBulkIdx].GT,
+					LowBulkAD:  fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[0]),
+					HighBulkL:  hbL,
+					HighBulkH:  hbH,
+					LowBulkL:   lbL,
+					LowBulkH:   lbH,
+					HighSI:     math.Round((hSI)*1e6) / 1e6,
+					LowSI:      math.Round((lSI)*1e6) / 1e6,
+					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
+					Gstat:      math.Round((GStatistic(hbH, hbL, lbH, lbL))*1e6) / 1e6,
+					ED:         math.Round((math.Abs(hSI-lSI))*1e6) / 1e6,
+					LOD:        math.Round((lod(hbL, hbH, lbL, lbH))*1e6) / 1e6,
+					BBLogBF:    math.Round((betaBinomialLogBF(hbH, hbL, lbH, lbL))*1e6) / 1e6,
+					Depth:      minDepth,
+				}
+				statsChan <- s
+				rawWriteChan <- s
+				bar.Add(1)
+			}
+		}()
+	}
+
+	go func() {
+		for v := vcfRdr.Read(); v != nil; v = vcfRdr.Read() {
+			variantChan <- v
+		}
+		close(variantChan)
+	}()
+
+	go func() {
+		workerWG.Wait()
+		close(statsChan)
+		close(rawWriteChan)
+	}()
+
+	chromStats := make(map[string][]BSAstats)
+	for s := range statsChan {
+		chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
+	}
+	bar.Finish()
+	rawWG.Wait()
+
+	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
+
+	var allSmoothed []SmoothedStats
+	for chrom, stats := range chromStats {
+		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
+		smoothed := smoothChromosome(stats, windowSize, stepSize)
+		allSmoothed = append(allSmoothed, smoothed...)
+	}
+
+	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
+	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
+	color.Green("\nThreshold calculations complete.")
+
+	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
+	if err := writeSmoothedTSV(filepath.Join(outDir, "GoBSAseq.smooth.tsv"), allSmoothed, highSmAF, lowSmAF, rep); err != nil {
+		color.Red("Error writing smoothed TSV: %v", err)
+	} else {
+		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), filepath.Join(outDir, "GoBSAseq.smooth.tsv"))
+	}
+	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
+	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
+
+	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
+	htmlFile := filepath.Join(outDir, "GoBSAseq_InteractivePlots.html")
+	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
+
+	if err := GenerateHtmlPlotsAndQTL(allSmoothed, highSmAF, lowSmAF, rep, htmlFile, qtlFile); err != nil {
+		color.Red("Error generating Plots and QTLs: %v", err)
+	} else {
+		color.Green("Interactive HTML plots written to %s", htmlFile)
+		color.Green("QTL tabular results written to %s", qtlFile)
+	}
+}
+
+// GenerateHtmlPlotsAndQTL processes smoothed stats, detects QTLs, and creates interactive HTML charts
+func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, rep int, htmlOutFile, qtlOutFile string) error {
+	// 1. Group stats by chromosome
+	byChr := make(map[string][]SmoothedStats)
+	for _, s := range allSmoothed {
+		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+	}
+
+	var chroms []string
+	for c := range byChr {
+		chroms = append(chroms, c)
+	}
+	sort.Strings(chroms)
+
+	var allQTLs []QTLRecord
+	page := components.NewPage()
+	page.SetLayout(components.PageFlexLayout)
+
+	for _, chrom := range chroms {
+		stats := byChr[chrom]
+		n := float64(len(stats))
+		if n == 0 {
+			continue
+		}
+
+		// 2. Calculate average thresholds for the current chromosome
+		var sumHp99, sumHp95, sumLp99, sumLp95, sumDp99, sumDp95, sumDMp99, sumDMp95, sumEp99, sumEp95, sumLodp99, sumLodp95, sumBbp99, sumBbp95 float64
+
+		for _, s := range stats {
+			t := calcThresholdsCached(s.MeanHighBulkDP, s.MeanLowBulkDP, highSmAF, lowSmAF, rep)
+			sumHp99 += t.HighP99
+			sumHp95 += t.HighP95
+			sumLp99 += t.LowP99
+			sumLp95 += t.LowP95
+			sumDp99 += t.DsiP99
+			sumDp95 += t.DsiP95
+			sumDMp99 += t.DsiMp99
+			sumDMp95 += t.DsiMp95
+			sumEp99 += t.EdP99
+			sumEp95 += t.EdP95
+			sumLodp99 += t.LodP99
+			sumLodp95 += t.LodP95
+			sumBbp99 += t.BbP99
+			sumBbp95 += t.BbP95
+		}
+
+		avgHp99, avgHp95 := sumHp99/n, sumHp95/n
+		avgLp99, avgLp95 := sumLp99/n, sumLp95/n
+		avgDp99, avgDp95 := sumDp99/n, sumDp95/n
+		avgDMp99, avgDMp95 := sumDMp99/n, sumDMp95/n
+		avgEp99, avgEp95 := sumEp99/n, sumEp95/n
+		avgLodp99, avgLodp95 := sumLodp99/n, sumLodp95/n
+		avgBbp99, avgBbp95 := sumBbp99/n, sumBbp95/n
+
+		// 3. Extract arrays for plotting and QTL detection
+		var x []int
+		var hi, li, dsi, ed, lod, bbl []float64
+
+		for _, s := range stats {
+			x = append(x, int(s.POS))
+			hi = append(hi, s.HighSI)
+			li = append(li, s.LowSI)
+			dsi = append(dsi, s.DeltaSI)
+			ed = append(ed, s.ED)
+			lod = append(lod, s.LOD)
+			bbl = append(bbl, s.BBLogBF)
+		}
+
+		// 4. Detect QTLs using the intersection logic
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, hi, avgHp99, "HighSI", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, hi, avgHp95, "HighSI", "95", false)...)
+
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, li, avgLp99, "LowSI", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, li, avgLp95, "LowSI", "95", false)...)
+
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, dsi, avgDp99, "DeltaSI", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, dsi, avgDp95, "DeltaSI", "95", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, dsi, avgDMp99, "DeltaSI", "99", true)...) // Valleys
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, dsi, avgDMp95, "DeltaSI", "95", true)...) // Valleys
+
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, ed, avgEp99, "ED", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, ed, avgEp95, "ED", "95", false)...)
+
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, lod, avgLodp99, "LOD", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, lod, avgLodp95, "LOD", "95", false)...)
+
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, bbl, avgBbp99, "BBLogBF", "99", false)...)
+		allQTLs = append(allQTLs, detectQTLs(chrom, x, bbl, avgBbp95, "BBLogBF", "95", false)...)
+
+		// 5. Create individual Echarts
+		hiChart := createInteractiveLineChart(chrom+" HighSI", x, hi, avgHp99, avgHp95, 0, 0, false)
+		liChart := createInteractiveLineChart(chrom+" LowSI", x, li, avgLp99, avgLp95, 0, 0, false)
+		dsiChart := createInteractiveLineChart(chrom+" DeltaSI", x, dsi, avgDp99, avgDp95, avgDMp99, avgDMp95, true)
+		edChart := createInteractiveLineChart(chrom+" ED", x, ed, avgEp99, avgEp95, 0, 0, false)
+		lodChart := createInteractiveLineChart(chrom+" LOD", x, lod, avgLodp99, avgLodp95, 0, 0, false)
+		bblChart := createInteractiveLineChart(chrom+" BBLogBF", x, bbl, avgBbp99, avgBbp95, 0, 0, false)
+
+		page.AddCharts(hiChart, liChart, dsiChart, edChart, lodChart, bblChart)
+
+		// 6. Create normalized overlay chart for this chromosome
+		normChart := createNormalizedOverlayChart(chrom, x, hi, li, dsi, ed, lod, bbl,
+			avgHp99, avgHp95, avgLp99, avgLp95,
+			avgDp99, avgDp95, avgDMp99, avgDMp95,
+			avgEp99, avgEp95, avgLodp99, avgLodp95,
+			avgBbp99, avgBbp95)
+		page.AddCharts(normChart)
+	}
+
+	// 7. Write HTML to file
+	fHtml, err := os.Create(htmlOutFile)
+	if err != nil {
+		return err
+	}
+	defer fHtml.Close()
+	if err := page.Render(fHtml); err != nil {
+		return err
+	}
+
+	// 8. Write QTL TSV to file
+	fTsv, err := os.Create(qtlOutFile)
+	if err != nil {
+		return err
+	}
+	defer fTsv.Close()
+
+	fmt.Fprintf(fTsv, "CHROM\tSTART\tSTOP\tPEAK\tSTAT\tCI\n")
+	for _, q := range allQTLs {
+		fmt.Fprintf(fTsv, "%s\t%d\t%d\t%.6f\t%s\t%s\n", q.Chrom, q.Start, q.Stop, q.Peak, q.Stat, q.CI)
+	}
+
+	return nil
+}
+
+func calcThresholds(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) Thresholds {
+	src := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(src)
+
+	// gonum distuv.Binomial needs its own source
+	distSrc := distuv.Binomial{N: float64(highBulkDP), P: highSmAF, Src: rng}
+	distLow := distuv.Binomial{N: float64(lowBulkDP), P: lowSmAF, Src: rng}
+
+	highSIArr := make([]float64, rep)
+	lowSIArr := make([]float64, rep)
+	dsiArr := make([]float64, rep)
+	gsArr := make([]float64, rep)
+	edArr := make([]float64, rep)
+	lodArr := make([]float64, rep)
+	bbArr := make([]float64, rep)
+
+	for i := 0; i < rep; i++ {
+		hAlt := distSrc.Rand()
+		lAlt := distLow.Rand()
+		hRef := float64(highBulkDP) - hAlt
+		lRef := float64(lowBulkDP) - lAlt
+
+		hSI := math.Round((hAlt/float64(highBulkDP))*1e6) / 1e6
+		lSI := math.Round((lAlt/float64(lowBulkDP))*1e6) / 1e6
+
+		highSIArr[i] = hSI
+		lowSIArr[i] = lSI
+		dsiArr[i] = math.Round((hSI-lSI)*1e6) / 1e6
+		gsArr[i] = math.Round(GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
+		edArr[i] = math.Round(math.Abs(hSI-lSI)*1e6) / 1e6
+		lodArr[i] = math.Round(lod(int(hRef), int(hAlt), int(lRef), int(lAlt))*1e6) / 1e6
+		bbArr[i] = math.Round(betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
+	}
+
+	sort.Float64s(highSIArr)
+	sort.Float64s(lowSIArr)
+	sort.Float64s(dsiArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(edArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	return Thresholds{
+		HighP99:  math.Round(stat.Quantile(0.995, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighP95:  math.Round(stat.Quantile(0.95, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighMp99: math.Round(stat.Quantile(0.005, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighMp95: math.Round(stat.Quantile(0.05, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+
+		LowP99:  math.Round(stat.Quantile(0.995, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowP95:  math.Round(stat.Quantile(0.95, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowMp99: math.Round(stat.Quantile(0.005, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowMp95: math.Round(stat.Quantile(0.05, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+
+		DsiP99:  math.Round(stat.Quantile(0.995, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiP95:  math.Round(stat.Quantile(0.95, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiMp99: math.Round(stat.Quantile(0.005, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiMp95: math.Round(stat.Quantile(0.05, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+
+		GsP99: math.Round(stat.Quantile(0.995, stat.Empirical, gsArr, nil)*1e6) / 1e6,
+		GsP95: math.Round(stat.Quantile(0.95, stat.Empirical, gsArr, nil)*1e6) / 1e6,
+
+		EdP99: math.Round(stat.Quantile(0.995, stat.Empirical, edArr, nil)*1e6) / 1e6,
+		EdP95: math.Round(stat.Quantile(0.95, stat.Empirical, edArr, nil)*1e6) / 1e6,
+
+		LodP99: math.Round(stat.Quantile(0.995, stat.Empirical, lodArr, nil)*1e6) / 1e6,
+		LodP95: math.Round(stat.Quantile(0.95, stat.Empirical, lodArr, nil)*1e6) / 1e6,
+
+		BbP99: math.Round(stat.Quantile(0.995, stat.Empirical, bbArr, nil)*1e6) / 1e6,
+		BbP95: math.Round(stat.Quantile(0.95, stat.Empirical, bbArr, nil)*1e6) / 1e6,
+	}
+}
+
+func calcThresholdsCached(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) Thresholds {
+	key := fmt.Sprintf("%d_%d_%.6f_%.6f", highBulkDP, lowBulkDP, highSmAF, lowSmAF)
+	if v, ok := thresholdCache.Load(key); ok {
+		return v.(Thresholds)
+	}
+	t := calcThresholds(highBulkDP, lowBulkDP, highSmAF, lowSmAF, rep)
+	thresholdCache.Store(key, t)
+	return t
+}
+
+func calcAllThresholds(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, rep int) {
+	// Collect unique depth pairs
+	type depthPair struct{ h, l int }
+	seen := make(map[depthPair]bool)
+	for _, sm := range allSmoothed {
+		dp := depthPair{sm.MeanHighBulkDP, sm.MeanLowBulkDP}
+		if sm.MeanHighBulkDP > 0 && sm.MeanLowBulkDP > 0 {
+			seen[dp] = true
+		}
+	}
+
+	pairs := make([]depthPair, 0, len(seen))
+	for dp := range seen {
+		pairs = append(pairs, dp)
+	}
+
+	total := len(pairs)
+	if total == 0 {
+		return
+	}
+
+	bar := progressbar.NewOptions(total,
+		progressbar.OptionSetDescription("Computing thresholds"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+
+	pairChan := make(chan depthPair, total)
+	for _, dp := range pairs {
+		pairChan <- dp
+	}
+	close(pairChan)
+
+	numWorkers := runtime.NumCPU()
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for dp := range pairChan {
+				calcThresholdsCached(dp.h, dp.l, highSmAF, lowSmAF, rep)
+				bar.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println() // newline after progress bar
+}
+
+func gStatisticFloat(hAlt, hRef, lAlt, lRef float64) float64 {
+	n1 := hAlt + hRef
+	n2 := lAlt + lRef
+	if n1 == 0 || n2 == 0 {
+		return 0
+	}
+	totalAlt := hAlt + lAlt
+	total := n1 + n2
+	p := totalAlt / total
+
+	g := 0.0
+	if hAlt > 0 {
+		g += hAlt * math.Log(hAlt/(n1*p))
+	}
+	if hRef > 0 {
+		g += hRef * math.Log(hRef/(n1*(1-p)))
+	}
+	if lAlt > 0 {
+		g += lAlt * math.Log(lAlt/(n2*p))
+	}
+	if lRef > 0 {
+		g += lRef * math.Log(lRef/(n2*(1-p)))
+	}
+	return 2 * g
+}
+
+func isHomozygous(gt []int) bool {
+	if len(gt) == 0 {
+		return false
+	}
+	first := gt[0]
+	if first < 0 {
+		return false
+	}
+	for _, a := range gt[1:] {
+		if a != first {
+			return false
+		}
+	}
+	return true
+}
+
+func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
+	hba := float64(highBulkAlt) + 0.5
+	hbr := float64(highBulkRef) + 0.5
+	lba := float64(lowBulkAlt) + 0.5
+	lbr := float64(lowBulkRef) + 0.5
+
+	highBulkTotal := hba + hbr
+	lowBulkTotal := lba + lbr
+	total := highBulkTotal + lowBulkTotal
+
+	if total == 0 {
+		return 0
+	}
+
+	expHighAlt := highBulkTotal * (hba + lba) / total
+	expHighRef := highBulkTotal * (hbr + lbr) / total
+	expLowAlt := lowBulkTotal * (hba + lba) / total
+	expLowRef := lowBulkTotal * (hbr + lbr) / total
+
+	g := 0.0
+	if hba > 0 {
+		g += hba * math.Log(hba/expHighAlt)
+	}
+	if hbr > 0 {
+		g += hbr * math.Log(hbr/expHighRef)
+	}
+	if lba > 0 {
+		g += lba * math.Log(lba/expLowAlt)
+	}
+	if lbr > 0 {
+		g += lbr * math.Log(lbr/expLowRef)
+	}
+
+	return 2 * g
+}
+
+func logBeta(a, b float64) float64 {
+	la, _ := math.Lgamma(a)
+	lb, _ := math.Lgamma(b)
+	lab, _ := math.Lgamma(a + b)
+	return la + lb - lab
+}
+
+func lod(ref1, alt1, ref2, alt2 int) float64 {
+	n1 := float64(ref1 + alt1)
+	n2 := float64(ref2 + alt2)
+	total := n1 + n2
+
+	if n1 == 0 || n2 == 0 || total == 0 {
+		return 0.0
+	}
+
+	eps := 1e-10
+	clamp := func(p float64) float64 {
+		if p <= 0 {
+			return eps
+		}
+		if p >= 1 {
+			return 1 - eps
+		}
+		return p
+	}
+
+	p1 := clamp(float64(alt1) / n1)
+	p2 := clamp(float64(alt2) / n2)
+	p0 := clamp(float64(alt1+alt2) / total)
+
+	logLik := func(k, n, p float64) float64 {
+		if n == 0 {
+			return 0
+		}
+		return k*math.Log(p) + (n-k)*math.Log(1-p)
+	}
+
+	logL1 := logLik(float64(alt1), n1, p1) + logLik(float64(alt2), n2, p2)
+	logL0 := logLik(float64(alt1), n1, p0) + logLik(float64(alt2), n2, p0)
+
+	return (logL1 - logL0) / math.Log(10)
+}
+
+func betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail int) float64 {
+	alphaH, betaH := 0.5, 0.5
+	alphaL, betaL := 0.5, 0.5
+
+	logAlt := logBeta(alphaH+float64(highSucc), betaH+float64(highFail)) - logBeta(alphaH, betaH)
+	logAlt += logBeta(alphaL+float64(lowSucc), betaL+float64(lowFail)) - logBeta(alphaL, betaL)
+
+	alpha0, beta0 := 0.5, 0.5
+	logNull := logBeta(alpha0+float64(highSucc+lowSucc), beta0+float64(highFail+lowFail)) - logBeta(alpha0, beta0)
+
+	return (logAlt - logNull) / math.Log(10)
+}
+
+func GoodVariants(v *vcfgo.Variant, highPar, highParDP, lowPar, lowParDP, highBulk, highBulkDP, lowBulk, lowBulkDP int) bool {
+	indices := []int{highPar, lowPar, highBulk, lowBulk}
+	if len(v.Alt()) != 1 {
+		return false
+	}
+
+	for _, idx := range indices {
+		if idx >= len(v.Samples) {
+			return false
+		}
+		s := v.Samples[idx]
+		if len(s.GT) == 0 {
+			return false
+		}
+		for _, allele := range s.GT {
+			if allele < 0 {
+				return false
+			}
+		}
+	}
+
+	hpGT, lpGT := v.Samples[highPar].GT, v.Samples[lowPar].GT
+	hpDP, lpDP := v.Samples[highPar].DP, v.Samples[lowPar].DP
+	hbDP, lbDP := v.Samples[highBulk].DP, v.Samples[lowBulk].DP
+
+	if !isHomozygous(hpGT) || !isHomozygous(lpGT) || hpGT[0] == lpGT[0] {
+		return false
+	}
+	if hpDP < highParDP || lpDP < lowParDP || hbDP < highBulkDP || lbDP < lowBulkDP {
+		return false
+	}
+	return true
+}
+
+func tricubeWeight(d, D float64) float64 {
+	if d >= D {
+		return 0
+	}
+	x := 1 - math.Pow(d/D, 3)
+	return x * x * x
+}
+
+func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []SmoothedStats {
+	if len(stats) == 0 {
+		return nil
+	}
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
+
+	var smoothed []SmoothedStats
+	chrom := stats[0].CHROM
+	minPos := stats[0].POS
+	maxPos := stats[len(stats)-1].POS
+
+	for center := minPos; center <= maxPos; center += step {
+		windowStart := center - windowSize/2
+		windowEnd := center + windowSize/2
+
+		var (
+			sumDeltaSI, sumED                float64
+			sumWeightDeltaSI, sumWeightED    float64
+			sumGstat, sumLOD, sumBBLogBF     float64
+			sumHighSI, sumLowSI, sumWeightSI float64
+			sumHighDP, sumLowDP              float64
+			nSNPs                            int
+		)
+
+		for _, s := range stats {
+			if s.POS < windowStart || s.POS > windowEnd {
+				continue
+			}
+			nSNPs++
+
+			d := math.Abs(float64(s.POS - center))
+			w := tricubeWeight(d, float64(windowSize)/2)
+			depthWeight := math.Sqrt(float64(s.Depth))
+			wDeltaSI := w * depthWeight
+
+			sumDeltaSI += s.DeltaSI * wDeltaSI
+			sumWeightDeltaSI += wDeltaSI
+
+			sumED += s.ED * wDeltaSI
+			sumWeightED += wDeltaSI
+
+			sumGstat += s.Gstat * wDeltaSI
+			sumLOD += s.LOD * wDeltaSI
+			sumBBLogBF += s.BBLogBF * wDeltaSI
+
+			sumHighSI += s.HighSI * wDeltaSI
+			sumLowSI += s.LowSI * wDeltaSI
+			sumWeightSI += wDeltaSI
+
+			sumHighDP += float64(s.HighBulkL + s.HighBulkH)
+			sumLowDP += float64(s.LowBulkL + s.LowBulkH)
+		}
+
+		if nSNPs == 0 {
+			continue
+		}
+
+		sm := SmoothedStats{
+			CHROM:          chrom,
+			POS:            center,
+			NumSNPs:        nSNPs,
+			MeanHighBulkDP: int(sumHighDP / float64(nSNPs)),
+			MeanLowBulkDP:  int(sumLowDP / float64(nSNPs)),
+		}
+
+		if sumWeightDeltaSI > 0 {
+			sm.DeltaSI = sumDeltaSI / sumWeightDeltaSI
+			sm.Gstat = sumGstat / sumWeightDeltaSI
+			sm.LOD = sumLOD / sumWeightDeltaSI
+			sm.BBLogBF = sumBBLogBF / sumWeightDeltaSI
+		}
+		if sumWeightED > 0 {
+			sm.ED = sumED / sumWeightED
+		}
+		if sumWeightSI > 0 {
+			sm.HighSI = sumHighSI / sumWeightSI
+			sm.LowSI = sumLowSI / sumWeightSI
+		}
+
+		smoothed = append(smoothed, sm)
+	}
+
+	return smoothed
+}
+
+func writeRawTSV(filename string, statsChan <-chan BSAstats) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tHighBulkGT\tHighBulkAD\tLowBulkGT\tLowBulkAD\tHighBulkL\tHighBulkH\tLowBulkL\tLowBulkH\tHighSI\tLowSI\tDeltaSI\tGstat\tED\tLOD\tBBLogBF\tDepth")
+
+	for s := range statsChan {
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
+			s.CHROM, s.POS, s.REF, s.ALT,
+			s.HighParGT, s.LowParGT, s.HighBulkGT, s.HighBulkAD, s.LowBulkGT, s.LowBulkAD,
+			s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH,
+			s.HighSI, s.LowSI, s.DeltaSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
+	}
+	return nil
+}
+
+func writeSmoothedTSV(filename string, data []SmoothedStats, highSmAF, lowSmAF float64, rep int) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	header := "CHROM\tPOS\tHighSI\tLowSI\tDeltaSI\tGstat\tED\tLOD\tBBLogBF\tNumSNPs\tMeanHighDP\tMeanLowDP" +
+		"\tHighSI_p99\tHighSI_p95\tHighSI_m_p99\tHighSI_m_p95" +
+		"\tLowSI_p99\tLowSI_p95\tLowSI_m_p99\tLowSI_m_p95" +
+		"\tDeltaSI_p99\tDeltaSI_p95\tDeltaSI_m_p99\tDeltaSI_m_p95" +
+		"\tGstat_p99\tGstat_p95" +
+		"\tED_p99\tED_p95" +
+		"\tLOD_p99\tLOD_p95" +
+		"\tBBLogBF_p99\tBBLogBF_p95"
+	fmt.Fprintln(w, header)
+
+	for _, d := range data {
+		t := calcThresholdsCached(d.MeanHighBulkDP, d.MeanLowBulkDP, highSmAF, lowSmAF, rep)
+
+		row := fmt.Sprintf(
+			"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d\t%d"+
+				"\t%.6f\t%.6f\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f",
+			d.CHROM, d.POS,
+			d.HighSI, d.LowSI, d.DeltaSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
+			d.NumSNPs, d.MeanHighBulkDP, d.MeanLowBulkDP,
+			t.HighP99, t.HighP95, t.HighMp99, t.HighMp95,
+			t.LowP99, t.LowP95, t.LowMp99, t.LowMp95,
+			t.DsiP99, t.DsiP95, t.DsiMp99, t.DsiMp95,
+			t.GsP99, t.GsP95,
+			t.EdP99, t.EdP95,
+			t.LodP99, t.LodP95,
+			t.BbP99, t.BbP95,
+		)
+		fmt.Fprintln(w, row)
+	}
+	return nil
+}
+
+// createNormalizedOverlayChart plots all six statistics normalized to their p99 thresholds
+// on a single shared y-axis, with p99=1.0 and p95=0.95 clearly marked
+func createNormalizedOverlayChart(chrom string, x []int,
+	hi, li, dsi, ed, lod, bbl []float64,
+	avgHp99, avgHp95, avgLp99, avgLp95 float64,
+	avgDp99, avgDp95, avgDMp99, avgDMp95 float64,
+	avgEp99, avgEp95, avgLodp99, avgLodp95 float64,
+	avgBbp99, avgBbp95 float64) *charts.Line {
+
+	line := charts.NewLine()
+	line.SetGlobalOptions(
+		charts.WithInitializationOpts(opts.Initialization{Theme: types.ThemeWesteros, Width: "100%", Height: "600px"}),
+		charts.WithTitleOpts(opts.Title{
+			Title:    chrom + " Normalized Statistics Overlay",
+			Subtitle: "All stats scaled to threshold units (p99 = 1.0, p95 = 0.95). DeltaSI valleys shown as negative.",
+		}),
+		charts.WithXAxisOpts(opts.XAxis{Name: "Position (bp)"}),
+		charts.WithYAxisOpts(opts.YAxis{
+			Name:  "Normalized Value (threshold units)",
+			Min:   opts.Float(-1.2),
+			Max:   opts.Float(1.2),
+			SplitLine: &opts.SplitLine{Show: opts.Bool(true)},
+		}),
+		charts.WithDataZoomOpts(
+			opts.DataZoom{Type: "slider", XAxisIndex: []int{0}},
+			opts.DataZoom{Type: "inside", XAxisIndex: []int{0}},
+		),
+		charts.WithTooltipOpts(opts.Tooltip{
+			Show:    opts.Bool(true),
+			Trigger: "axis",
+		}),
+		charts.WithLegendOpts(opts.Legend{
+			Show: opts.Bool(true),
+			Top:  "10%",
+		}),
+	)
+
+	// Build normalized data series
+	hiNorm := normalizeToThreshold(hi, avgHp99, false)
+	liNorm := normalizeToThreshold(li, avgLp99, false)
+	dsiNorm := normalizeDeltaSI(dsi, avgDp99, avgDp95, avgDMp99, avgDMp95)
+	edNorm := normalizeToThreshold(ed, avgEp99, false)
+	lodNorm := normalizeToThreshold(lod, avgLodp99, false)
+	bblNorm := normalizeToThreshold(bbl, avgBbp99, false)
+
+	// Build straight lines for threshold references (normalized)
+	p99Pos := make([]opts.LineData, len(x))
+	p95Pos := make([]opts.LineData, len(x))
+	p99Neg := make([]opts.LineData, len(x))
+	p95Neg := make([]opts.LineData, len(x))
+	zeroLine := make([]opts.LineData, len(x))
+
+	for i := range x {
+		p99Pos[i] = opts.LineData{Value: 1.0}
+		p95Pos[i] = opts.LineData{Value: 0.95}
+		p99Neg[i] = opts.LineData{Value: -1.0}
+		p95Neg[i] = opts.LineData{Value: -0.95}
+		zeroLine[i] = opts.LineData{Value: 0.0}
+	}
+
+	smoothing := true
+
+	// Add threshold reference lines first (so they appear behind data)
+	line.SetXAxis(x).
+		AddSeries("p99 (+)", p99Pos,
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 2, Color: "#ff0000"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0.0)}),
+		).
+		AddSeries("p95 (+)", p95Pos,
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1, Color: "#ff6600"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0.0)}),
+		).
+		AddSeries("zero", zeroLine,
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "solid", Width: 1, Color: "#999999"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0.0)}),
+		).
+		AddSeries("p95 (-)", p95Neg,
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1, Color: "#ff6600"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0.0)}),
+		).
+		AddSeries("p99 (-)", p99Neg,
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 2, Color: "#ff0000"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0.0)}),
+		)
+
+	// Add normalized data series with distinct colors
+	line.AddSeries("HighSI", floatSliceToLineData(hiNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2, Color: "#1f77b4"}),
+	)
+	line.AddSeries("LowSI", floatSliceToLineData(liNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2, Color: "#ff7f0e"}),
+	)
+	line.AddSeries("DeltaSI", floatSliceToLineData(dsiNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 3, Color: "#2ca02c"}),
+	)
+	line.AddSeries("ED", floatSliceToLineData(edNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2, Color: "#d62728"}),
+	)
+	line.AddSeries("LOD", floatSliceToLineData(lodNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2, Color: "#9467bd"}),
+	)
+	line.AddSeries("BBLogBF", floatSliceToLineData(bblNorm),
+		charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2, Color: "#8c564b"}),
+	)
+
+	// Mark significant regions with mark areas
+	line.SetSeriesOptions(
+		charts.WithMarkAreaNameTypeItemOpts(
+			opts.MarkAreaNameTypeItem{
+				Name: "Significant (+)",
+				Type: "p99 (+)",
+			},
+			opts.MarkAreaNameTypeItem{
+				Name: "Significant (+)",
+				Type: "p95 (+)",
+			},
+		),
+		charts.WithMarkAreaStyleOpts(
+			opts.MarkAreaStyle{
+				ItemStyle: &opts.ItemStyle{
+					Color: "rgba(255, 0, 0, 0.05)",
+				},
+			},
+		),
+	)
+
+	return line
+}
+
+// normalizeToThreshold scales values by dividing by the p99 threshold
+// Values > 1.0 exceed genome-wide significance
+func normalizeToThreshold(values []float64, p99 float64, allowNegative bool) []float64 {
+	norm := make([]float64, len(values))
+	if p99 == 0 {
+		// Fallback: if threshold is zero, use min-max within this series
+		return normalizeMinMax(values)
+	}
+	for i, v := range values {
+		norm[i] = v / p99
+		if !allowNegative && norm[i] < 0 {
+			norm[i] = 0
+		}
+	}
+	return norm
+}
+
+// normalizeDeltaSI handles bidirectional normalization for DeltaSI
+// Positive values scaled by positive p99, negative values by negative p99 (valley threshold)
+func normalizeDeltaSI(values []float64, p99Pos, p95Pos, p99Neg, p95Neg float64) []float64 {
+	norm := make([]float64, len(values))
+	absP99Neg := math.Abs(p99Neg)
+	if absP99Neg == 0 {
+		absP99Neg = p99Pos // fallback
+	}
+
+	for i, v := range values {
+		if v >= 0 {
+			if p99Pos != 0 {
+				norm[i] = v / p99Pos
+			} else {
+				norm[i] = v
+			}
+		} else {
+			if absP99Neg != 0 {
+				norm[i] = v / absP99Neg // v is negative, absP99Neg is positive, result is negative
+			} else {
+				norm[i] = v
+			}
+		}
+	}
+	return norm
+}
+
+// normalizeMinMax fallback when threshold is zero
+func normalizeMinMax(values []float64) []float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	min, max := values[0], values[0]
+	for _, v := range values[1:] {
+		if v < min {
+			min = v
+		}
+		if v > max {
+			max = v
+		}
+	}
+	out := make([]float64, len(values))
+	if max == min {
+		for i := range values {
+			out[i] = 0.5
+		}
+		return out
+	}
+	for i, v := range values {
+		out[i] = (v - min) / (max - min)
+	}
+	return out
+}
+
+// floatSliceToLineData converts []float64 to []opts.LineData
+func floatSliceToLineData(values []float64) []opts.LineData {
+	data := make([]opts.LineData, len(values))
+	for i, v := range values {
+		data[i] = opts.LineData{Value: v}
+	}
+	return data
+}
+
+// detectQTLs identifies consecutive points crossing the threshold and returns the START, STOP, and PEAK
+func detectQTLs(chrom string, x []int, y []float64, threshold float64, statName, ci string, isValley bool) []QTLRecord {
+	var qtls []QTLRecord
+	inQTL := false
+	var start, stop int64
+	var peak float64
+
+	for i, val := range y {
+		condition := val > threshold
+		if isValley {
+			condition = val < threshold
+		}
+
+		if condition {
+			if !inQTL {
+				inQTL = true
+				start = int64(x[i])
+				peak = val
+			} else {
+				if (isValley && val < peak) || (!isValley && val > peak) {
+					peak = val
+				}
+			}
+		} else {
+			if inQTL {
+				stop = int64(x[i-1]) // Record last point above threshold
+				qtls = append(qtls, QTLRecord{
+					Chrom: chrom,
+					Start: start,
+					Stop:  stop,
+					Peak:  peak,
+					Stat:  statName,
+					CI:    ci,
+				})
+				inQTL = false
+			}
+		}
+	}
+
+	// Handle QTL that extends to the very last window of the chromosome
+	if inQTL {
+		stop = int64(x[len(x)-1])
+		qtls = append(qtls, QTLRecord{
+			Chrom: chrom,
+			Start: start,
+			Stop:  stop,
+			Peak:  peak,
+			Stat:  statName,
+			CI:    ci,
+		})
+	}
+	return qtls
+}
+
+// createInteractiveLineChart handles standard and bidirectional (DeltaSI) plots
+func createInteractiveLineChart(title string, x []int, y []float64, t99, t95, tm99, tm95 float64, hasNegativeThresh bool) *charts.Line {
+	line := charts.NewLine()
+	line.SetGlobalOptions(
+		charts.WithInitializationOpts(opts.Initialization{Theme: types.ThemeWesteros}),
+		charts.WithTitleOpts(opts.Title{Title: title}),
+		charts.WithXAxisOpts(opts.XAxis{Name: "Position (bp)"}),
+		charts.WithDataZoomOpts(opts.DataZoom{Type: "slider", XAxisIndex: []int{0}}),
+		charts.WithTooltipOpts(opts.Tooltip{Show: opts.Bool(true), Trigger: "axis"}),
+	)
+
+	// Build straight lines for the average thresholds
+	yData := make([]opts.LineData, len(y))
+	y99Data := make([]opts.LineData, len(y))
+	y95Data := make([]opts.LineData, len(y))
+
+	var ym99Data []opts.LineData
+	var ym95Data []opts.LineData
+	if hasNegativeThresh {
+		ym99Data = make([]opts.LineData, len(y))
+		ym95Data = make([]opts.LineData, len(y))
+	}
+
+	for i, val := range y {
+		yData[i] = opts.LineData{Value: val}
+		y99Data[i] = opts.LineData{Value: t99}
+		y95Data[i] = opts.LineData{Value: t95}
+		if hasNegativeThresh {
+			ym99Data[i] = opts.LineData{Value: tm99}
+			ym95Data[i] = opts.LineData{Value: tm95}
+		}
+	}
+
+	smoothing := true
+	line.SetXAxis(x).
+		AddSeries("Statistic", yData, charts.WithLineChartOpts(opts.LineChart{Smooth: &smoothing})).
+		AddSeries("p99", y99Data).
+		AddSeries("p95", y95Data)
+
+	if hasNegativeThresh {
+		line.AddSeries("p99_valley", ym99Data)
+		line.AddSeries("p95_valley", ym95Data)
+	}
+
+	return line
+}
