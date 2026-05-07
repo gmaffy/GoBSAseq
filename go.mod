@@ -3,6 +3,7 @@ module github.com/gmaffy/GoBSAseq
 go 1.26.2
 
 require (
+	github.com/biogo/hts v1.4.5
 	github.com/brentp/vcfgo v0.0.0-20250902214554-a31336cef488
 	github.com/fatih/color v1.19.0
 	github.com/go-echarts/go-echarts/v2 v2.7.2

@@ -1,9 +1,6 @@
 package utils
 
 import (
-	"fmt"
-	"math/rand/v2"
-
 	"github.com/brentp/vcfgo"
 )
 
@@ -48,40 +45,27 @@ type AnalysisConfig struct {
 	OneBulkSize  int
 }
 
-func SimulateAF(popStruc string, bulkSize float64, rep int) float64 {
+type HardFilterConfig struct {
+	// SNP thresholds (GATK Best Practices)
+	SNP_QD_Min             float64 // default 2.0   – QualByDepth
+	SNP_QUAL_Min           float64 // default 30.0  – variant quality score
+	SNP_SOR_Max            float64 // default 3.0   – StrandOddsRatio
+	SNP_FS_Max             float64 // default 60.0  – FisherStrand
+	SNP_MQ_Min             float64 // default 40.0  – RMSMappingQuality
+	SNP_MQRankSum_Min      float64 // default -12.5 – MappingQualityRankSumTest
+	SNP_ReadPosRankSum_Min float64 // default -8.0  – ReadPosRankSumTest
 
-	var prob []float64
+	// INDEL thresholds (GATK Best Practices)
+	// Note: MQ/MQRankSum are intentionally excluded for INDELs per GATK guidance
+	// because indel length covaries with mapping quality degradation in a way that
+	// is not indicative of error.
+	INDEL_QD_Min             float64 // default 2.0   – QualByDepth
+	INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
+	INDEL_FS_Max             float64 // default 200.0 – FisherStrand
+	INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
 
-	switch popStruc {
-	case "F2":
-		prob = []float64{0.25, 0.5, 0.25}
-	case "RIL":
-		prob = []float64{0.5, 0.0, 0.5}
-	case "BC":
-		prob = []float64{0.5, 0.5, 0.0}
-	default:
-		fmt.Println("Invalid population structure")
-		return 0.0
-	}
-
-	var totalFreq float64
-	for i := 0; i < rep; i++ {
-		var sumFreq float64
-		for j := 0; j < int(bulkSize); j++ {
-			// Use a simple weighted random choice
-			r := rand.Float64()
-			var allele float64
-			if r < prob[0] {
-				allele = 0.0
-			} else if r < prob[0]+prob[1] {
-				allele = 0.5
-			} else {
-				allele = 1.0
-			}
-			sumFreq += allele
-		}
-		totalFreq += sumFreq / bulkSize
-	}
-	return totalFreq / float64(rep)
-
+	// SaveFilteredVCF writes the hard-filtered records (PASS only) to a
+	// bgzf-compressed VCF at FilteredVCFPath when true.
+	SaveFilteredVCF bool
+	FilteredVCFPath string
 }

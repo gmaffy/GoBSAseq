@@ -288,10 +288,7 @@ type filteredVariant struct {
 //
 // The function is safe to call concurrently with other pipeline stages because
 // it returns a self-contained slice; the rdr must not be shared.
-func ApplyGATKHardFilters(rdr *vcfgo.Reader,
-	header *vcfgo.Header,
-	cfg HardFilterConfig,
-) ([]*vcfgo.Variant, HardFilterStats, error) {
+func ApplyGATKHardFilters(rdr *vcfgo.Reader, header *vcfgo.Header, cfg HardFilterConfig) ([]*vcfgo.Variant, HardFilterStats, error) {
 
 	stats := HardFilterStats{FilterCounts: make(map[string]int)}
 	var passed []*vcfgo.Variant
@@ -650,6 +647,8 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	//	hfCfg.SaveFilteredVCF = true
 	//	hfCfg.FilteredVCFPath = filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 	//}
+	hfCfg.SaveFilteredVCF = true
+	hfCfg.FilteredVCFPath = filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 
 	passedVariants, hfStats, err := ApplyGATKHardFilters(vcfRdr, vcfRdr.Header, hfCfg)
 	if err != nil {

@@ -43,6 +43,19 @@ var rootCmd = &cobra.Command{
 		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
 
+		minQD_SNP, _ := cmd.Flags().GetFloat64("min-QD-SNP")
+		minQUAL_SNP, _ := cmd.Flags().GetFloat64("min-QUAL-SNP")
+		minSOR_SNP, _ := cmd.Flags().GetFloat64("min-SOR-SNP")
+		minFS_SNP, _ := cmd.Flags().GetFloat64("min-FS-SNP")
+		minMQ_SNP, _ := cmd.Flags().GetFloat64("min-MQ-SNP")
+		minMQRank, _ := cmd.Flags().GetFloat64("min-MQRankSum-SNP")
+		minReadPosRank, _ := cmd.Flags().GetFloat64("min-ReadPosRankSum-SNP")
+
+		minQD_INDEL, _ := cmd.Flags().GetFloat64("min-QD-INDEL")
+		minQUAL_INDEL, _ := cmd.Flags().GetFloat64("min-QUAL-INDEL")
+		maxFS_INDEL, _ := cmd.Flags().GetFloat64("max-FS-INDEL")
+		minReadPosRank_INDEL, _ := cmd.Flags().GetFloat64("min-ReadPosRankSum-INDEL")
+
 		parentNamesLst := strings.Split(parents, ",")
 		bulkNamesLst := strings.Split(bulks, ",")
 		bulksDepthLst := strings.Split(bulksDepth, ",")
@@ -188,6 +201,10 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
+		// ==================================== Hard Filter config ================================================== //
+
+		min
+
 		config := utils.AnalysisConfig{
 			VCF:           variant,
 			Population:    population,
@@ -252,4 +269,18 @@ func init() {
 	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
 	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
 	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
+
+	rootCmd.Flags().Float64("min-QD-SNP", 2.0, "QualByDepth SNPs") // SNP_QD_Min             float64 // default 2.0   – QualByDepth
+	rootCmd.Flags().Float64("min-QUAL-SNP", 30.0, "Variant quality SNPs")
+	rootCmd.Flags().Float64("min-SOR-SNP", 3.0, "StrandOddsRatio SNPs")
+	rootCmd.Flags().Float64("min-FS-SNP", 60.0, "FisherStrand SNPs")
+	rootCmd.Flags().Float64("min-MQ-SNP", 40.0, "RMSMappingQuality SNPs")
+	rootCmd.Flags().Float64("min-MQRankSum-SNP", -12.5, "MappingQualityRank SNPs")
+	rootCmd.Flags().Float64("min-ReadPosRankSum-SNP", -8.0, "ReadPosRank SNPs")
+
+	rootCmd.Flags().Float64("min-QD-INDEL", 2.0, "QualByDepth INDELs")               // INDEL_QD_Min             float64 // default 2.0   – QualByDepth
+	rootCmd.Flags().Float64("min-QUAL-INDEL", 30.0, "Variant quality INDELs")        //INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
+	rootCmd.Flags().Float64("max-FS-INDEL", 200.0, "FisherStrand INDELs")            //INDEL_FS_Max             float64 // default 200.0 – FisherStrand
+	rootCmd.Flags().Float64("min-ReadPosRankSum-INDEL", -20.0, "ReadPosRank INDELs") //INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
+
 }
