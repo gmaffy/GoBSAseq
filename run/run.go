@@ -43,7 +43,7 @@ func openVCF(path string) (io.Reader, func(), error) {
 	return f, cleanup, nil
 }
 
-func Run(cfg utils.AnalysisConfig) error { //, vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
+func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
 	bold := color.New(color.Bold).SprintFunc()
 	samples := []string{cfg.HighParentName, cfg.LowParentName, cfg.OneParentName, cfg.HighBulkName, cfg.LowBulkName, cfg.OneBulkName}
 	fmt.Printf("Samples: %v\n", samples)
@@ -317,7 +317,7 @@ func Run(cfg utils.AnalysisConfig) error { //, vcf string, highParentDepth int, 
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulkTwoParents(cfg)
+		twobulk.RunTwoBulkTwoParents(cfg, hfCfg)
 
 	}
 	return nil

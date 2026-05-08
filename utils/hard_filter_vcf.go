@@ -1,5 +1,14 @@
 package utils
 
-func HardFilterVcf(vcf string, out string, cfg utils.HardFilterConfig) error {
+import "github.com/brentp/vcfgo"
+
+func HardFilterVcf(rdr *vcfgo.Reader, out string, cfg HardFilterConfig) error {
+	for {
+		v := rdr.Read()
+		if v == nil {
+			break
+		}
+		if indelThresholds.readPo
+
 	return nil
 }

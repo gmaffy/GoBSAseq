@@ -616,7 +616,7 @@ var thresholdCache sync.Map
 // ---------------------------------------------------------------------------
 
 // RunTwoBulkTwoParents is the main entry point for the two-bulk two-parent analysis.
-func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
+func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
 	highParIdx := cfg.HighParentIdx
 	highParDP := cfg.HighParentDepth
 	lowParIdx := cfg.LowParentIdx
@@ -642,12 +642,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig) {
 	// Stage 0 — GATK hard filtering
 	// -----------------------------------------------------------------------
 	color.Cyan("============================ GATK Hard Filtering ============================\n\n")
-	hfCfg := DefaultHardFilterConfig()
-	//if cfg.SaveFilteredVCF {
-	//	hfCfg.SaveFilteredVCF = true
-	//	hfCfg.FilteredVCFPath = filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
-	//}
-	hfCfg.SaveFilteredVCF = true
+
 	hfCfg.FilteredVCFPath = filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 
 	passedVariants, hfStats, err := ApplyGATKHardFilters(vcfRdr, vcfRdr.Header, hfCfg)

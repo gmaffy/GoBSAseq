@@ -203,9 +203,78 @@ var rootCmd = &cobra.Command{
 
 		// ==================================== Hard Filter config ================================================== //
 
-		min
+		qd_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minQD_SNP), 64)
+		if err != nil {
+			color.Red("min-QD-SNP is supposed to be a float")
+			return
+		}
+		qual_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minQUAL_SNP), 64)
+		if err != nil {
+			color.Red("min-QUAL-SNP is supposed to be a float")
+			return
+		}
+		sor_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minSOR_SNP), 64)
+		if err != nil {
+			color.Red("min-SOR-SNP is supposed to be a float")
+			return
+		}
+		fs_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minFS_SNP), 64)
+		if err != nil {
+			color.Red("min-FS-SNP is supposed to be a float")
+			return
+		}
+		mq_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minMQ_SNP), 64)
+		if err != nil {
+			color.Red("min-MQ-SNP is supposed to be a float")
+			return
+		}
+		mqRank_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minMQRank), 64)
+		if err != nil {
+			color.Red("min-MQRankSum-SNP is supposed to be a float")
+			return
+		}
+		readPosRank_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minReadPosRank), 64)
+		if err != nil {
+			color.Red("min-ReadPosRankSum-SNP is supposed to be a float")
+			return
+		}
 
-		config := utils.AnalysisConfig{
+		qd_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minQD_INDEL), 64)
+		if err != nil {
+			color.Red("min-QD-INDEL is supposed to be a float")
+			return
+		}
+		qual_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minQUAL_INDEL), 64)
+		if err != nil {
+			color.Red("min-QUAL-INDEL is supposed to be a float")
+			return
+		}
+		fs_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", maxFS_INDEL), 64)
+		if err != nil {
+			color.Red("max-FS-INDEL is supposed to be a float")
+			return
+		}
+		readPosRank_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minReadPosRank_INDEL), 64)
+		if err != nil {
+			color.Red("min-ReadPosRankSum-INDEL is supposed to be a float")
+			return
+		}
+
+		hfConfig := utils.HardFilterConfig{
+			SNP_QD_Min:               qd_snp,
+			SNP_QUAL_Min:             qual_snp,
+			SNP_SOR_Max:              sor_snp,
+			SNP_FS_Max:               fs_snp,
+			SNP_MQ_Min:               mq_snp,
+			SNP_MQRankSum_Min:        mqRank_snp,
+			SNP_ReadPosRankSum_Min:   readPosRank_snp,
+			INDEL_QD_Min:             qd_indel,
+			INDEL_QUAL_Min:           qual_indel,
+			INDEL_FS_Max:             fs_indel,
+			INDEL_ReadPosRankSum_Min: readPosRank_indel,
+		}
+
+		a_config := utils.AnalysisConfig{
 			VCF:           variant,
 			Population:    population,
 			WindowSize:    winSize,
@@ -238,7 +307,7 @@ var rootCmd = &cobra.Command{
 			OneBulkSize:  oneBulkSize,
 		}
 
-		err = run.Run(config)
+		err = run.Run(a_config, hfConfig)
 		if err != nil {
 			return
 		}
