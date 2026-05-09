@@ -112,34 +112,9 @@ const (
 // GATK Hard Filtering
 // ---------------------------------------------------------------------------
 
-// HardFilterConfig controls the GATK-style hard filtering applied to raw VCF
-// variants before BSA statistics are computed.  All threshold fields use the
-// GATK Best Practices defaults; set a field to math.NaN() to disable that
-// individual filter.
-type HardFilterConfig struct {
-	// SNP thresholds (GATK Best Practices)
-	SNP_QD_Min             float64 // default 2.0   – QualByDepth
-	SNP_QUAL_Min           float64 // default 30.0  – variant quality score
-	SNP_SOR_Max            float64 // default 3.0   – StrandOddsRatio
-	SNP_FS_Max             float64 // default 60.0  – FisherStrand
-	SNP_MQ_Min             float64 // default 40.0  – RMSMappingQuality
-	SNP_MQRankSum_Min      float64 // default -12.5 – MappingQualityRankSumTest
-	SNP_ReadPosRankSum_Min float64 // default -8.0  – ReadPosRankSumTest
-
-	// INDEL thresholds (GATK Best Practices)
-	// Note: MQ/MQRankSum are intentionally excluded for INDELs per GATK guidance
-	// because indel length covaries with mapping quality degradation in a way that
-	// is not indicative of error.
-	INDEL_QD_Min             float64 // default 2.0   – QualByDepth
-	INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
-	INDEL_FS_Max             float64 // default 200.0 – FisherStrand
-	INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
-
-	// SaveFilteredVCF writes the hard-filtered records (PASS only) to a
-	// bgzf-compressed VCF at FilteredVCFPath when true.
-	SaveFilteredVCF bool
-	FilteredVCFPath string
-}
+// HardFilterConfig is shared with utils so CLI parsing and two-bulk filtering
+// cannot drift into incompatible config types.
+type HardFilterConfig = utils.HardFilterConfig
 
 // DefaultHardFilterConfig returns a HardFilterConfig populated with the GATK
 // Best Practices thresholds as documented in:

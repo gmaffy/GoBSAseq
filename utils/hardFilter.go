@@ -136,6 +136,17 @@ func (r vcfRecord) RefName() string { return r.chrom }
 func (r vcfRecord) Start() int      { return r.start }
 func (r vcfRecord) End() int        { return r.end }
 
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
 // HardFilter reads the input VCF (plain or bgzipped), applies GATK
 // best-practice hard filters to every SNP and INDEL, and writes the passing
 // variants to outPath as a bgzipped VCF.  A tabix index (.tbi) is written
@@ -172,15 +183,26 @@ func HardFilter(vcfPath, outPath string, verbose bool) error {
 
 	// bgzf.NewWriter(w, concurrency).  Use 1 for deterministic block boundaries
 	// (required for correct tabix offsets).
-	bgzfWriter := bgzf.NewWriter(outFile, 1)
+	countingOut := &countingWriter{w: outFile}
+	bgzfWriter := bgzf.NewWriter(countingOut, 1)
 
 	vcfWriter, err := vcfgo.NewWriter(bgzfWriter, rdr.Header)
 	if err != nil {
 		return fmt.Errorf("creating vcf writer: %w", err)
 	}
+	if err := bgzfWriter.Flush(); err != nil {
+		return fmt.Errorf("flushing vcf header: %w", err)
+	}
+	if err := bgzfWriter.Wait(); err != nil {
+		return fmt.Errorf("writing vcf header: %w", err)
+	}
 
 	// ── tabix index ───────────────────────────────────────────────────────────
 	tbx := tabix.New()
+	tbx.Format = 2
+	tbx.NameColumn = 1
+	tbx.BeginColumn = 2
+	tbx.MetaChar = '#'
 
 	var kept, total int
 	for {
@@ -195,13 +217,17 @@ func HardFilter(vcfPath, outPath string, verbose bool) error {
 		}
 
 		// Capture the virtual offset *before* writing this record.
-		startOffset := bgzfWriter.LastChunk()
+		startOffset := bgzf.Offset{File: countingOut.n}
 
-		if err := vcfWriter.WriteVariant(v); err != nil {
+		vcfWriter.WriteVariant(v)
+
+		if err := bgzfWriter.Flush(); err != nil {
+			return fmt.Errorf("flushing variant: %w", err)
+		}
+		if err := bgzfWriter.Wait(); err != nil {
 			return fmt.Errorf("writing variant: %w", err)
 		}
-
-		endOffset := bgzfWriter.LastChunk()
+		endOffset := bgzf.Offset{File: countingOut.n}
 
 		// tabix uses 0-based half-open coordinates.
 		rec := vcfRecord{
@@ -210,7 +236,7 @@ func HardFilter(vcfPath, outPath string, verbose bool) error {
 			end:   int(v.Pos) - 1 + len(v.Ref()), // approximate; correct for SNPs & simple indels
 		}
 
-		if err := tbx.Add(rec, bgzf.Chunk{Begin: startOffset.Begin, End: endOffset.End}, true, true); err != nil {
+		if err := tbx.Add(rec, bgzf.Chunk{Begin: startOffset, End: endOffset}, true, true); err != nil {
 			if verbose {
 				fmt.Fprintf(os.Stderr, "tabix add warning for %s:%d : %v\n", rec.chrom, v.Pos, err)
 			}
@@ -242,7 +268,7 @@ func HardFilter(vcfPath, outPath string, verbose bool) error {
 
 	// The tabix spec requires the .tbi itself to be bgzipped.
 	tbiGz := bgzf.NewWriter(tbiFile, 1)
-	if _, err := tbx.WriteTo(tbiGz); err != nil {
+	if err := tabix.WriteTo(tbiGz, tbx); err != nil {
 		return fmt.Errorf("writing tabix index: %w", err)
 	}
 	if err := tbiGz.Close(); err != nil {
