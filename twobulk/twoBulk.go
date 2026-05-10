@@ -1,55 +1,7 @@
-// Package twobulk contains plotting and QTL-detection for GoBSAseq two-bulk analysis.
-//
-// GenerateHtmlPlotsAndQTL produces THREE separate HTML files:
-//
-//	GoBSAseq_IndividualPlots.html   – one raw-value line chart per statistic per chromosome
-//	GoBSAseq_NormalizedOverlay.html – per-chromosome threshold-relative overlay
-//	GoBSAseq_RobustZScore.html      – genome-wide robust Z-score view, one chart per chromosome
-//
-// Hard filtering (v3):
-//
-//	ApplyGATKHardFilters implements GATK Best Practices hard filtering for SNPs and INDELs
-//	using INFO field annotations (QD, QUAL, FS, SOR, MQ, MQRankSum, ReadPosRankSum).
-//	SNPs and INDELs are evaluated against separate threshold tables matching the GATK
-//	VariantFiltration recommendations:
-//
-//	  SNP filters  : QD<2.0, QUAL<30, SOR>3.0, FS>60.0, MQ<40.0, MQRankSum<-12.5, ReadPosRankSum<-8.0
-//	  INDEL filters: QD<2.0, QUAL<30, FS>200.0, ReadPosRankSum<-20.0
-//
-//	Variants that fail one or more filters are excluded from downstream BSA analysis.
-//	Optionally the filtered VCF can be written to a bgzf-compressed .vcf.gz file.
-//
-// Normalization (v2):
-//
-//	Genome-wide robust Z-score:
-//	    z = (x − median_genome) / (MAD_genome × 1.4826)
-//	The top 1 % of values per statistic are excluded when estimating the background
-//	median/MAD so that genuine QTL peaks do not inflate the spread.
-//	Reference lines are drawn at z = ±2 (suggestive) and z = ±3 (significant).
-//
-// QTL detection improvements (v3):
-//
-//   - Per-statistic weight accumulators in smoothChromosome (Gstat/LOD/BF no longer
-//     share the DeltaSI weight denominator).
-//   - Adaptive minimum-SNP guard: windows with fewer than minSNPsPerWindow SNPs are
-//     skipped to avoid unstable estimates in low-density regions.
-//   - Robust Z-score arrays are now passed through detectQTLs at z=2/z=3 and written
-//     to a dedicated "ZScore_QTL" section of the QTL TSV.
-//   - Multi-statistic consensus QTL calling: positions where ≥ consensusMinStats
-//     statistics simultaneously exceed their thresholds are reported as ConsensusQTL.
-//   - Gap-bridging in detectQTLs: intervals separated by ≤ maxGapWindows windows are
-//     merged to avoid fragmenting real QTLs across repetitive-element gaps.
-//   - BRM blocks are intersected with permutation QTLs to produce a high-confidence
-//     HighConfidenceQTL output column.
-//   - AFP floor in calculateBRMBlocks prevents hypersensitive calls near fixation.
-//   - Per-window threshold lookup in detectQTLs replaces chromosome-average thresholds.
-//   - ED statistic now uses the ED^4 power formulation (Magwene et al.) for independent
-//     signal from DeltaSI.
 package twobulk
 
 import (
 	"bufio"
-	"compress/gzip"
 	"fmt"
 	"math"
 	"math/rand"
@@ -57,8 +9,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -108,379 +58,6 @@ const (
 	defaultBRMAlpha = 0.05
 )
 
-// ---------------------------------------------------------------------------
-// GATK Hard Filtering
-// ---------------------------------------------------------------------------
-
-// HardFilterConfig is shared with utils so CLI parsing and two-bulk filtering
-// cannot drift into incompatible config types.
-type HardFilterConfig = utils.HardFilterConfig
-
-// DefaultHardFilterConfig returns a HardFilterConfig populated with the GATK
-// Best Practices thresholds as documented in:
-// https://gatk.broadinstitute.org/hc/en-us/articles/360035531112
-func DefaultHardFilterConfig() HardFilterConfig {
-	return HardFilterConfig{
-		SNP_QD_Min:             2.0,
-		SNP_QUAL_Min:           30.0,
-		SNP_SOR_Max:            3.0,
-		SNP_FS_Max:             60.0,
-		SNP_MQ_Min:             40.0,
-		SNP_MQRankSum_Min:      -12.5,
-		SNP_ReadPosRankSum_Min: -8.0,
-
-		INDEL_QD_Min:             2.0,
-		INDEL_QUAL_Min:           30.0,
-		INDEL_FS_Max:             200.0,
-		INDEL_ReadPosRankSum_Min: -20.0,
-	}
-}
-
-// filterResult is the outcome of evaluating a single variant.
-type filterResult struct {
-	pass        bool
-	failReasons []string
-}
-
-// isSNP reports whether a VCF variant record is a SNP (REF and all ALT alleles
-// are single bases).
-func isSNP(v *vcfgo.Variant) bool {
-	if len(v.Reference) != 1 {
-		return false
-	}
-	for _, a := range v.Alt() {
-		if len(a) != 1 || a == "<*>" || a == "<NON_REF>" {
-			return false
-		}
-	}
-	return true
-}
-
-// getInfoFloat extracts a float64 from the INFO field of a VCF variant.
-// Returns (value, true) on success, (0, false) if the key is absent or
-// not parseable.
-func getInfoFloat(v *vcfgo.Variant, key string) (float64, bool) {
-	raw, err := v.Info().Get(key)
-	if err != nil || raw == nil {
-		return 0, false
-	}
-	switch val := raw.(type) {
-	case float64:
-		return val, true
-	case float32:
-		return float64(val), true
-	case int:
-		return float64(val), true
-	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(val), 64)
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	}
-	return 0, false
-}
-
-// evalSNPFilters evaluates GATK SNP hard-filter criteria against a variant.
-func evalSNPFilters(v *vcfgo.Variant, cfg HardFilterConfig) filterResult {
-	var fails []string
-
-	if qual := float64(v.Quality); !math.IsNaN(cfg.SNP_QUAL_Min) && qual < cfg.SNP_QUAL_Min {
-		fails = append(fails, fmt.Sprintf("QUAL30(%.1f)", qual))
-	}
-	if qd, ok := getInfoFloat(v, "QD"); ok && !math.IsNaN(cfg.SNP_QD_Min) && qd < cfg.SNP_QD_Min {
-		fails = append(fails, fmt.Sprintf("QD2(%.2f)", qd))
-	}
-	if sor, ok := getInfoFloat(v, "SOR"); ok && !math.IsNaN(cfg.SNP_SOR_Max) && sor > cfg.SNP_SOR_Max {
-		fails = append(fails, fmt.Sprintf("SOR3(%.2f)", sor))
-	}
-	if fs, ok := getInfoFloat(v, "FS"); ok && !math.IsNaN(cfg.SNP_FS_Max) && fs > cfg.SNP_FS_Max {
-		fails = append(fails, fmt.Sprintf("FS60(%.2f)", fs))
-	}
-	if mq, ok := getInfoFloat(v, "MQ"); ok && !math.IsNaN(cfg.SNP_MQ_Min) && mq < cfg.SNP_MQ_Min {
-		fails = append(fails, fmt.Sprintf("MQ40(%.2f)", mq))
-	}
-	if mqrs, ok := getInfoFloat(v, "MQRankSum"); ok && !math.IsNaN(cfg.SNP_MQRankSum_Min) && mqrs < cfg.SNP_MQRankSum_Min {
-		fails = append(fails, fmt.Sprintf("MQRankSum-12.5(%.2f)", mqrs))
-	}
-	if rprs, ok := getInfoFloat(v, "ReadPosRankSum"); ok && !math.IsNaN(cfg.SNP_ReadPosRankSum_Min) && rprs < cfg.SNP_ReadPosRankSum_Min {
-		fails = append(fails, fmt.Sprintf("ReadPosRankSum-8(%.2f)", rprs))
-	}
-
-	return filterResult{pass: len(fails) == 0, failReasons: fails}
-}
-
-// evalINDELFilters evaluates GATK INDEL hard-filter criteria against a variant.
-// MQ and MQRankSum are intentionally omitted per GATK guidance.
-func evalINDELFilters(v *vcfgo.Variant, cfg HardFilterConfig) filterResult {
-	var fails []string
-
-	if qual := float64(v.Quality); !math.IsNaN(cfg.INDEL_QUAL_Min) && qual < cfg.INDEL_QUAL_Min {
-		fails = append(fails, fmt.Sprintf("QUAL30(%.1f)", qual))
-	}
-	if qd, ok := getInfoFloat(v, "QD"); ok && !math.IsNaN(cfg.INDEL_QD_Min) && qd < cfg.INDEL_QD_Min {
-		fails = append(fails, fmt.Sprintf("QD2(%.2f)", qd))
-	}
-	if fs, ok := getInfoFloat(v, "FS"); ok && !math.IsNaN(cfg.INDEL_FS_Max) && fs > cfg.INDEL_FS_Max {
-		fails = append(fails, fmt.Sprintf("FS200(%.2f)", fs))
-	}
-	if rprs, ok := getInfoFloat(v, "ReadPosRankSum"); ok && !math.IsNaN(cfg.INDEL_ReadPosRankSum_Min) && rprs < cfg.INDEL_ReadPosRankSum_Min {
-		fails = append(fails, fmt.Sprintf("ReadPosRankSum-20(%.2f)", rprs))
-	}
-
-	return filterResult{pass: len(fails) == 0, failReasons: fails}
-}
-
-// HardFilterStats summarises the outcome of a hard-filter pass.
-type HardFilterStats struct {
-	Total        int
-	Passed       int
-	SNPs         int
-	INDELs       int
-	SNPPass      int
-	INDELPass    int
-	FilterCounts map[string]int // per-filter-name fail counts
-}
-
-// filteredVariant bundles a variant with its evaluation result for the optional
-// VCF writer goroutine.
-type filteredVariant struct {
-	v      *vcfgo.Variant
-	result filterResult
-	isSNPv bool
-}
-
-// ApplyGATKHardFilters reads variants from rdr, applies GATK Best Practices
-// hard filters (SNPs and INDELs with separate thresholds), and returns the
-// slice of variants that PASS all applicable filters along with filter
-// statistics.
-//
-// When cfg.SaveFilteredVCF is true the function concurrently writes all records
-// (PASS and FAIL) in annotated form to a bgzf-compressed VCF at
-// cfg.FilteredVCFPath, mirroring the GATK VariantFiltration output format
-// where passing records have FILTER=PASS and failing records carry the filter
-// name(s).
-//
-// The function is safe to call concurrently with other pipeline stages because
-// it returns a self-contained slice; the rdr must not be shared.
-func ApplyGATKHardFilters(rdr *vcfgo.Reader, header *vcfgo.Header, cfg HardFilterConfig) ([]*vcfgo.Variant, HardFilterStats, error) {
-
-	stats := HardFilterStats{FilterCounts: make(map[string]int)}
-	var passed []*vcfgo.Variant
-	var mu sync.Mutex
-
-	// Optional VCF writer channel.
-	var writeChan chan filteredVariant
-	var writeWG sync.WaitGroup
-	var writeErr error
-
-	if cfg.SaveFilteredVCF && cfg.FilteredVCFPath != "" {
-		writeChan = make(chan filteredVariant, 4096)
-		writeWG.Add(1)
-		go func() {
-			defer writeWG.Done()
-			if err := writeFilteredVCFGZ(cfg.FilteredVCFPath, header, writeChan); err != nil {
-				mu.Lock()
-				writeErr = err
-				mu.Unlock()
-			}
-		}()
-	}
-
-	numWorkers := runtime.NumCPU()
-	varChan := make(chan *vcfgo.Variant, 10000)
-	resultChan := make(chan struct {
-		v      *vcfgo.Variant
-		r      filterResult
-		isSNPv bool
-	}, 10000)
-
-	// Reader goroutine.
-	go func() {
-		for v := rdr.Read(); v != nil; v = rdr.Read() {
-			varChan <- v
-		}
-		close(varChan)
-	}()
-
-	// Worker goroutines evaluate each variant.
-	var workerWG sync.WaitGroup
-	for w := 0; w < numWorkers; w++ {
-		workerWG.Add(1)
-		go func() {
-			defer workerWG.Done()
-			for v := range varChan {
-				snp := isSNP(v)
-				var r filterResult
-				if snp {
-					r = evalSNPFilters(v, cfg)
-				} else {
-					r = evalINDELFilters(v, cfg)
-				}
-				resultChan <- struct {
-					v      *vcfgo.Variant
-					r      filterResult
-					isSNPv bool
-				}{v, r, snp}
-			}
-		}()
-	}
-
-	go func() {
-		workerWG.Wait()
-		close(resultChan)
-	}()
-
-	// Collector: aggregate stats and build pass slice.
-	bar := progressbar.Default(-1, "Hard filtering variants")
-	for res := range resultChan {
-		stats.Total++
-		if res.isSNPv {
-			stats.SNPs++
-		} else {
-			stats.INDELs++
-		}
-
-		if res.r.pass {
-			stats.Passed++
-			if res.isSNPv {
-				stats.SNPPass++
-			} else {
-				stats.INDELPass++
-			}
-			passed = append(passed, res.v)
-		} else {
-			for _, reason := range res.r.failReasons {
-				// Extract filter name prefix (e.g. "QD2" from "QD2(1.5)").
-				name := reason
-				if idx := strings.Index(reason, "("); idx > 0 {
-					name = reason[:idx]
-				}
-				stats.FilterCounts[name]++
-			}
-		}
-
-		if writeChan != nil {
-			writeChan <- filteredVariant{v: res.v, result: res.r, isSNPv: res.isSNPv}
-		}
-		_ = bar.Add(1)
-	}
-	_ = bar.Finish()
-
-	if writeChan != nil {
-		close(writeChan)
-		writeWG.Wait()
-		if writeErr != nil {
-			return passed, stats, fmt.Errorf("writing filtered VCF: %w", writeErr)
-		}
-	}
-
-	return passed, stats, nil
-}
-
-// writeFilteredVCFGZ writes all variants received on ch to a bgzf-compressed
-// VCF file at path.  PASS variants get FILTER=PASS; failing variants get their
-// filter name(s) in the FILTER column, matching GATK VariantFiltration output.
-func writeFilteredVCFGZ(path string, header *vcfgo.Header, ch <-chan filteredVariant) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", path, err)
-	}
-	gz := gzip.NewWriter(f)
-	bw := bufio.NewWriterSize(gz, 1<<20)
-
-	// Write VCF header.
-	_ = header // vcfgo does not expose a header serialiser; write a minimal header.
-	fmt.Fprintln(bw, "##fileformat=VCFv4.2")
-	fmt.Fprintln(bw, "##FILTER=<ID=PASS,Description=\"All filters passed\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=QD2,Description=\"QD < 2.0\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=QUAL30,Description=\"QUAL < 30.0\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=SOR3,Description=\"SOR > 3.0 (SNP)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=FS60,Description=\"FS > 60.0 (SNP)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=MQ40,Description=\"MQ < 40.0 (SNP)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=MQRankSum-12.5,Description=\"MQRankSum < -12.5 (SNP)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=ReadPosRankSum-8,Description=\"ReadPosRankSum < -8.0 (SNP)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=FS200,Description=\"FS > 200.0 (INDEL)\">")
-	fmt.Fprintln(bw, "##FILTER=<ID=ReadPosRankSum-20,Description=\"ReadPosRankSum < -20.0 (INDEL)\">")
-	fmt.Fprintln(bw, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO")
-
-	for fv := range ch {
-		v := fv.v
-		filterField := "PASS"
-		if !fv.result.pass {
-			// Strip parenthesised values from reason strings to get clean filter IDs.
-			names := make([]string, 0, len(fv.result.failReasons))
-			for _, r := range fv.result.failReasons {
-				name := r
-				if idx := strings.Index(r, "("); idx > 0 {
-					name = r[:idx]
-				}
-				names = append(names, name)
-			}
-			filterField = strings.Join(names, ";")
-		}
-		altStr := strings.Join(v.Alt(), ",")
-		infoStr := "."
-		if v.Info() != nil {
-			infoStr = v.Info().String()
-		}
-		fmt.Fprintf(bw, "%s\t%d\t.\t%s\t%s\t%.2f\t%s\t%s\n",
-			v.Chromosome, v.Pos, v.Reference, altStr,
-			float64(v.Quality), filterField, infoStr)
-	}
-
-	if err := bw.Flush(); err != nil {
-		_ = gz.Close()
-		_ = f.Close()
-		return err
-	}
-	if err := gz.Close(); err != nil {
-		_ = f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// PrintHardFilterStats writes a formatted summary of hard-filter results.
-func PrintHardFilterStats(stats HardFilterStats) {
-	color.Cyan("\n======================== Hard Filter Summary ========================\n")
-	color.White("  Total variants examined : %d", stats.Total)
-	color.White("  SNPs                    : %d  (passed: %d, failed: %d)",
-		stats.SNPs, stats.SNPPass, stats.SNPs-stats.SNPPass)
-	color.White("  INDELs                  : %d  (passed: %d, failed: %d)",
-		stats.INDELs, stats.INDELPass, stats.INDELs-stats.INDELPass)
-	color.Green("  Total PASS              : %d (%.1f%%)",
-		stats.Passed, 100*float64(stats.Passed)/float64(max1(stats.Total)))
-	if len(stats.FilterCounts) > 0 {
-		color.Yellow("  Per-filter failure counts:")
-		type kv struct {
-			k string
-			v int
-		}
-		var pairs []kv
-		for k, v := range stats.FilterCounts {
-			pairs = append(pairs, kv{k, v})
-		}
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].v > pairs[j].v })
-		for _, p := range pairs {
-			color.Yellow("    %-30s %d", p.k, p.v)
-		}
-	}
-	fmt.Println()
-}
-
-func max1(n int) int {
-	if n < 1 {
-		return 1
-	}
-	return n
-}
-
-// ---------------------------------------------------------------------------
-// Domain types
-// ---------------------------------------------------------------------------
-
-// BSAstats holds the raw statistics for a single SNP position.
 type BSAstats struct {
 	CHROM      string
 	POS        int64
@@ -507,6 +84,17 @@ type BSAstats struct {
 	BBLogBF float64
 
 	Depth int
+}
+
+// HardFilterStats summarises the outcome of a hard-filter pass.
+type HardFilterStats struct {
+	Total        int
+	Passed       int
+	SNPs         int
+	INDELs       int
+	SNPPass      int
+	INDELPass    int
+	FilterCounts map[string]int // per-filter-name fail counts
 }
 
 // SmoothedStats holds the window-averaged statistics for one genomic window.
@@ -590,222 +178,106 @@ var thresholdCache sync.Map
 // Analysis pipeline
 // ---------------------------------------------------------------------------
 
-// RunTwoBulkTwoParents is the main entry point for the two-bulk two-parent analysis.
-func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
-	highParIdx := cfg.HighParentIdx
-	highParDP := cfg.HighParentDepth
-	lowParIdx := cfg.LowParentIdx
-	lowParDP := cfg.LowParentDepth
-	highBulkIdx := cfg.HighBulkIdx
-	highBulkDP := cfg.HighBulkDepth
-	lowBulkIdx := cfg.LowBulkIdx
-	lowBulkDP := cfg.LowBulkDepth
-	vcfRdr := cfg.Rdr
-	outDir := cfg.OutputDir
+// ================================== BSA-seq statistics ======================================================== //
 
-	windowSize := int64(cfg.WindowSize)
-	stepSize := int64(cfg.StepSize)
-	rep := cfg.Rep
-	pop := cfg.Population
+func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
+	hba := float64(highBulkAlt) + 0.5
+	hbr := float64(highBulkRef) + 0.5
+	lba := float64(lowBulkAlt) + 0.5
+	lbr := float64(lowBulkRef) + 0.5
 
-	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
-	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
-
-	overallStart := time.Now()
-
-	// -----------------------------------------------------------------------
-	// Stage 0 — GATK hard filtering
-	// -----------------------------------------------------------------------
-	color.Cyan("============================ GATK Hard Filtering ============================\n\n")
-
-	hfCfg.FilteredVCFPath = filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
-
-	passedVariants, hfStats, err := ApplyGATKHardFilters(vcfRdr, vcfRdr.Header, hfCfg)
-	if err != nil {
-		color.Red("Hard filter error: %v", err)
+	highBulkTotal := hba + hbr
+	lowBulkTotal := lba + lbr
+	total := highBulkTotal + lowBulkTotal
+	if total == 0 {
+		return 0
 	}
-	PrintHardFilterStats(hfStats)
 
-	// -----------------------------------------------------------------------
-	// Stage 1 — per-SNP statistics (concurrent)
-	// -----------------------------------------------------------------------
-	statsChan := make(chan BSAstats, 10000)
-	rawWriteChan := make(chan BSAstats, 10000)
+	expHighAlt := highBulkTotal * (hba + lba) / total
+	expHighRef := highBulkTotal * (hbr + lbr) / total
+	expLowAlt := lowBulkTotal * (hba + lba) / total
+	expLowRef := lowBulkTotal * (hbr + lbr) / total
 
-	numWorkers := runtime.NumCPU()
-	var workerWG sync.WaitGroup
+	g := 0.0
+	if hba > 0 {
+		g += hba * math.Log(hba/expHighAlt)
+	}
+	if hbr > 0 {
+		g += hbr * math.Log(hbr/expHighRef)
+	}
+	if lba > 0 {
+		g += lba * math.Log(lba/expLowAlt)
+	}
+	if lbr > 0 {
+		g += lbr * math.Log(lbr/expLowRef)
+	}
+	return 2 * g
+}
 
-	var rawWG sync.WaitGroup
-	rawWG.Add(1)
-	go func() {
-		defer rawWG.Done()
-		if err := writeRawTSV(filepath.Join(outDir, "GoBSAseq.raw.tsv"), rawWriteChan); err != nil {
-			color.Red("Error writing raw TSV: %v", err)
+// euclideanDistance4 computes the ED^4 formulation from Magwene et al. (2011),
+// which provides a statistic that is genuinely distinct from |DeltaSI|:
+//
+//	ED = sqrt((hSI - lSI)^2)  →  ED^4 = (hSI - lSI)^4
+//
+// Raising to the 4th power amplifies large differences while strongly
+// suppressing noise near zero, increasing separation between signal and background.
+func euclideanDistance4(hSI, lSI float64) float64 {
+	d := hSI - lSI
+	return d * d * d * d
+}
+
+func logBeta(a, b float64) float64 {
+	la, _ := math.Lgamma(a)
+	lb, _ := math.Lgamma(b)
+	lab, _ := math.Lgamma(a + b)
+	return la + lb - lab
+}
+
+func lod(ref1, alt1, ref2, alt2 int) float64 {
+	n1 := float64(ref1 + alt1)
+	n2 := float64(ref2 + alt2)
+	total := n1 + n2
+	if n1 == 0 || n2 == 0 || total == 0 {
+		return 0
+	}
+
+	const eps = 1e-10
+	clamp := func(p float64) float64 {
+		if p <= 0 {
+			return eps
 		}
-	}()
-
-	color.Cyan("============================ Calculating Statistics =============================\n\n")
-	bar := progressbar.Default(int64(len(passedVariants)), "Processing variants")
-
-	// Feed worker pool from the pre-filtered slice.
-	variantChan := make(chan *vcfgo.Variant, 10000)
-	go func() {
-		for _, v := range passedVariants {
-			variantChan <- v
+		if p >= 1 {
+			return 1 - eps
 		}
-		close(variantChan)
-	}()
-
-	for i := 0; i < numWorkers; i++ {
-		workerWG.Add(1)
-		go func() {
-			defer workerWG.Done()
-			for variant := range variantChan {
-				if !GoodVariants(variant, highParIdx, highParDP, lowParIdx, lowParDP, highBulkIdx, highBulkDP, lowBulkIdx, lowBulkDP) {
-					_ = bar.Add(1)
-					continue
-				}
-
-				lpGT := variant.Samples[lowParIdx].GT
-				hbGT := variant.Samples[highBulkIdx].GT
-				lbGT := variant.Samples[lowBulkIdx].GT
-				hbDP, lbDP := variant.Samples[highBulkIdx].DP, variant.Samples[lowBulkIdx].DP
-
-				if hbDP == 0 || lbDP == 0 {
-					_ = bar.Add(1)
-					continue
-				}
-
-				hbRefDep, _ := variant.Samples[highBulkIdx].RefDepth()
-				hbAltDeps, _ := variant.Samples[highBulkIdx].AltDepths()
-				lbRefDep, _ := variant.Samples[lowBulkIdx].RefDepth()
-				lbAltDeps, _ := variant.Samples[lowBulkIdx].AltDepths()
-
-				if len(hbAltDeps) == 0 || len(lbAltDeps) == 0 {
-					_ = bar.Add(1)
-					continue
-				}
-
-				var hbL, hbH, lbL, lbH int
-				if hbGT[0] == lpGT[0] {
-					hbL, hbH = hbRefDep, hbAltDeps[0]
-				} else {
-					hbL, hbH = hbAltDeps[0], hbRefDep
-				}
-				if lbGT[0] == lpGT[0] {
-					lbL, lbH = lbRefDep, lbAltDeps[0]
-				} else {
-					lbL, lbH = lbAltDeps[0], lbRefDep
-				}
-
-				hSI := float64(hbH) / float64(hbDP)
-				lSI := float64(lbH) / float64(lbDP)
-				minDepth := hbDP
-				if lbDP < minDepth {
-					minDepth = lbDP
-				}
-
-				s := BSAstats{
-					CHROM:      variant.Chromosome,
-					POS:        int64(variant.Pos),
-					REF:        variant.Reference,
-					ALT:        variant.Alt()[0],
-					HighParGT:  variant.Samples[highParIdx].GT,
-					LowParGT:   variant.Samples[lowParIdx].GT,
-					HighBulkGT: variant.Samples[highBulkIdx].GT,
-					HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[0]),
-					LowBulkGT:  variant.Samples[lowBulkIdx].GT,
-					LowBulkAD:  fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[0]),
-					HighBulkL:  hbL,
-					HighBulkH:  hbH,
-					LowBulkL:   lbL,
-					LowBulkH:   lbH,
-					HighSI:     math.Round(hSI*1e6) / 1e6,
-					LowSI:      math.Round(lSI*1e6) / 1e6,
-					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
-					Gstat:      math.Round(GStatistic(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					ED:         math.Round(euclideanDistance4(hSI, lSI)*1e6) / 1e6,
-					LOD:        math.Round(lod(hbL, hbH, lbL, lbH)*1e6) / 1e6,
-					BBLogBF:    math.Round(betaBinomialLogBF(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					Depth:      minDepth,
-				}
-				statsChan <- s
-				rawWriteChan <- s
-				_ = bar.Add(1)
-			}
-		}()
+		return p
 	}
 
-	go func() {
-		workerWG.Wait()
-		close(statsChan)
-		close(rawWriteChan)
-	}()
+	p1 := clamp(float64(alt1) / n1)
+	p2 := clamp(float64(alt2) / n2)
+	p0 := clamp(float64(alt1+alt2) / total)
 
-	chromStats := make(map[string][]BSAstats)
-	for s := range statsChan {
-		chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
-	}
-	_ = bar.Finish()
-	rawWG.Wait()
-
-	// -----------------------------------------------------------------------
-	// Stage 2 — smoothing
-	// -----------------------------------------------------------------------
-	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
-
-	var allSmoothed []SmoothedStats
-	for chrom, stats := range chromStats {
-		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
-		smoothed := smoothChromosome(stats, windowSize, stepSize)
-		allSmoothed = append(allSmoothed, smoothed...)
+	logLik := func(k, n, p float64) float64 {
+		if n == 0 {
+			return 0
+		}
+		return k*math.Log(p) + (n-k)*math.Log(1-p)
 	}
 
-	// -----------------------------------------------------------------------
-	// Stage 3 — threshold simulation
-	// -----------------------------------------------------------------------
-	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
-	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
-	// Attach per-window thresholds to the SmoothedStats slice so downstream
-	// QTL detection can use locally adaptive thresholds rather than chromosome averages.
-	for i := range allSmoothed {
-		allSmoothed[i].thresholds = calcThresholdsCached(
-			allSmoothed[i].MeanHighBulkDP, allSmoothed[i].MeanLowBulkDP, highSmAF, lowSmAF, rep)
-	}
-	color.Green("\nThreshold calculations complete.")
+	logL1 := logLik(float64(alt1), n1, p1) + logLik(float64(alt2), n2, p2)
+	logL0 := logLik(float64(alt1), n1, p0) + logLik(float64(alt2), n2, p0)
+	return (logL1 - logL0) / math.Log(10)
+}
 
-	// -----------------------------------------------------------------------
-	// Stage 4 — smoothed TSV
-	// -----------------------------------------------------------------------
-	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
-	smoothTSV := filepath.Join(outDir, "GoBSAseq.smooth.tsv")
-	if err := writeSmoothedTSV(smoothTSV, allSmoothed, highSmAF, lowSmAF, rep); err != nil {
-		color.Red("Error writing smoothed TSV: %v", err)
-	} else {
-		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), smoothTSV)
-	}
-	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
-	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
+func betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail int) float64 {
+	alphaH, betaH := 0.5, 0.5
+	alphaL, betaL := 0.5, 0.5
 
-	// -----------------------------------------------------------------------
-	// Stage 5 — plots and QTL detection
-	// -----------------------------------------------------------------------
-	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
-	htmlFile := filepath.Join(outDir, "GoBSAseq_InteractivePlots.html")
-	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
+	logAlt := logBeta(alphaH+float64(highSucc), betaH+float64(highFail)) - logBeta(alphaH, betaH)
+	logAlt += logBeta(alphaL+float64(lowSucc), betaL+float64(lowFail)) - logBeta(alphaL, betaL)
 
-	if err := GenerateHtmlPlotsAndQTL(
-		allSmoothed,
-		highSmAF, lowSmAF,
-		cfg.HighBulkSize, cfg.LowBulkSize,
-		pop, cfg.Alphas, rep,
-		htmlFile, qtlFile,
-	); err != nil {
-		color.Red("Error generating Plots and QTLs: %v", err)
-	} else {
-		color.Green("Interactive HTML plots written under %s", outDir)
-		color.Green("QTL tabular results written to %s", qtlFile)
-	}
+	alpha0, beta0 := 0.5, 0.5
+	logNull := logBeta(alpha0+float64(highSucc+lowSucc), beta0+float64(highFail+lowFail)) - logBeta(alpha0, beta0)
+	return (logAlt - logNull) / math.Log(10)
 }
 
 // ---------------------------------------------------------------------------
@@ -945,159 +417,6 @@ func calcAllThresholds(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, r
 	}
 	wg.Wait()
 	fmt.Println()
-}
-
-// ---------------------------------------------------------------------------
-// Statistic helpers
-// ---------------------------------------------------------------------------
-
-func isHomozygous(gt []int) bool {
-	if len(gt) == 0 {
-		return false
-	}
-	first := gt[0]
-	if first < 0 {
-		return false
-	}
-	for _, a := range gt[1:] {
-		if a != first {
-			return false
-		}
-	}
-	return true
-}
-
-func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
-	hba := float64(highBulkAlt) + 0.5
-	hbr := float64(highBulkRef) + 0.5
-	lba := float64(lowBulkAlt) + 0.5
-	lbr := float64(lowBulkRef) + 0.5
-
-	highBulkTotal := hba + hbr
-	lowBulkTotal := lba + lbr
-	total := highBulkTotal + lowBulkTotal
-	if total == 0 {
-		return 0
-	}
-
-	expHighAlt := highBulkTotal * (hba + lba) / total
-	expHighRef := highBulkTotal * (hbr + lbr) / total
-	expLowAlt := lowBulkTotal * (hba + lba) / total
-	expLowRef := lowBulkTotal * (hbr + lbr) / total
-
-	g := 0.0
-	if hba > 0 {
-		g += hba * math.Log(hba/expHighAlt)
-	}
-	if hbr > 0 {
-		g += hbr * math.Log(hbr/expHighRef)
-	}
-	if lba > 0 {
-		g += lba * math.Log(lba/expLowAlt)
-	}
-	if lbr > 0 {
-		g += lbr * math.Log(lbr/expLowRef)
-	}
-	return 2 * g
-}
-
-// euclideanDistance4 computes the ED^4 formulation from Magwene et al. (2011),
-// which provides a statistic that is genuinely distinct from |DeltaSI|:
-//
-//	ED = sqrt((hSI - lSI)^2)  →  ED^4 = (hSI - lSI)^4
-//
-// Raising to the 4th power amplifies large differences while strongly
-// suppressing noise near zero, increasing separation between signal and background.
-func euclideanDistance4(hSI, lSI float64) float64 {
-	d := hSI - lSI
-	return d * d * d * d
-}
-
-func logBeta(a, b float64) float64 {
-	la, _ := math.Lgamma(a)
-	lb, _ := math.Lgamma(b)
-	lab, _ := math.Lgamma(a + b)
-	return la + lb - lab
-}
-
-func lod(ref1, alt1, ref2, alt2 int) float64 {
-	n1 := float64(ref1 + alt1)
-	n2 := float64(ref2 + alt2)
-	total := n1 + n2
-	if n1 == 0 || n2 == 0 || total == 0 {
-		return 0
-	}
-
-	const eps = 1e-10
-	clamp := func(p float64) float64 {
-		if p <= 0 {
-			return eps
-		}
-		if p >= 1 {
-			return 1 - eps
-		}
-		return p
-	}
-
-	p1 := clamp(float64(alt1) / n1)
-	p2 := clamp(float64(alt2) / n2)
-	p0 := clamp(float64(alt1+alt2) / total)
-
-	logLik := func(k, n, p float64) float64 {
-		if n == 0 {
-			return 0
-		}
-		return k*math.Log(p) + (n-k)*math.Log(1-p)
-	}
-
-	logL1 := logLik(float64(alt1), n1, p1) + logLik(float64(alt2), n2, p2)
-	logL0 := logLik(float64(alt1), n1, p0) + logLik(float64(alt2), n2, p0)
-	return (logL1 - logL0) / math.Log(10)
-}
-
-func betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail int) float64 {
-	alphaH, betaH := 0.5, 0.5
-	alphaL, betaL := 0.5, 0.5
-
-	logAlt := logBeta(alphaH+float64(highSucc), betaH+float64(highFail)) - logBeta(alphaH, betaH)
-	logAlt += logBeta(alphaL+float64(lowSucc), betaL+float64(lowFail)) - logBeta(alphaL, betaL)
-
-	alpha0, beta0 := 0.5, 0.5
-	logNull := logBeta(alpha0+float64(highSucc+lowSucc), beta0+float64(highFail+lowFail)) - logBeta(alpha0, beta0)
-	return (logAlt - logNull) / math.Log(10)
-}
-
-// GoodVariants filters to biallelic, fully called, homozygous divergent parents
-// with sufficient parent and bulk depth.
-func GoodVariants(v *vcfgo.Variant, highPar, highParDP, lowPar, lowParDP, highBulk, highBulkDP, lowBulk, lowBulkDP int) bool {
-	indices := []int{highPar, lowPar, highBulk, lowBulk}
-	if len(v.Alt()) != 1 {
-		return false
-	}
-
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(v.Samples) {
-			return false
-		}
-		s := v.Samples[idx]
-		if len(s.GT) == 0 {
-			return false
-		}
-		for _, allele := range s.GT {
-			if allele < 0 {
-				return false
-			}
-		}
-	}
-
-	hpGT, lpGT := v.Samples[highPar].GT, v.Samples[lowPar].GT
-	hpDP, lpDP := v.Samples[highPar].DP, v.Samples[lowPar].DP
-	hbDP, lbDP := v.Samples[highBulk].DP, v.Samples[lowBulk].DP
-
-	if !isHomozygous(hpGT) || !isHomozygous(lpGT) || hpGT[0] == lpGT[0] {
-		return false
-	}
-	return hpDP >= highParDP && lpDP >= lowParDP && hbDP >= highBulkDP && lbDP >= lowBulkDP
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,50 +669,7 @@ func robustZScore(vals []float64, median, mad float64) []float64 {
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// Genome-wide normalisation state
-// ---------------------------------------------------------------------------
 
-type genomeWideNorms struct {
-	hiMed, hiMAD   float64
-	liMed, liMAD   float64
-	dsiMed, dsiMAD float64
-	gsMed, gsMAD   float64
-	edMed, edMAD   float64
-	lodMed, lodMAD float64
-	bblMed, bblMAD float64
-}
-
-func computeGenomeWideNorms(allSmoothed []SmoothedStats) genomeWideNorms {
-	hi := make([]float64, 0, len(allSmoothed))
-	li := make([]float64, 0, len(allSmoothed))
-	dsi := make([]float64, 0, len(allSmoothed))
-	gs := make([]float64, 0, len(allSmoothed))
-	ed := make([]float64, 0, len(allSmoothed))
-	lod := make([]float64, 0, len(allSmoothed))
-	bbl := make([]float64, 0, len(allSmoothed))
-
-	for _, s := range allSmoothed {
-		hi = append(hi, s.HighSI)
-		li = append(li, s.LowSI)
-		dsi = append(dsi, s.DeltaSI)
-		gs = append(gs, s.Gstat)
-		ed = append(ed, s.ED)
-		lod = append(lod, s.LOD)
-		bbl = append(bbl, s.BBLogBF)
-	}
-
-	const trim = 0.01
-	n := genomeWideNorms{}
-	n.hiMed, n.hiMAD = robustBackground(hi, trim)
-	n.liMed, n.liMAD = robustBackground(li, trim)
-	n.dsiMed, n.dsiMAD = robustBackground(dsi, trim)
-	n.gsMed, n.gsMAD = robustBackground(gs, trim)
-	n.edMed, n.edMAD = robustBackground(ed, trim)
-	n.lodMed, n.lodMAD = robustBackground(lod, trim)
-	n.bblMed, n.bblMAD = robustBackground(bbl, trim)
-	return n
-}
 
 // ---------------------------------------------------------------------------
 // QTL detection
@@ -1762,7 +1038,7 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 }
 
 // ---------------------------------------------------------------------------
-// Individual (raw-value) line chart
+// Individual (raw-value) line chart — one series per statistic, per chromosome
 // ---------------------------------------------------------------------------
 
 func createInteractiveLineChart(
@@ -1855,6 +1131,89 @@ func createInteractiveLineChart(
 				charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 			)
 	}
+
+	return line
+}
+
+// ---------------------------------------------------------------------------
+// Composite best-signal chart — max |Z| across all 7 statistics per window.
+// A single line that peaks wherever any statistic fires strongly, with z=2/z=3
+// reference lines and BRM block shading identical to the Z-score overlay.
+// ---------------------------------------------------------------------------
+
+func createCompositeSignalChart(chrom string, x []int64, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ []float64, brmBlocks []BRMBlock) *charts.Line {
+	n := len(x)
+	composite := make([]float64, n)
+	for i := range composite {
+		composite[i] = math.Max(math.Abs(hiZ[i]),
+			math.Max(math.Abs(liZ[i]),
+				math.Max(math.Abs(dsiZ[i]),
+					math.Max(math.Abs(gsZ[i]),
+						math.Max(math.Abs(edZ[i]),
+							math.Max(math.Abs(lodZ[i]), math.Abs(bblZ[i])))))))
+	}
+
+	title := chrom + " — Composite Signal (max |Z|)"
+	subtitle := "Max absolute robust Z-score across all 7 statistics per window. " +
+		"z = 2 suggestive · z = 3 significant. Shaded bands: BRM blocks."
+
+	line := charts.NewLine()
+	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "max |Z-score|", chartWidth, chartHeight, false)...)
+
+	line.SetGlobalOptions(
+		charts.WithTooltipOpts(opts.Tooltip{
+			Show:        opts.Bool(true),
+			Trigger:     "axis",
+			AxisPointer: &opts.AxisPointer{Type: "cross"},
+			Formatter: opts.FuncOpts(`function(params) {
+				let pos = params[0].axisValue;
+				let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
+				let result = '<strong>' + posStr + '</strong><br/>';
+				params.forEach(function(item) {
+					let val = parseFloat(item.value);
+					if (isNaN(val)) return;
+					let sig = '';
+					if (item.seriesName === 'Composite') {
+						if (val >= 3.0)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ z≥3 significant</span>';
+						else if (val >= 2.0) sig = ' <span style="color:#f39c12">● z≥2 suggestive</span>';
+					}
+					result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
+				});
+				return result;
+			}`),
+		}),
+	)
+
+	mkRef := func(val float64) []opts.LineData {
+		d := make([]opts.LineData, n)
+		for i := range d {
+			d[i] = opts.LineData{Value: val}
+		}
+		return d
+	}
+
+	compositeData := make([]opts.LineData, n)
+	for i, v := range composite {
+		compositeData[i] = opts.LineData{Value: v}
+	}
+
+	compositeOpts := []charts.SeriesOpts{
+		charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
+		charts.WithLineStyleOpts(opts.LineStyle{Width: 2.5, Color: "#2ca02c"}),
+		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
+	}
+	compositeOpts = append(compositeOpts, brmBlockMarkAreaOpts(brmBlocks, x)...)
+
+	line.SetXAxis(positionLabels(x)).
+		AddSeries("Composite", compositeData, compositeOpts...).
+		AddSeries("z=2 (sugg.)", mkRef(zSugg),
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
+		).
+		AddSeries("z=3 (sig.)", mkRef(zSig),
+			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
+			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
+		)
 
 	return line
 }
@@ -2045,141 +1404,6 @@ func brmBlockMarkAreaOpts(blocks []BRMBlock, x []int64) []charts.SeriesOpts {
 }
 
 // ---------------------------------------------------------------------------
-// Normalised overlay chart (legacy, retained for backward compatibility)
-// ---------------------------------------------------------------------------
-
-func createNormalizedOverlayChart(
-	chrom string,
-	x []int64,
-	hi, li, dsi, gs, ed, lod, bbl []float64,
-	avgHp99, avgHp95, avgLp99, avgLp95 float64,
-	avgDp99, avgDp95, avgDMp99, avgDMp95 float64,
-	avgGs99, avgGs95, avgEp99, avgEp95, avgLodp99, avgLodp95 float64,
-	avgBbp99, avgBbp95 float64,
-	brmBlocks []BRMBlock,
-) *charts.Line {
-
-	title := chrom + " — Threshold-Relative Overlay"
-	subtitle := "Values divided by per-chromosome avg p99 threshold (p99=1.0; p95 varies by statistic). " +
-		"Note: depth-dependent — see Robust Z-score page. Shaded bands: BRM blocks."
-
-	line := charts.NewLine()
-	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "Threshold-relative value", chartWidth, chartHeight, true)...)
-
-	tooltipFormatter := fmt.Sprintf(`function(params) {
-		let pos = params[0].axisValue;
-		let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
-		let result = '<strong>' + posStr + '</strong><br/>';
-		let p95Pos = {
-			'HighSI': %.6f,
-			'LowSI': %.6f,
-			'DeltaSI': %.6f,
-			'Gstat': %.6f,
-			'ED': %.6f,
-			'LOD': %.6f,
-			'BBLogBF': %.6f
-		};
-		let p95Neg = {'DeltaSI': %.6f};
-		let statSeries = ['HighSI','LowSI','DeltaSI','Gstat','ED','LOD','BBLogBF'];
-		params.forEach(function(item) {
-			if (statSeries.indexOf(item.seriesName) === -1) return;
-			let val = parseFloat(item.value);
-			if (isNaN(val)) return;
-			let p95 = val < 0 ? (p95Neg[item.seriesName] || p95Pos[item.seriesName] || 0) : (p95Pos[item.seriesName] || 0);
-			let sig = '';
-			if (Math.abs(val) >= 1.0) sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99</span>';
-			else if (p95 > 0 && Math.abs(val) >= p95) sig = ' <span style="color:#f39c12">● p95</span>';
-			result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
-		});
-		return result;
-	}`,
-		thresholdRatio(avgHp95, avgHp99),
-		thresholdRatio(avgLp95, avgLp99),
-		thresholdRatio(avgDp95, avgDp99),
-		thresholdRatio(avgGs95, avgGs99),
-		thresholdRatio(avgEp95, avgEp99),
-		thresholdRatio(avgLodp95, avgLodp99),
-		thresholdRatio(avgBbp95, avgBbp99),
-		thresholdRatio(math.Abs(avgDMp95), math.Abs(avgDMp99)),
-	)
-
-	line.SetGlobalOptions(
-		charts.WithYAxisOpts(opts.YAxis{
-			Name:         "Threshold-relative value",
-			NameLocation: "middle",
-			NameGap:      55,
-			SplitLine:    &opts.SplitLine{Show: opts.Bool(true)},
-			AxisLabel: &opts.AxisLabel{
-				Formatter: opts.FuncOpts(`function(v) {
-					let fv = parseFloat(v.toFixed(3));
-					if (fv === 1.0)   return 'p99 (+)';
-					if (fv === -1.0)  return 'p99 (-)';
-					if (fv === 0.0)   return '0';
-					return v.toFixed(2);
-				}`),
-			},
-		}),
-		charts.WithTooltipOpts(opts.Tooltip{
-			Show:        opts.Bool(true),
-			Trigger:     "axis",
-			AxisPointer: &opts.AxisPointer{Type: "cross"},
-			Formatter:   opts.FuncOpts(tooltipFormatter),
-		}),
-	)
-
-	n := len(x)
-	mkRef := func(val float64) []opts.LineData {
-		d := make([]opts.LineData, n)
-		for i := range d {
-			d[i] = opts.LineData{Value: val}
-		}
-		return d
-	}
-
-	baselineOpts := []charts.SeriesOpts{
-		charts.WithLineStyleOpts(opts.LineStyle{Type: "solid", Width: 1, Color: "#bdc3c7"}),
-		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-	}
-	baselineOpts = append(baselineOpts, brmBlockMarkAreaOpts(brmBlocks, x)...)
-
-	line.SetXAxis(positionLabels(x)).
-		AddSeries("z=0 baseline", mkRef(0), baselineOpts...).
-		AddSeries("p99 (+)", mkRef(1.0),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries("p99 (-)", mkRef(-1.0),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		)
-
-	type sd struct {
-		name string
-		data []float64
-		w    float32
-	}
-	series := []sd{
-		{"HighSI", normalizeToThreshold(hi, avgHp99, false), 2.0},
-		{"LowSI", normalizeToThreshold(li, avgLp99, false), 2.0},
-		{"DeltaSI", normalizeDeltaSI(dsi, avgDp99, avgDMp99), 3.0},
-		{"Gstat", normalizeToThreshold(gs, avgGs99, false), 2.0},
-		{"ED", normalizeToThreshold(ed, avgEp99, false), 2.0},
-		{"LOD", normalizeToThreshold(lod, avgLodp99, false), 2.0},
-		{"BBLogBF", normalizeToThreshold(bbl, avgBbp99, false), 2.0},
-	}
-	for _, s := range series {
-		col := statColor(s.name)
-		line.AddSeries(s.name, floatSliceToLineData(s.data),
-			charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
-			charts.WithLineStyleOpts(opts.LineStyle{Width: s.w, Color: col}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Color: col, Opacity: opts.Float(0)}),
-		)
-	}
-
-	return line
-}
-
-// ---------------------------------------------------------------------------
 // Utility helpers
 // ---------------------------------------------------------------------------
 
@@ -2199,43 +1423,7 @@ func positionLabels(x []int64) []string {
 	return labels
 }
 
-func normalizeToThreshold(vals []float64, ref float64, invert bool) []float64 {
-	out := make([]float64, len(vals))
-	if ref == 0 {
-		return out
-	}
-	sign := 1.0
-	if invert {
-		sign = -1.0
-	}
-	for i, v := range vals {
-		out[i] = sign * v / ref
-	}
-	return out
-}
 
-func thresholdRatio(numerator, denominator float64) float64 {
-	if denominator == 0 {
-		return 0
-	}
-	return math.Abs(numerator / denominator)
-}
-
-func normalizeDeltaSI(dsi []float64, p99, mp99 float64) []float64 {
-	out := make([]float64, len(dsi))
-	for i, v := range dsi {
-		if v >= 0 {
-			if p99 != 0 {
-				out[i] = v / p99
-			}
-		} else {
-			if mp99 != 0 {
-				out[i] = v / math.Abs(mp99)
-			}
-		}
-	}
-	return out
-}
 
 func writeHTMLPage(page *components.Page, path string) error {
 	f, err := os.Create(path)
@@ -2261,27 +1449,41 @@ func writeHTMLPage(page *components.Page, path string) error {
 //
 // Output files:
 //
-//	GoBSAseq_IndividualPlots.html   – raw-value charts with permutation thresholds
-//	GoBSAseq_NormalizedOverlay.html – threshold-relative overlay (legacy method)
-//	GoBSAseq_RobustZScore.html      – genome-wide robust Z-score overlay (recommended)
-//	<qtlOutFile>                    – TSV of all QTL intervals (all detection methods)
-//	GoBSAseq_BRMBlocks.tsv         – TSV of BRM-style block intervals used for plot shading
-func GenerateHtmlPlotsAndQTL(
-	allSmoothed []SmoothedStats,
-	highSmAF, lowSmAF float64,
-	highBulkSize, lowBulkSize int,
-	population string,
-	alphas []float64,
-	rep int,
-	htmlOutFile, qtlOutFile string,
-) error {
+//	GoBSAseq_IndividualPlots.html  – raw-value charts with permutation thresholds (7 per chromosome)
+//	GoBSAseq_RobustZScore.html     – genome-wide robust Z-score overlay (all stats overlaid)
+//	GoBSAseq_CompositeSignal.html  – single max-|Z| composite signal per chromosome
+//	<qtlOutFile>                   – TSV of all QTL intervals (all detection methods)
+//	GoBSAseq_BRMBlocks.tsv        – TSV of BRM-style block intervals used for plot shading
+func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, highBulkSize, lowBulkSize int,
+	population string, alphas []float64, rep int, htmlOutFile, qtlOutFile string) error {
 
 	outDir := filepath.Dir(htmlOutFile)
 
-	// Pass 1 — genome-wide robust Z parameters.
-	norms := computeGenomeWideNorms(allSmoothed)
+	// -----------------------------------------------------------------------
+	// Pass 1 — compute genome-wide robust Z normalisation parameters.
+	// Each statistic's median and MAD are derived from all windows across all
+	// chromosomes, with the top 1% trimmed so true QTL peaks don't inflate
+	// the spread estimate.
+	// -----------------------------------------------------------------------
+	const trim = 0.01
+	collectStat := func(fn func(SmoothedStats) float64) []float64 {
+		v := make([]float64, len(allSmoothed))
+		for i, s := range allSmoothed {
+			v[i] = fn(s)
+		}
+		return v
+	}
+	hiMed, hiMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.HighSI }), trim)
+	liMed, liMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.LowSI }), trim)
+	dsiMed, dsiMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.DeltaSI }), trim)
+	gsMed, gsMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.Gstat }), trim)
+	edMed, edMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.ED }), trim)
+	lodMed, lodMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.LOD }), trim)
+	bblMed, bblMAD := robustBackground(collectStat(func(s SmoothedStats) float64 { return s.BBLogBF }), trim)
 
-	// Pass 2 — group by chromosome.
+	// -----------------------------------------------------------------------
+	// Pass 2 — group windows by chromosome and sort for consistent output.
+	// -----------------------------------------------------------------------
 	byChr := make(map[string][]SmoothedStats)
 	for _, s := range allSmoothed {
 		byChr[s.CHROM] = append(byChr[s.CHROM], s)
@@ -2311,24 +1513,23 @@ func GenerateHtmlPlotsAndQTL(
 	individualPage.SetLayout(components.PageFlexLayout)
 	individualPage.PageTitle = "GoBSAseq — Individual Statistics"
 
-	normalizedPage := components.NewPage()
-	normalizedPage.SetLayout(components.PageFlexLayout)
-	normalizedPage.PageTitle = "GoBSAseq — Threshold-Relative Overlay"
-
 	robustZPage := components.NewPage()
 	robustZPage.SetLayout(components.PageFlexLayout)
 	robustZPage.PageTitle = "GoBSAseq — Robust Z-score Overlay"
 
+	compositePage := components.NewPage()
+	compositePage.SetLayout(components.PageFlexLayout)
+	compositePage.PageTitle = "GoBSAseq — Composite Signal"
+
 	for _, chrom := range chroms {
 		stats := byChr[chrom]
-		n := float64(len(stats))
-		if n == 0 {
+		if len(stats) == 0 {
 			continue
 		}
 
-		// Average permutation thresholds across windows of this chromosome
-		// (used for the individual raw-value charts only; QTL detection uses
-		// per-window thresholds stored in SmoothedStats.thresholds).
+		// Average permutation thresholds across windows — used to draw the
+		// reference lines on the individual raw-value charts only.
+		nf := float64(len(stats))
 		var (
 			sumHp99, sumHp95     float64
 			sumLp99, sumLp95     float64
@@ -2341,76 +1542,64 @@ func GenerateHtmlPlotsAndQTL(
 		)
 		for _, s := range stats {
 			t := s.thresholds
-			sumHp99 += t.HighP99
-			sumHp95 += t.HighP95
-			sumLp99 += t.LowP99
-			sumLp95 += t.LowP95
-			sumDp99 += t.DsiP99
-			sumDp95 += t.DsiP95
-			sumDMp99 += t.DsiMp99
-			sumDMp95 += t.DsiMp95
-			sumGs99 += t.GsP99
-			sumGs95 += t.GsP95
-			sumEp99 += t.EdP99
-			sumEp95 += t.EdP95
-			sumLodp99 += t.LodP99
-			sumLodp95 += t.LodP95
-			sumBbp99 += t.BbP99
-			sumBbp95 += t.BbP95
+			sumHp99 += t.HighP99; sumHp95 += t.HighP95
+			sumLp99 += t.LowP99;  sumLp95 += t.LowP95
+			sumDp99 += t.DsiP99;  sumDp95 += t.DsiP95
+			sumDMp99 += t.DsiMp99; sumDMp95 += t.DsiMp95
+			sumGs99 += t.GsP99;  sumGs95 += t.GsP95
+			sumEp99 += t.EdP99;  sumEp95 += t.EdP95
+			sumLodp99 += t.LodP99; sumLodp95 += t.LodP95
+			sumBbp99 += t.BbP99;  sumBbp95 += t.BbP95
 		}
-		avgHp99, avgHp95 := sumHp99/n, sumHp95/n
-		avgLp99, avgLp95 := sumLp99/n, sumLp95/n
-		avgDp99, avgDp95 := sumDp99/n, sumDp95/n
-		avgDMp99, avgDMp95 := sumDMp99/n, sumDMp95/n
-		avgGs99, avgGs95 := sumGs99/n, sumGs95/n
-		avgEp99, avgEp95 := sumEp99/n, sumEp95/n
-		avgLodp99, avgLodp95 := sumLodp99/n, sumLodp95/n
-		avgBbp99, avgBbp95 := sumBbp99/n, sumBbp95/n
+		avgHp99, avgHp95     := sumHp99/nf, sumHp95/nf
+		avgLp99, avgLp95     := sumLp99/nf, sumLp95/nf
+		avgDp99, avgDp95     := sumDp99/nf, sumDp95/nf
+		avgDMp99, avgDMp95   := sumDMp99/nf, sumDMp95/nf
+		avgGs99, avgGs95     := sumGs99/nf, sumGs95/nf
+		avgEp99, avgEp95     := sumEp99/nf, sumEp95/nf
+		avgLodp99, avgLodp95 := sumLodp99/nf, sumLodp95/nf
+		avgBbp99, avgBbp95   := sumBbp99/nf, sumBbp95/nf
 
-		// Extract data arrays.
-		x := make([]int64, 0, len(stats))
-		hi := make([]float64, 0, len(stats))
-		li := make([]float64, 0, len(stats))
-		dsi := make([]float64, 0, len(stats))
-		gs := make([]float64, 0, len(stats))
-		ed := make([]float64, 0, len(stats))
-		lod := make([]float64, 0, len(stats))
-		bbl := make([]float64, 0, len(stats))
+		// Extract per-window data and per-window p99/p95 threshold arrays.
+		n := len(stats)
+		x := make([]int64, n)
+		hi := make([]float64, n)
+		li := make([]float64, n)
+		dsi := make([]float64, n)
+		gs := make([]float64, n)
+		ed := make([]float64, n)
+		lod := make([]float64, n)
+		bbl := make([]float64, n)
+		hiT99, hiT95 := make([]float64, n), make([]float64, n)
+		liT99, liT95 := make([]float64, n), make([]float64, n)
+		dsiT99, dsiTM99 := make([]float64, n), make([]float64, n)
+		dsiT95, dsiTM95 := make([]float64, n), make([]float64, n)
+		gsT99, gsT95 := make([]float64, n), make([]float64, n)
+		edT99, edT95 := make([]float64, n), make([]float64, n)
+		lodT99, lodT95 := make([]float64, n), make([]float64, n)
+		bblT99, bblT95 := make([]float64, n), make([]float64, n)
 
-		// Per-window threshold arrays for locally-adaptive QTL detection.
-		hiT99 := make([]float64, 0, len(stats))
-		liT99 := make([]float64, 0, len(stats))
-		dsiT99 := make([]float64, 0, len(stats))
-		dsiTM99 := make([]float64, 0, len(stats))
-		gsT99 := make([]float64, 0, len(stats))
-		edT99 := make([]float64, 0, len(stats))
-		lodT99 := make([]float64, 0, len(stats))
-		bblT99 := make([]float64, 0, len(stats))
-
-		for _, s := range stats {
-			x = append(x, s.POS)
-			hi = append(hi, s.HighSI)
-			li = append(li, s.LowSI)
-			dsi = append(dsi, s.DeltaSI)
-			gs = append(gs, s.Gstat)
-			ed = append(ed, s.ED)
-			lod = append(lod, s.LOD)
-			bbl = append(bbl, s.BBLogBF)
-			hiT99 = append(hiT99, s.thresholds.HighP99)
-			liT99 = append(liT99, s.thresholds.LowP99)
-			dsiT99 = append(dsiT99, s.thresholds.DsiP99)
-			dsiTM99 = append(dsiTM99, s.thresholds.DsiMp99)
-			gsT99 = append(gsT99, s.thresholds.GsP99)
-			edT99 = append(edT99, s.thresholds.EdP99)
-			lodT99 = append(lodT99, s.thresholds.LodP99)
-			bblT99 = append(bblT99, s.thresholds.BbP99)
+		for i, s := range stats {
+			x[i] = s.POS
+			hi[i], li[i], dsi[i] = s.HighSI, s.LowSI, s.DeltaSI
+			gs[i], ed[i], lod[i], bbl[i] = s.Gstat, s.ED, s.LOD, s.BBLogBF
+			t := s.thresholds
+			hiT99[i], hiT95[i] = t.HighP99, t.HighP95
+			liT99[i], liT95[i] = t.LowP99, t.LowP95
+			dsiT99[i], dsiTM99[i] = t.DsiP99, t.DsiMp99
+			dsiT95[i], dsiTM95[i] = t.DsiP95, t.DsiMp95
+			gsT99[i], gsT95[i] = t.GsP99, t.GsP95
+			edT99[i], edT95[i] = t.EdP99, t.EdP95
+			lodT99[i], lodT95[i] = t.LodP99, t.LodP95
+			bblT99[i], bblT95[i] = t.BbP99, t.BbP95
 		}
 
 		// ----------------------------------------------------------------
-		// QTL detection — Method 1: per-window permutation thresholds
-		// (locally-adaptive: each window compared to its own threshold)
+		// QTL detection — Method 1: locally-adaptive permutation thresholds.
+		// Each window is compared to its own depth-specific p99/p95 threshold.
 		// ----------------------------------------------------------------
 		var chromQTLs []QTLRecord
+		// p99
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiT99, "HighSI", "99", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liT99, "LowSI", "99", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiT99, "DeltaSI", "99", false, "Permutation")...)
@@ -2419,26 +1608,7 @@ func GenerateHtmlPlotsAndQTL(
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, ed, edT99, "ED4", "99", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, lod, lodT99, "LOD", "99", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, bbl, bblT99, "BBLogBF", "99", false, "Permutation")...)
-
-		// p95 permutation calls.
-		hiT95 := make([]float64, len(stats))
-		liT95 := make([]float64, len(stats))
-		dsiT95 := make([]float64, len(stats))
-		dsiTM95 := make([]float64, len(stats))
-		gsT95 := make([]float64, len(stats))
-		edT95 := make([]float64, len(stats))
-		lodT95 := make([]float64, len(stats))
-		bblT95 := make([]float64, len(stats))
-		for j, s := range stats {
-			hiT95[j] = s.thresholds.HighP95
-			liT95[j] = s.thresholds.LowP95
-			dsiT95[j] = s.thresholds.DsiP95
-			dsiTM95[j] = s.thresholds.DsiMp95
-			gsT95[j] = s.thresholds.GsP95
-			edT95[j] = s.thresholds.EdP95
-			lodT95[j] = s.thresholds.LodP95
-			bblT95[j] = s.thresholds.BbP95
-		}
+		// p95
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiT95, "HighSI", "95", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liT95, "LowSI", "95", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiT95, "DeltaSI", "95", false, "Permutation")...)
@@ -2449,44 +1619,45 @@ func GenerateHtmlPlotsAndQTL(
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, bbl, bblT95, "BBLogBF", "95", false, "Permutation")...)
 
 		// ----------------------------------------------------------------
-		// QTL detection — Method 2: robust Z-score at z=3 / z=2
+		// QTL detection — Method 2: genome-wide robust Z-score at z=±3.
+		// Uses Pass 1 median/MAD so signals are normalised across the genome.
 		// ----------------------------------------------------------------
-		hiZ := robustZScore(hi, norms.hiMed, norms.hiMAD)
-		liZ := robustZScore(li, norms.liMed, norms.liMAD)
-		dsiZ := robustZScore(dsi, norms.dsiMed, norms.dsiMAD)
-		gsZ := robustZScore(gs, norms.gsMed, norms.gsMAD)
-		edZ := robustZScore(ed, norms.edMed, norms.edMAD)
-		lodZ := robustZScore(lod, norms.lodMed, norms.lodMAD)
-		bblZ := robustZScore(bbl, norms.bblMed, norms.bblMAD)
+		hiZ := robustZScore(hi, hiMed, hiMAD)
+		liZ := robustZScore(li, liMed, liMAD)
+		dsiZ := robustZScore(dsi, dsiMed, dsiMAD)
+		gsZ := robustZScore(gs, gsMed, gsMAD)
+		edZ := robustZScore(ed, edMed, edMAD)
+		lodZ := robustZScore(lod, lodMed, lodMAD)
+		bblZ := robustZScore(bbl, bblMed, bblMAD)
 
-		zSig3 := zSig
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, hiZ, zSig3, "HighSI_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, liZ, zSig3, "LowSI_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, dsiZ, zSig3, "DeltaSI_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, dsiZ, -zSig3, "DeltaSI_Z", "z3", true, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, gsZ, zSig3, "Gstat_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, edZ, zSig3, "ED4_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, lodZ, zSig3, "LOD_Z", "z3", false, "ZScore")...)
-		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, bblZ, zSig3, "BBLogBF_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, hiZ, zSig, "HighSI_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, liZ, zSig, "LowSI_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, dsiZ, zSig, "DeltaSI_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, dsiZ, -zSig, "DeltaSI_Z", "z3", true, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, gsZ, zSig, "Gstat_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, edZ, zSig, "ED4_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, lodZ, zSig, "LOD_Z", "z3", false, "ZScore")...)
+		chromQTLs = append(chromQTLs, detectQTLs(chrom, x, bblZ, zSig, "BBLogBF_Z", "z3", false, "ZScore")...)
 
 		// ----------------------------------------------------------------
-		// QTL detection — Method 3: multi-statistic consensus
+		// QTL detection — Method 3: multi-statistic consensus.
+		// Windows where ≥consensusMinStats statistics exceed their p99
+		// thresholds simultaneously are merged into consensus intervals.
 		// ----------------------------------------------------------------
 		chromQTLs = append(chromQTLs, detectConsensusQTLs(chrom, stats)...)
 
 		// ----------------------------------------------------------------
-		// BRM blocks and Method 4: high-confidence intersection
+		// BRM blocks and Method 4: high-confidence intersection.
+		// Permutation QTLs overlapping a BRM block are promoted to
+		// HighConfidence, providing cross-method validation.
 		// ----------------------------------------------------------------
 		chromBRMBlocks := calculateBRMBlocks(chrom, stats, highBulkSize, lowBulkSize, popLevel, brmUAlpha)
 		allBRMBlocks = append(allBRMBlocks, chromBRMBlocks...)
-
-		hcQTLs := intersectQTLsWithBRM(chromQTLs, chromBRMBlocks)
-		chromQTLs = append(chromQTLs, hcQTLs...)
+		chromQTLs = append(chromQTLs, intersectQTLsWithBRM(chromQTLs, chromBRMBlocks)...)
 		allQTLs = append(allQTLs, chromQTLs...)
 
-		// ----------------------------------------------------------------
-		// Charts
-		// ----------------------------------------------------------------
+		robustZPage.AddCharts(createRobustZOverlayChart(chrom, x, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ, chromBRMBlocks))
+
 		individualPage.AddCharts(
 			createInteractiveLineChart(chrom+" HighSI", x, hi, avgHp99, avgHp95, 0, 0, false, chromBRMBlocks),
 			createInteractiveLineChart(chrom+" LowSI", x, li, avgLp99, avgLp95, 0, 0, false, chromBRMBlocks),
@@ -2497,26 +1668,17 @@ func GenerateHtmlPlotsAndQTL(
 			createInteractiveLineChart(chrom+" BBLogBF", x, bbl, avgBbp99, avgBbp95, 0, 0, false, chromBRMBlocks),
 		)
 
-		normalizedPage.AddCharts(createNormalizedOverlayChart(
-			chrom, x, hi, li, dsi, gs, ed, lod, bbl,
-			avgHp99, avgHp95, avgLp99, avgLp95,
-			avgDp99, avgDp95, avgDMp99, avgDMp95,
-			avgGs99, avgGs95, avgEp99, avgEp95, avgLodp99, avgLodp95,
-			avgBbp99, avgBbp95,
-			chromBRMBlocks,
-		))
-
-		robustZPage.AddCharts(createRobustZOverlayChart(chrom, x, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ, chromBRMBlocks))
+		compositePage.AddCharts(createCompositeSignalChart(chrom, x, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ, chromBRMBlocks))
 	}
 
 	// Write HTML files.
 	if err := writeHTMLPage(individualPage, filepath.Join(outDir, "GoBSAseq_IndividualPlots.html")); err != nil {
 		return err
 	}
-	if err := writeHTMLPage(normalizedPage, filepath.Join(outDir, "GoBSAseq_NormalizedOverlay.html")); err != nil {
+	if err := writeHTMLPage(robustZPage, filepath.Join(outDir, "GoBSAseq_RobustZScore.html")); err != nil {
 		return err
 	}
-	if err := writeHTMLPage(robustZPage, filepath.Join(outDir, "GoBSAseq_RobustZScore.html")); err != nil {
+	if err := writeHTMLPage(compositePage, filepath.Join(outDir, "GoBSAseq_CompositeSignal.html")); err != nil {
 		return err
 	}
 
@@ -2646,3 +1808,258 @@ func detectQTLsAdaptive(chrom string, x []int64, y, thresholds []float64, statNa
 	}
 	return qtls
 }
+
+func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
+	highParIdx := cfg.HighParentIdx
+	//highParDP := cfg.HighParentDepth
+	lowParIdx := cfg.LowParentIdx
+	//lowParDP := cfg.LowParentDepth
+	highBulkIdx := cfg.HighBulkIdx
+	//highBulkDP := cfg.HighBulkDepth
+	lowBulkIdx := cfg.LowBulkIdx
+	//lowBulkDP := cfg.LowBulkDepth
+	vcfRdr := cfg.Rdr
+	outDir := cfg.OutputDir
+
+	windowSize := int64(cfg.WindowSize)
+	stepSize := int64(cfg.StepSize)
+	rep := cfg.Rep
+	pop := cfg.Population
+
+	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
+	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
+
+	overallStart := time.Now()
+
+	// -----------------------------------------------------------------------
+	// Stage 0 — hard filtering
+	// -----------------------------------------------------------------------
+	color.Cyan("============================ GATK Hard Filtering ============================\n\n")
+
+	filteredVcfPath := filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
+	badVcfPath := filepath.Join(outDir, "GoBSAseq.bad_variants.vcf.gz")
+
+	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg)
+	if err != nil {
+		color.Red("Hard filter error: %v", err)
+		return
+	}
+	color.Green("Original variants: %v\nHard filtered variants: %v", original, hardFiltered)
+	// -----------------------------------------------------------------------
+	// Stage 1 — per-SNP statistics (concurrent)
+	// -----------------------------------------------------------------------
+	color.Cyan("============================ Calculating Statistics =============================\n\n")
+
+	statsChan := make(chan BSAstats, 10000)
+	rawWriteChan := make(chan BSAstats, 10000)
+
+	numWorkers := runtime.NumCPU()
+	var workerWG sync.WaitGroup
+
+	var rawWG sync.WaitGroup
+	rawWG.Add(1)
+	go func() {
+		defer rawWG.Done()
+		if err := writeRawTSV(filepath.Join(outDir, "GoBSAseq.raw.tsv"), rawWriteChan); err != nil {
+			color.Red("Error writing raw TSV: %v", err)
+		}
+	}()
+
+	bar := progressbar.Default(int64(len(passedVariants)), "Processing variants")
+
+	// Feed worker pool from the pre-filtered slice.
+	variantChan := make(chan *vcfgo.Variant, 10000)
+	go func() {
+		for _, v := range passedVariants {
+			variantChan <- v
+		}
+		close(variantChan)
+	}()
+
+	for i := 0; i < numWorkers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for variant := range variantChan {
+				// Basic safety: Ensure samples exist for the configured indices
+				maxIdx := highParIdx
+				for _, idx := range []int{lowParIdx, highBulkIdx, lowBulkIdx} {
+					if idx > maxIdx {
+						maxIdx = idx
+					}
+				}
+				if len(variant.Samples) <= maxIdx {
+					_ = bar.Add(1)
+					continue
+				}
+
+				hpS := variant.Samples[highParIdx]
+				lpS := variant.Samples[lowParIdx]
+				hbS := variant.Samples[highBulkIdx]
+				lbS := variant.Samples[lowBulkIdx]
+
+				// Identify the one 'real' ALT allele index.
+				realAltIdx := -1
+				for i, alt := range variant.Alt() {
+					if !utils.IsSymbolic(alt) {
+						realAltIdx = i
+						break
+					}
+				}
+				if realAltIdx == -1 {
+					_ = bar.Add(1)
+					continue
+				}
+
+				// Identify which allele is from the High Parent.
+				// passesTwoBulkBSAseqFilters guarantees parents are homozygous
+				// and carry either 0 (REF) or the one real ALT allele.
+				hpAllele := hpS.GT[0]
+
+				// Get ADs for each bulk.
+				hbRefDep, _ := hbS.RefDepth()
+				hbAltDeps, _ := hbS.AltDepths()
+				lbRefDep, _ := lbS.RefDepth()
+				lbAltDeps, _ := lbS.AltDepths()
+
+				// Safety check: ensure the target ALT allele depth exists.
+				if len(hbAltDeps) <= realAltIdx || len(lbAltDeps) <= realAltIdx {
+					_ = bar.Add(1)
+					continue
+				}
+
+				var hbH, hbL, lbH, lbL int
+				// SI (Success Index) is defined as the frequency of the High Parent allele.
+				if hpAllele == 0 {
+					// High Parent allele is REF (0), Low Parent is ALT.
+					hbH, hbL = hbRefDep, hbAltDeps[realAltIdx]
+					lbH, lbL = lbRefDep, lbAltDeps[realAltIdx]
+				} else {
+					// High Parent allele is ALT, Low Parent is REF (0).
+					hbH, hbL = hbAltDeps[realAltIdx], hbRefDep
+					lbH, lbL = lbAltDeps[realAltIdx], lbRefDep
+				}
+
+				// Total depth for SI calculation is the sum of relevant alleles.
+				// This is more robust than s.DP if there are symbolic/other alleles.
+				hbTotal := hbH + hbL
+				lbTotal := lbH + lbL
+
+				if hbTotal == 0 || lbTotal == 0 {
+					_ = bar.Add(1)
+					continue
+				}
+
+				hSI := float64(hbH) / float64(hbTotal)
+				lSI := float64(lbH) / float64(lbTotal)
+				minDepth := hbTotal
+				if lbTotal < minDepth {
+					minDepth = lbTotal
+				}
+
+				s := BSAstats{
+					CHROM:      variant.Chromosome,
+					POS:        int64(variant.Pos),
+					REF:        variant.Reference,
+					ALT:        variant.Alt()[realAltIdx],
+					HighParGT:  hpS.GT,
+					LowParGT:   lpS.GT,
+					HighBulkGT: hbS.GT,
+					HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[realAltIdx]),
+					LowBulkGT:  lbS.GT,
+					LowBulkAD:  fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[realAltIdx]),
+					HighBulkL:  hbL,
+					HighBulkH:  hbH,
+					LowBulkL:   lbL,
+					LowBulkH:   lbH,
+					HighSI:     math.Round(hSI*1e6) / 1e6,
+					LowSI:      math.Round(lSI*1e6) / 1e6,
+					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
+					Gstat:      math.Round(GStatistic(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					ED:         math.Round(euclideanDistance4(hSI, lSI)*1e6) / 1e6,
+					LOD:        math.Round(lod(hbL, hbH, lbL, lbH)*1e6) / 1e6,
+					BBLogBF:    math.Round(betaBinomialLogBF(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					Depth:      minDepth,
+				}
+				statsChan <- s
+				rawWriteChan <- s
+				_ = bar.Add(1)
+			}
+		}()
+	}
+
+	go func() {
+		workerWG.Wait()
+		close(statsChan)
+		close(rawWriteChan)
+	}()
+
+	chromStats := make(map[string][]BSAstats)
+	for s := range statsChan {
+		chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
+	}
+	_ = bar.Finish()
+	rawWG.Wait()
+
+	// -----------------------------------------------------------------------
+	// Stage 2 — smoothing
+	// -----------------------------------------------------------------------
+	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
+
+	var allSmoothed []SmoothedStats
+	for chrom, stats := range chromStats {
+		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
+		smoothed := smoothChromosome(stats, windowSize, stepSize)
+		allSmoothed = append(allSmoothed, smoothed...)
+	}
+
+	// -----------------------------------------------------------------------
+	// Stage 3 — threshold simulation
+	// -----------------------------------------------------------------------
+	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
+	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
+	// Attach per-window thresholds to the SmoothedStats slice so downstream
+	// QTL detection can use locally adaptive thresholds rather than chromosome averages.
+	for i := range allSmoothed {
+		allSmoothed[i].thresholds = calcThresholdsCached(
+			allSmoothed[i].MeanHighBulkDP, allSmoothed[i].MeanLowBulkDP, highSmAF, lowSmAF, rep)
+	}
+	color.Green("\nThreshold calculations complete.")
+
+	// -----------------------------------------------------------------------
+	// Stage 4 — smoothed TSV
+	// -----------------------------------------------------------------------
+	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
+	smoothTSV := filepath.Join(outDir, "GoBSAseq.smooth.tsv")
+	if err := writeSmoothedTSV(smoothTSV, allSmoothed, highSmAF, lowSmAF, rep); err != nil {
+		color.Red("Error writing smoothed TSV: %v", err)
+	} else {
+		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), smoothTSV)
+	}
+	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
+	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
+
+	// -----------------------------------------------------------------------
+	// Stage 5 — plots and QTL detection
+	// -----------------------------------------------------------------------
+	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
+	htmlFile := filepath.Join(outDir, "GoBSAseq_RobustZScore.html")
+	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
+
+	if err := GenerateHtmlPlotsAndQTL(
+		allSmoothed,
+		highSmAF, lowSmAF,
+		cfg.HighBulkSize, cfg.LowBulkSize,
+		pop, cfg.Alphas, rep,
+		htmlFile, qtlFile,
+	); err != nil {
+		color.Red("Error generating Plots and QTLs: %v", err)
+	} else {
+		color.Green("HTML plots written to %s", outDir)
+		color.Green("QTL tabular results written to %s", qtlFile)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Threshold simulation and caching
+// ---------------------------------------------------------------------------

@@ -55,10 +55,6 @@ type HardFilterConfig struct {
 	SNP_MQRankSum_Min      float64 // default -12.5 – MappingQualityRankSumTest
 	SNP_ReadPosRankSum_Min float64 // default -8.0  – ReadPosRankSumTest
 
-	// INDEL thresholds (GATK Best Practices)
-	// Note: MQ/MQRankSum are intentionally excluded for INDELs per GATK guidance
-	// because indel length covaries with mapping quality degradation in a way that
-	// is not indicative of error.
 	INDEL_QD_Min             float64 // default 2.0   – QualByDepth
 	INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
 	INDEL_FS_Max             float64 // default 200.0 – FisherStrand
@@ -66,6 +62,5 @@ type HardFilterConfig struct {
 
 	// SaveFilteredVCF writes the hard-filtered records (PASS only) to a
 	// bgzf-compressed VCF at FilteredVCFPath when true.
-	SaveFilteredVCF bool
-	FilteredVCFPath string
+
 }

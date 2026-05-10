@@ -1,0 +1,273 @@
+package utils
+
+import (
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"sync"
+
+	"github.com/biogo/hts/bgzf"
+	"github.com/brentp/vcfgo"
+	"github.com/schollz/progressbar/v3"
+)
+
+func isHomozygous(gt []int) bool {
+	if len(gt) == 0 {
+		return false
+	}
+	first := gt[0]
+	if first < 0 {
+		return false
+	}
+	for _, a := range gt[1:] {
+		if a != first {
+			return false
+		}
+	}
+	return true
+}
+
+func isSNP(v *vcfgo.Variant) bool {
+	if len(v.Ref()) != 1 {
+		return false
+	}
+	for _, alt := range v.Alt() {
+		if len(alt) != 1 || alt == "." || alt == "*" {
+			return false
+		}
+	}
+	return true
+}
+
+func isIndel(v *vcfgo.Variant) bool {
+	refLen := len(v.Ref())
+	for _, alt := range v.Alt() {
+		if alt == "." || alt == "*" {
+			continue
+		}
+		if len(alt) != refLen {
+			return true
+		}
+	}
+	return false
+}
+
+func isQualitySNP(v *vcfgo.Variant, cfg HardFilterConfig) bool {
+	if float64(v.Quality) < cfg.SNP_QUAL_Min {
+		return false
+	}
+	if qd, ok := getFloat(v, "QD"); ok && qd < cfg.SNP_QD_Min {
+		return false
+	}
+	if fs, ok := getFloat(v, "FS"); ok && fs > cfg.SNP_FS_Max {
+		return false
+	}
+	if sor, ok := getFloat(v, "SOR"); ok && sor > cfg.SNP_SOR_Max {
+		return false
+	}
+	if mq, ok := getFloat(v, "MQ"); ok && mq < cfg.SNP_MQ_Min {
+		return false
+	}
+	if mqRankSum, ok := getFloat(v, "MQRankSum"); ok && mqRankSum < cfg.SNP_MQRankSum_Min {
+		return false
+	}
+	if readPosRankSum, ok := getFloat(v, "ReadPosRankSum"); ok && readPosRankSum < cfg.SNP_ReadPosRankSum_Min {
+		return false
+	}
+	return true
+}
+
+func isQualityINDEL(v *vcfgo.Variant, cfg HardFilterConfig) bool {
+	if float64(v.Quality) < cfg.INDEL_QUAL_Min {
+		return false
+	}
+	if qd, ok := getFloat(v, "QD"); ok && qd < cfg.INDEL_QD_Min {
+		return false
+	}
+	if fs, ok := getFloat(v, "FS"); ok && fs > cfg.INDEL_FS_Max {
+		return false
+	}
+	if readPosRankSum, ok := getFloat(v, "ReadPosRankSum"); ok && readPosRankSum < cfg.INDEL_ReadPosRankSum_Min {
+		return false
+	}
+	return true
+}
+
+func passesTwoBulkBSAseqFilters(v *vcfgo.Variant, cfg AnalysisConfig) bool {
+	highPar := cfg.HighParentIdx
+	highParDP := cfg.HighParentDepth
+	lowPar := cfg.LowParentIdx
+	lowParDP := cfg.LowParentDepth
+	highBulk := cfg.HighBulkIdx
+	highBulkDP := cfg.HighBulkDepth
+	lowBulk := cfg.LowBulkIdx
+	lowBulkDP := cfg.LowBulkDepth
+	indices := []int{highPar, lowPar, highBulk, lowBulk}
+	if len(v.Alt()) != 1 {
+		return false
+	}
+
+	for _, idx := range indices {
+		if idx < 0 || idx >= len(v.Samples) {
+			return false
+		}
+		s := v.Samples[idx]
+		if s == nil || len(s.GT) == 0 {
+			return false
+		}
+		for _, allele := range s.GT {
+			if allele < 0 {
+				return false
+			}
+		}
+	}
+
+	hpGT, lpGT := v.Samples[highPar].GT, v.Samples[lowPar].GT
+	hpDP, lpDP := v.Samples[highPar].DP, v.Samples[lowPar].DP
+	hbDP, lbDP := v.Samples[highBulk].DP, v.Samples[lowBulk].DP
+
+	if !isHomozygous(hpGT) || !isHomozygous(lpGT) || hpGT[0] == lpGT[0] {
+		return false
+	}
+	return hpDP >= highParDP && lpDP >= lowParDP && hbDP >= highBulkDP && lbDP >= lowBulkDP
+}
+
+func isNonFatalSampleParseError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "bad sample string")
+}
+
+func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath string, cfg AnalysisConfig, hfcfg HardFilterConfig) ([]*vcfgo.Variant, int, int, error) {
+
+	// =========================================== Hard Filtered vcf i/o =========================================== //
+	f, err := os.Create(hardFilteredVcfPath)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to create file: %w", err)
+	}
+	defer f.Close()
+
+	hfbgzfWriter := bgzf.NewWriter(f, 1)
+	hfWriter, err := vcfgo.NewWriter(hfbgzfWriter, rdr.Header)
+	if err != nil {
+		hfbgzfWriter.Close()
+		return nil, 0, 0, fmt.Errorf("failed to create VCF writer: %w", err)
+	}
+
+	// =========================================== Hard Filtered vcf i/o =========================================== //
+	b, err := os.Create(badVcfPath)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to create file: %w", err)
+	}
+	defer b.Close()
+
+	bbgzfWriter := bgzf.NewWriter(b, 1)
+	bWriter, err := vcfgo.NewWriter(bbgzfWriter, rdr.Header)
+	if err != nil {
+		bbgzfWriter.Close()
+		return nil, 0, 0, fmt.Errorf("failed to create VCF writer: %w", err)
+	}
+
+	var hardFilteredVariants []*vcfgo.Variant
+	original := 0
+	hardFiltered := 0
+
+	type filterResult struct {
+		v    *vcfgo.Variant
+		keep bool
+	}
+
+	var workerWG sync.WaitGroup
+	var writerWG sync.WaitGroup
+	var malformedSamples int
+	var writeErr error
+
+	variantChan := make(chan *vcfgo.Variant, 10000)
+	resultChan := make(chan filterResult, 10000)
+	bar := progressbar.Default(-1, "Hard filtering variants")
+
+	// ----------------------------------------- writing results --------------------------------------------------- //
+
+	writerWG.Add(1)
+	go func() {
+		defer writerWG.Done()
+		for res := range resultChan {
+			if res.keep {
+				hardFilteredVariants = append(hardFilteredVariants, res.v)
+				hfWriter.WriteVariant(res.v)
+				hardFiltered++
+			} else {
+				bWriter.WriteVariant(res.v)
+			}
+			_ = bar.Add(1)
+		}
+	}()
+
+	numWorkers := runtime.NumCPU()
+	for i := 0; i < numWorkers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for v := range variantChan {
+				keep := false
+				if isSNP(v) {
+					keep = isQualitySNP(v, hfcfg) && passesTwoBulkBSAseqFilters(v, cfg)
+				} else if isIndel(v) {
+					keep = isQualityINDEL(v, hfcfg) && passesTwoBulkBSAseqFilters(v, cfg)
+				}
+				resultChan <- filterResult{v: v, keep: keep}
+			}
+		}()
+	}
+
+	for {
+		v := rdr.Read()
+		if v == nil {
+			break
+		}
+		original++
+		//if readErr := rdr.Error(); readErr != nil {
+		//	if isNonFatalSampleParseError(readErr) {
+		//		malformedSamples++
+		//		rdr.Clear()
+		//	} else {
+		//		writeErr = fmt.Errorf("failed to read VCF: %w", readErr)
+		//		break
+		//	}
+		//}
+		variantChan <- v
+	}
+	close(variantChan)
+	workerWG.Wait()
+	close(resultChan)
+	writerWG.Wait()
+	_ = bar.Finish()
+
+	if writeErr != nil {
+		hfbgzfWriter.Close()
+		bbgzfWriter.Close()
+		return nil, 0, 0, writeErr
+	}
+
+	//if err = rdr.Error(); err != nil {
+	//	if isNonFatalSampleParseError(err) {
+	//		malformedSamples++
+	//		rdr.Clear()
+	//	} else {
+	//		hfbgzfWriter.Close()
+	//		bbgzfWriter.Close()
+	//		return nil, 0, 0, fmt.Errorf("failed to read VCF: %w", err)
+	//	}
+	//}
+	if err = hfbgzfWriter.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to close VCF writer: %w", err)
+	}
+
+	if err = bbgzfWriter.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("failed to close VCF writer: %w", err)
+	}
+	if malformedSamples > 0 {
+		fmt.Printf("Skipped %d non-fatal malformed sample parse warning(s).\n", malformedSamples)
+	}
+
+	return hardFilteredVariants, original, hardFiltered, nil
+}
