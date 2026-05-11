@@ -2,12 +2,14 @@ package utils
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strings"
 	"sync"
 
 	"github.com/biogo/hts/bgzf"
+	"github.com/biogo/hts/tabix"
 	"github.com/brentp/vcfgo"
 	"github.com/schollz/progressbar/v3"
 )
@@ -318,6 +320,29 @@ type filterResult struct {
 	keep bool
 }
 
+// countingWriter tracks the number of bytes written to the underlying writer.
+type countingWriter struct {
+	io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+// vcfRecord wraps a VCF record so it satisfies tabix.Record for index building.
+type vcfRecord struct {
+	chrom string
+	start int // 0-based
+	end   int // 0-based half-open
+}
+
+func (r vcfRecord) RefName() string { return r.chrom }
+func (r vcfRecord) Start() int      { return r.start }
+func (r vcfRecord) End() int        { return r.end }
+
 // ---------------------------------------------------------------------------
 // HardFilterVcf reads variants from rdr, applies GATK hard-filtering and
 // BSA-seq filters, writes passing variants to hardFilteredVcfPath and failing
@@ -355,7 +380,8 @@ func HardFilterVcf(
 	}
 	defer hfFile.Close()
 
-	hfBgzf := bgzf.NewWriter(hfFile, 1)
+	hfCounting := &countingWriter{Writer: hfFile}
+	hfBgzf := bgzf.NewWriter(hfCounting, 1)
 	hfWriter, err := vcfgo.NewWriter(hfBgzf, rdr.Header)
 	if err != nil {
 		hfBgzf.Close()
@@ -376,6 +402,13 @@ func HardFilterVcf(
 		badBgzf.Close()
 		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
 	}
+
+	hfIdx := tabix.New()
+	hfIdx.Format = 2 // VCF
+	hfIdx.NameColumn = 1
+	hfIdx.BeginColumn = 2
+	hfIdx.EndColumn = 0
+	hfIdx.MetaChar = '#'
 
 	// ------------------------------------------------------------------ //
 	// Concurrency setup
@@ -432,7 +465,27 @@ func HardFilterVcf(
 
 				if r.keep {
 					hardFilteredVariants = append(hardFilteredVariants, r.v)
+
+					// Capture virtual offset before and after writing for tabix.
+					// bgzf.Writer.Next() returns the offset within the current block.
+					// hfCounting.n tracks the file offset of the start of the current block.
+					blockOffset, _ := hfBgzf.Next()
+					startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
+
 					hfWriter.WriteVariant(r.v)
+
+					blockOffsetEnd, _ := hfBgzf.Next()
+					endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
+
+					rec := vcfRecord{
+						chrom: r.v.Chromosome,
+						start: int(r.v.Pos) - 1,
+						end:   int(r.v.Pos) - 1 + len(r.v.Ref()),
+					}
+					if err := hfIdx.Add(rec, bgzf.Chunk{Begin: startOffset, End: endOffset}, true, true); err != nil {
+						writeErr = fmt.Errorf("tabix add variant at %s:%d: %w", rec.chrom, r.v.Pos, err)
+					}
+
 					hardFiltered++
 				} else {
 					badWriter.WriteVariant(r.v)
@@ -552,6 +605,23 @@ func HardFilterVcf(
 	}
 	if err = badBgzf.Close(); err != nil {
 		return nil, 0, 0, fmt.Errorf("close rejected bgzf: %w", err)
+	}
+
+	// ── write tabix index ─────────────────────────────────────────────────────
+	tbiPath := hardFilteredVcfPath + ".tbi"
+	tbiFile, err := os.Create(tbiPath)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("create tbi file: %w", err)
+	}
+	defer tbiFile.Close()
+
+	tbiGz := bgzf.NewWriter(tbiFile, 1)
+	if err := tabix.WriteTo(tbiGz, hfIdx); err != nil {
+		_ = tbiGz.Close()
+		return nil, 0, 0, fmt.Errorf("write tabix index: %w", err)
+	}
+	if err := tbiGz.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
 	}
 
 	fmt.Printf(

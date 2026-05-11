@@ -774,10 +774,10 @@ func detectConsensusQTLs(chrom string, stats []SmoothedStats) []QTLRecord {
 	for _, s := range stats {
 		t := s.thresholds
 		count := 0
-		if s.HighSI > t.HighP99 {
+		if s.HighSI > t.HighP99 || s.HighSI < t.HighMp99 {
 			count++
 		}
-		if s.LowSI > t.LowP99 {
+		if s.LowSI > t.LowP99 || s.LowSI < t.LowMp99 {
 			count++
 		}
 		if s.DeltaSI > t.DsiP99 || s.DeltaSI < t.DsiMp99 {
@@ -1532,7 +1532,9 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		nf := float64(len(stats))
 		var (
 			sumHp99, sumHp95     float64
+			sumHMp99, sumHMp95   float64
 			sumLp99, sumLp95     float64
+			sumLMp99, sumLMp95   float64
 			sumDp99, sumDp95     float64
 			sumDMp99, sumDMp95   float64
 			sumGs99, sumGs95     float64
@@ -1543,7 +1545,9 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		for _, s := range stats {
 			t := s.thresholds
 			sumHp99 += t.HighP99; sumHp95 += t.HighP95
+			sumHMp99 += t.HighMp99; sumHMp95 += t.HighMp95
 			sumLp99 += t.LowP99;  sumLp95 += t.LowP95
+			sumLMp99 += t.LowMp99; sumLMp95 += t.LowMp95
 			sumDp99 += t.DsiP99;  sumDp95 += t.DsiP95
 			sumDMp99 += t.DsiMp99; sumDMp95 += t.DsiMp95
 			sumGs99 += t.GsP99;  sumGs95 += t.GsP95
@@ -1552,7 +1556,9 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 			sumBbp99 += t.BbP99;  sumBbp95 += t.BbP95
 		}
 		avgHp99, avgHp95     := sumHp99/nf, sumHp95/nf
+		avgHMp99, avgHMp95   := sumHMp99/nf, sumHMp95/nf
 		avgLp99, avgLp95     := sumLp99/nf, sumLp95/nf
+		avgLMp99, avgLMp95   := sumLMp99/nf, sumLMp95/nf
 		avgDp99, avgDp95     := sumDp99/nf, sumDp95/nf
 		avgDMp99, avgDMp95   := sumDMp99/nf, sumDMp95/nf
 		avgGs99, avgGs95     := sumGs99/nf, sumGs95/nf
@@ -1570,8 +1576,10 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		ed := make([]float64, n)
 		lod := make([]float64, n)
 		bbl := make([]float64, n)
-		hiT99, hiT95 := make([]float64, n), make([]float64, n)
-		liT99, liT95 := make([]float64, n), make([]float64, n)
+		hiT99, hiTM99 := make([]float64, n), make([]float64, n)
+		hiT95, hiTM95 := make([]float64, n), make([]float64, n)
+		liT99, liTM99 := make([]float64, n), make([]float64, n)
+		liT95, liTM95 := make([]float64, n), make([]float64, n)
 		dsiT99, dsiTM99 := make([]float64, n), make([]float64, n)
 		dsiT95, dsiTM95 := make([]float64, n), make([]float64, n)
 		gsT99, gsT95 := make([]float64, n), make([]float64, n)
@@ -1584,8 +1592,10 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 			hi[i], li[i], dsi[i] = s.HighSI, s.LowSI, s.DeltaSI
 			gs[i], ed[i], lod[i], bbl[i] = s.Gstat, s.ED, s.LOD, s.BBLogBF
 			t := s.thresholds
-			hiT99[i], hiT95[i] = t.HighP99, t.HighP95
-			liT99[i], liT95[i] = t.LowP99, t.LowP95
+			hiT99[i], hiTM99[i] = t.HighP99, t.HighMp99
+			hiT95[i], hiTM95[i] = t.HighP95, t.HighMp95
+			liT99[i], liTM99[i] = t.LowP99, t.LowMp99
+			liT95[i], liTM95[i] = t.LowP95, t.LowMp95
 			dsiT99[i], dsiTM99[i] = t.DsiP99, t.DsiMp99
 			dsiT95[i], dsiTM95[i] = t.DsiP95, t.DsiMp95
 			gsT99[i], gsT95[i] = t.GsP99, t.GsP95
@@ -1601,7 +1611,9 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		var chromQTLs []QTLRecord
 		// p99
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiT99, "HighSI", "99", false, "Permutation")...)
+		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiTM99, "HighSI", "99", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liT99, "LowSI", "99", false, "Permutation")...)
+		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liTM99, "LowSI", "99", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiT99, "DeltaSI", "99", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiTM99, "DeltaSI", "99", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, gs, gsT99, "Gstat", "99", false, "Permutation")...)
@@ -1610,7 +1622,9 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, bbl, bblT99, "BBLogBF", "99", false, "Permutation")...)
 		// p95
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiT95, "HighSI", "95", false, "Permutation")...)
+		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, hi, hiTM95, "HighSI", "95", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liT95, "LowSI", "95", false, "Permutation")...)
+		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, li, liTM95, "LowSI", "95", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiT95, "DeltaSI", "95", false, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, dsi, dsiTM95, "DeltaSI", "95", true, "Permutation")...)
 		chromQTLs = append(chromQTLs, detectQTLsAdaptive(chrom, x, gs, gsT95, "Gstat", "95", false, "Permutation")...)
@@ -1659,8 +1673,8 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		robustZPage.AddCharts(createRobustZOverlayChart(chrom, x, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ, chromBRMBlocks))
 
 		individualPage.AddCharts(
-			createInteractiveLineChart(chrom+" HighSI", x, hi, avgHp99, avgHp95, 0, 0, false, chromBRMBlocks),
-			createInteractiveLineChart(chrom+" LowSI", x, li, avgLp99, avgLp95, 0, 0, false, chromBRMBlocks),
+			createInteractiveLineChart(chrom+" HighSI", x, hi, avgHp99, avgHp95, avgHMp99, avgHMp95, true, chromBRMBlocks),
+			createInteractiveLineChart(chrom+" LowSI", x, li, avgLp99, avgLp95, avgLMp99, avgLMp95, true, chromBRMBlocks),
 			createInteractiveLineChart(chrom+" DeltaSI", x, dsi, avgDp99, avgDp95, avgDMp99, avgDMp95, true, chromBRMBlocks),
 			createInteractiveLineChart(chrom+" Gstat", x, gs, avgGs99, avgGs95, 0, 0, false, chromBRMBlocks),
 			createInteractiveLineChart(chrom+" ED4", x, ed, avgEp99, avgEp95, 0, 0, false, chromBRMBlocks),
