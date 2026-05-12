@@ -17,6 +17,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/gmaffy/genome-whisperer/annotation"
+	"github.com/gmaffy/genome-whisperer/genespace"
 	"github.com/go-echarts/go-echarts/v2/charts"
 	"github.com/go-echarts/go-echarts/v2/components"
 	"github.com/go-echarts/go-echarts/v2/opts"
@@ -1471,7 +1472,7 @@ func writeHTMLPage(page *components.Page, path string) error {
 //	<qtlOutFile>                   – TSV of all QTL intervals (all detection methods)
 //	GoBSAseq_BRMBlocks.tsv        – TSV of BRM-style block intervals used for plot shading
 func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, highBulkSize, lowBulkSize int,
-	population string, alphas []float64, rep int, htmlOutFile, qtlOutFile string) error {
+	population string, alphas []float64, rep int, htmlOutFile, qtlOutFile string) ([]QTLRecord, error) {
 
 	outDir := filepath.Dir(htmlOutFile)
 
@@ -1734,19 +1735,19 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 
 	// Write HTML files.
 	if err := writeHTMLPage(individualPage, filepath.Join(outDir, "GoBSAseq_IndividualPlots.html")); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeHTMLPage(robustZPage, filepath.Join(outDir, "GoBSAseq_RobustZScore.html")); err != nil {
 		return err
 	}
 	if err := writeHTMLPage(compositePage, filepath.Join(outDir, "GoBSAseq_CompositeSignal.html")); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Write main QTL TSV (Permutation, ZScore, HighConfidence).
 	fTsv, err := os.Create(qtlOutFile)
 	if err != nil {
-		return fmt.Errorf("create qtl file: %w", err)
+		return nil, fmt.Errorf("create qtl file: %w", err)
 	}
 	fmt.Fprintf(fTsv, "CHROM\tSTART\tSTOP\tPEAK\tSTAT\tCI\tSOURCE\n")
 	for _, q := range allQTLs {
@@ -1759,7 +1760,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 	// Per user request: rename PEAK to #STATS and SOURCE to STATS.
 	fCons, err := os.Create(filepath.Join(outDir, "GoBSAseq_QTL_CONSENSUS.tsv"))
 	if err != nil {
-		return fmt.Errorf("create consensus qtl file: %w", err)
+		return nil, fmt.Errorf("create consensus qtl file: %w", err)
 	}
 	fmt.Fprintf(fCons, "CHROM\tSTART\tSTOP\t#STATS\tSTAT\tCI\tSTATS\n")
 	for _, q := range allConsensusQTLs {
@@ -1771,7 +1772,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 	// Write MaxZ QTL TSV (Method 4).
 	fMaxZ, err := os.Create(filepath.Join(outDir, "GoBSAseq_QTL_MAX_Z.tsv"))
 	if err != nil {
-		return fmt.Errorf("create maxz qtl file: %w", err)
+		return nil, fmt.Errorf("create maxz qtl file: %w", err)
 	}
 	fmt.Fprintf(fMaxZ, "CHROM\tSTART\tSTOP\tPEAK\tSTAT\tCI\tSOURCE\n")
 	for _, q := range allMaxZQTLs {
@@ -1783,7 +1784,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 	// Write BRM blocks TSV.
 	fBRM, err := os.Create(filepath.Join(outDir, "GoBSAseq_BRMBlocks.tsv"))
 	if err != nil {
-		return fmt.Errorf("create brm blocks file: %w", err)
+		return nil, fmt.Errorf("create brm blocks file: %w", err)
 	}
 	fmt.Fprintf(fBRM, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK_DELTA_SI\tBRM_THRESHOLD\n")
 	for _, b := range allBRMBlocks {
@@ -1791,7 +1792,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 			b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.Threshold)
 	}
 	if err := fBRM.Close(); err != nil {
-		return fmt.Errorf("close brm blocks file: %w", err)
+		return nil, fmt.Errorf("close brm blocks file: %w", err)
 	}
 
 	return nil
@@ -2130,13 +2131,14 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	htmlFile := filepath.Join(outDir, "GoBSAseq_RobustZScore.html")
 	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
 
-	if err := GenerateHtmlPlotsAndQTL(
+	finalQTLs, err := GenerateHtmlPlotsAndQTL(
 		allSmoothed,
 		highSmAF, lowSmAF,
 		cfg.HighBulkSize, cfg.LowBulkSize,
 		pop, cfg.Alphas, rep,
 		htmlFile, qtlFile,
-	); err != nil {
+	)
+	if err != nil {
 		color.Red("Error generating Plots and QTLs: %v", err)
 	} else {
 		color.Green("HTML plots written to %s", outDir)
@@ -2146,22 +2148,30 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	// -------------------------------------------------------------------------------------------------
 	// Stage 6 - Gene space analysis
 	//--------------------------------------------------------------------------------------------------
-
-	if cfg.SnpEffDB != "" {
+	var annotatedTsvFiles []string
+	if cfg.SnpEffDB != "" && cfg.GeneDesc != "" && cfg.Prg != "" {
 		_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
 		if hasEFF {
 			fmt.Println("EFF column is present in the VCF header")
 		} else {
 			fmt.Println("EFF column is NOT present")
 			fmt.Printf("Annotate vcf")
-			err, annotatedTsvFiles, annotatedVcfFiles := annotation.RunSnpEff([]string{filteredVcfPath}, cfg.SnpEffDB, true)
+			err, annotatedTsvFiles = annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
 			if err != nil {
 				color.Red("Failed variant annotation with SNPEFF: %s", err)
 				return
 			}
 			color.Green("SNPEFF annotation complete")
 			color.Green("Annotated TSV files written to %s", annotatedTsvFiles)
-			color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
+			//color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
+		}
+	}
+
+	if cfg.Gff != "" {
+		color.Cyan("Performing Gene space analysis ...")
+		for _, qtl := range finalQTLs {
+			fmt.Println(qtl.Chrom, qtl.Start, qtl.Stop)
+			genespace.GeneSpace(cfg.Gff, annotatedTsvFiles[0], qtl.Chrom, int(qtl.Start), int(qtl.Stop), cfg.HighParentName, cfg.LowParentName)
 		}
 
 	}

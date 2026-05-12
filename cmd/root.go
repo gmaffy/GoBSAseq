@@ -61,6 +61,8 @@ var rootCmd = &cobra.Command{
 		cds, _ := cmd.Flags().GetString("cds")
 		ref, _ := cmd.Flags().GetString("reference")
 		protein, _ := cmd.Flags().GetString("protein")
+		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
+		prg, _ := cmd.Flags().GetString("prg")
 
 		parentNamesLst := strings.Split(parents, ",")
 		bulkNamesLst := strings.Split(bulks, ",")
@@ -317,6 +319,8 @@ var rootCmd = &cobra.Command{
 			Protein:  protein,
 			Gff:      gff,
 			Cds:      cds,
+			GeneDesc: geneDescriptions,
+			Prg:      prg,
 		}
 
 		err = run.Run(a_config, hfConfig)
@@ -369,5 +373,7 @@ func init() {
 	rootCmd.Flags().String("cds", "", "cds file path")
 	rootCmd.Flags().StringP("reference", "r", "", "cds fasta path")
 	rootCmd.Flags().String("protein", "", "protein fasta path")
+	rootCmd.Flags().String("gene-descriptions", "", "gene descriptions file path")
+	rootCmd.Flags().String("prg", "", "prg blast file path ")
 
 }

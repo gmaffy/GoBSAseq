@@ -49,6 +49,8 @@ type AnalysisConfig struct {
 	Protein  string
 	Gff      string
 	Cds      string
+	GeneDesc string
+	Prg      string
 }
 
 type HardFilterConfig struct {
