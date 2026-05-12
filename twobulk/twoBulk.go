@@ -1738,7 +1738,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		return nil, err
 	}
 	if err := writeHTMLPage(robustZPage, filepath.Join(outDir, "GoBSAseq_RobustZScore.html")); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeHTMLPage(compositePage, filepath.Join(outDir, "GoBSAseq_CompositeSignal.html")); err != nil {
 		return nil, err
@@ -1795,7 +1795,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		return nil, fmt.Errorf("close brm blocks file: %w", err)
 	}
 
-	return nil
+	return allMaxZQTLs, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2171,7 +2171,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 		color.Cyan("Performing Gene space analysis ...")
 		for _, qtl := range finalQTLs {
 			fmt.Println(qtl.Chrom, qtl.Start, qtl.Stop)
-			genespace.GeneSpace(cfg.Gff, annotatedTsvFiles[0], qtl.Chrom, int(qtl.Start), int(qtl.Stop), cfg.HighParentName, cfg.LowParentName)
+			genespace.GeneSpace(cfg.Gff, annotatedTsvFiles[0], qtl.Chrom, int(qtl.Start), int(qtl.Stop), cfg.HighParentName, "PEPO")
 		}
 
 	}
