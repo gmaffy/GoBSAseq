@@ -6,6 +6,7 @@ require (
 	github.com/biogo/hts v1.4.5
 	github.com/brentp/vcfgo v0.0.0-20250902214554-a31336cef488
 	github.com/fatih/color v1.19.0
+	github.com/gmaffy/genome-whisperer v0.0.0-20260422182429-bd42b8e7dd93
 	github.com/go-echarts/go-echarts/v2 v2.7.2
 	github.com/schollz/progressbar/v3 v3.19.0
 	github.com/spf13/cobra v1.10.2
@@ -23,5 +24,5 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	golang.org/x/sys v0.42.0 // indirect
-	golang.org/x/term v0.28.0 // indirect
+	golang.org/x/term v0.40.0 // indirect
 )

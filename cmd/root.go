@@ -56,6 +56,12 @@ var rootCmd = &cobra.Command{
 		maxFS_INDEL, _ := cmd.Flags().GetFloat64("max-FS-INDEL")
 		minReadPosRank_INDEL, _ := cmd.Flags().GetFloat64("min-ReadPosRankSum-INDEL")
 
+		snpEffDB, _ := cmd.Flags().GetString("snpEffDB")
+		gff, _ := cmd.Flags().GetString("gff")
+		cds, _ := cmd.Flags().GetString("cds")
+		ref, _ := cmd.Flags().GetString("reference")
+		protein, _ := cmd.Flags().GetString("protein")
+
 		parentNamesLst := strings.Split(parents, ",")
 		bulkNamesLst := strings.Split(bulks, ",")
 		bulksDepthLst := strings.Split(bulksDepth, ",")
@@ -305,6 +311,12 @@ var rootCmd = &cobra.Command{
 			OneBulkName:  oneBulkName,
 			OneBulkDepth: oneBulkDepth,
 			OneBulkSize:  oneBulkSize,
+
+			SnpEffDB: snpEffDB,
+			Ref:      ref,
+			Protein:  protein,
+			Gff:      gff,
+			Cds:      cds,
 		}
 
 		err = run.Run(a_config, hfConfig)
@@ -351,5 +363,11 @@ func init() {
 	rootCmd.Flags().Float64("min-QUAL-INDEL", 30.0, "Variant quality INDELs")        //INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
 	rootCmd.Flags().Float64("max-FS-INDEL", 200.0, "FisherStrand INDELs")            //INDEL_FS_Max             float64 // default 200.0 – FisherStrand
 	rootCmd.Flags().Float64("min-ReadPosRankSum-INDEL", -20.0, "ReadPosRank INDELs") //INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
+
+	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
+	rootCmd.Flags().String("gff", "", "gff3 file path")
+	rootCmd.Flags().String("cds", "", "cds file path")
+	rootCmd.Flags().StringP("reference", "r", "", "cds fasta path")
+	rootCmd.Flags().String("protein", "", "protein fasta path")
 
 }

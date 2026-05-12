@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/gmaffy/genome-whisperer/annotation"
 	"github.com/go-echarts/go-echarts/v2/charts"
 	"github.com/go-echarts/go-echarts/v2/components"
 	"github.com/go-echarts/go-echarts/v2/opts"
@@ -669,8 +671,6 @@ func robustZScore(vals []float64, median, mad float64) []float64 {
 	return out
 }
 
-
-
 // ---------------------------------------------------------------------------
 // QTL detection
 // ---------------------------------------------------------------------------
@@ -768,35 +768,37 @@ func detectConsensusQTLs(chrom string, stats []SmoothedStats) []QTLRecord {
 	type hit struct {
 		pos   int64
 		count int
+		fired []string
 	}
 
 	hits := make([]hit, 0, len(stats))
 	for _, s := range stats {
 		t := s.thresholds
-		count := 0
+		var fired []string
 		if s.HighSI > t.HighP99 || s.HighSI < t.HighMp99 {
-			count++
+			fired = append(fired, "HighSI")
 		}
 		if s.LowSI > t.LowP99 || s.LowSI < t.LowMp99 {
-			count++
+			fired = append(fired, "LowSI")
 		}
 		if s.DeltaSI > t.DsiP99 || s.DeltaSI < t.DsiMp99 {
-			count++
+			fired = append(fired, "DeltaSI")
 		}
 		if s.Gstat > t.GsP99 {
-			count++
+			fired = append(fired, "Gstat")
 		}
 		if s.ED > t.EdP99 {
-			count++
+			fired = append(fired, "ED4")
 		}
 		if s.LOD > t.LodP99 {
-			count++
+			fired = append(fired, "LOD")
 		}
 		if s.BBLogBF > t.BbP99 {
-			count++
+			fired = append(fired, "BBLogBF")
 		}
-		if count >= consensusMinStats {
-			hits = append(hits, hit{s.POS, count})
+
+		if len(fired) >= consensusMinStats {
+			hits = append(hits, hit{s.POS, len(fired), fired})
 		}
 	}
 
@@ -804,24 +806,35 @@ func detectConsensusQTLs(chrom string, stats []SmoothedStats) []QTLRecord {
 		return nil
 	}
 
-	// Merge consecutive hit positions (gap-bridge by maxGapWindows implicitly
-	// because hits with count < threshold are naturally absent).
 	var qtls []QTLRecord
 	start := hits[0].pos
 	stop := hits[0].pos
 	maxCount := hits[0].count
+	uniqueStats := make(map[string]bool)
+	for _, st := range hits[0].fired {
+		uniqueStats[st] = true
+	}
 
 	for i := 1; i < len(hits); i++ {
-		// Use index distance in the full stats slice as proxy for gap size.
 		prevIdx := sort.Search(len(stats), func(j int) bool { return stats[j].POS >= stop })
 		nextIdx := sort.Search(len(stats), func(j int) bool { return stats[j].POS >= hits[i].pos })
 		gap := nextIdx - prevIdx - 1
+
 		if gap <= maxGapWindows {
 			stop = hits[i].pos
 			if hits[i].count > maxCount {
 				maxCount = hits[i].count
 			}
+			for _, st := range hits[i].fired {
+				uniqueStats[st] = true
+			}
 		} else {
+			allFired := make([]string, 0, len(uniqueStats))
+			for st := range uniqueStats {
+				allFired = append(allFired, st)
+			}
+			sort.Strings(allFired)
+
 			qtls = append(qtls, QTLRecord{
 				Chrom:  chrom,
 				Start:  start,
@@ -829,13 +842,25 @@ func detectConsensusQTLs(chrom string, stats []SmoothedStats) []QTLRecord {
 				Peak:   float64(maxCount),
 				Stat:   "Consensus",
 				CI:     "99",
-				Source: "Consensus",
+				Source: strings.Join(allFired, ","),
 			})
+
 			start = hits[i].pos
 			stop = hits[i].pos
 			maxCount = hits[i].count
+			uniqueStats = make(map[string]bool)
+			for _, st := range hits[i].fired {
+				uniqueStats[st] = true
+			}
 		}
 	}
+
+	allFired := make([]string, 0, len(uniqueStats))
+	for st := range uniqueStats {
+		allFired = append(allFired, st)
+	}
+	sort.Strings(allFired)
+
 	qtls = append(qtls, QTLRecord{
 		Chrom:  chrom,
 		Start:  start,
@@ -843,17 +868,18 @@ func detectConsensusQTLs(chrom string, stats []SmoothedStats) []QTLRecord {
 		Peak:   float64(maxCount),
 		Stat:   "Consensus",
 		CI:     "99",
-		Source: "Consensus",
+		Source: strings.Join(allFired, ","),
 	})
+
 	return qtls
 }
 
 // intersectQTLsWithBRM marks permutation-called QTLs that overlap at least one
 // BRM block as high-confidence and returns a deduplicated list.
-func intersectQTLsWithBRM(qtls []QTLRecord, brm []BRMBlock) []QTLRecord {
+func intersectQTLsWithBRM(qtls []QTLRecord, brm []BRMBlock, targetSource string) []QTLRecord {
 	var hc []QTLRecord
 	for _, q := range qtls {
-		if q.Source == "Consensus" || q.Source == "HighConfidence" {
+		if q.Stat == "Consensus" || q.Source == "HighConfidence" || q.Source == "CompositeHighConfidence" {
 			continue
 		}
 		for _, b := range brm {
@@ -865,7 +891,7 @@ func intersectQTLsWithBRM(qtls []QTLRecord, brm []BRMBlock) []QTLRecord {
 					Peak:   q.Peak,
 					Stat:   q.Stat,
 					CI:     q.CI,
-					Source: "HighConfidence",
+					Source: targetSource,
 				})
 				break
 			}
@@ -1041,15 +1067,7 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 // Individual (raw-value) line chart — one series per statistic, per chromosome
 // ---------------------------------------------------------------------------
 
-func createInteractiveLineChart(
-	title string,
-	x []int64,
-	y []float64,
-	t99, t95 float64,
-	tm99, tm95 float64,
-	hasNegativeThresh bool,
-	brmBlocks []BRMBlock,
-) *charts.Line {
+func createInteractiveLineChart(title string, x []int64, y []float64, t99, t95 float64, tm99, tm95 float64, hasNegativeThresh bool, brmBlocks []BRMBlock) *charts.Line {
 
 	subtitle := fmt.Sprintf("p99 threshold: %.4f  |  p95 threshold: %.4f  |  shaded: BRM blocks", t99, t95)
 
@@ -1423,8 +1441,6 @@ func positionLabels(x []int64) []string {
 	return labels
 }
 
-
-
 func writeHTMLPage(page *components.Page, path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -1496,6 +1512,8 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 
 	var allQTLs []QTLRecord
 	var allBRMBlocks []BRMBlock
+	var allConsensusQTLs []QTLRecord
+	var allMaxZQTLs []QTLRecord
 
 	popLevel := 0
 	if population == "F2" {
@@ -1544,27 +1562,37 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		)
 		for _, s := range stats {
 			t := s.thresholds
-			sumHp99 += t.HighP99; sumHp95 += t.HighP95
-			sumHMp99 += t.HighMp99; sumHMp95 += t.HighMp95
-			sumLp99 += t.LowP99;  sumLp95 += t.LowP95
-			sumLMp99 += t.LowMp99; sumLMp95 += t.LowMp95
-			sumDp99 += t.DsiP99;  sumDp95 += t.DsiP95
-			sumDMp99 += t.DsiMp99; sumDMp95 += t.DsiMp95
-			sumGs99 += t.GsP99;  sumGs95 += t.GsP95
-			sumEp99 += t.EdP99;  sumEp95 += t.EdP95
-			sumLodp99 += t.LodP99; sumLodp95 += t.LodP95
-			sumBbp99 += t.BbP99;  sumBbp95 += t.BbP95
+			sumHp99 += t.HighP99
+			sumHp95 += t.HighP95
+			sumHMp99 += t.HighMp99
+			sumHMp95 += t.HighMp95
+			sumLp99 += t.LowP99
+			sumLp95 += t.LowP95
+			sumLMp99 += t.LowMp99
+			sumLMp95 += t.LowMp95
+			sumDp99 += t.DsiP99
+			sumDp95 += t.DsiP95
+			sumDMp99 += t.DsiMp99
+			sumDMp95 += t.DsiMp95
+			sumGs99 += t.GsP99
+			sumGs95 += t.GsP95
+			sumEp99 += t.EdP99
+			sumEp95 += t.EdP95
+			sumLodp99 += t.LodP99
+			sumLodp95 += t.LodP95
+			sumBbp99 += t.BbP99
+			sumBbp95 += t.BbP95
 		}
-		avgHp99, avgHp95     := sumHp99/nf, sumHp95/nf
-		avgHMp99, avgHMp95   := sumHMp99/nf, sumHMp95/nf
-		avgLp99, avgLp95     := sumLp99/nf, sumLp95/nf
-		avgLMp99, avgLMp95   := sumLMp99/nf, sumLMp95/nf
-		avgDp99, avgDp95     := sumDp99/nf, sumDp95/nf
-		avgDMp99, avgDMp95   := sumDMp99/nf, sumDMp95/nf
-		avgGs99, avgGs95     := sumGs99/nf, sumGs95/nf
-		avgEp99, avgEp95     := sumEp99/nf, sumEp95/nf
+		avgHp99, avgHp95 := sumHp99/nf, sumHp95/nf
+		avgHMp99, avgHMp95 := sumHMp99/nf, sumHMp95/nf
+		avgLp99, avgLp95 := sumLp99/nf, sumLp95/nf
+		avgLMp99, avgLMp95 := sumLMp99/nf, sumLMp95/nf
+		avgDp99, avgDp95 := sumDp99/nf, sumDp95/nf
+		avgDMp99, avgDMp95 := sumDMp99/nf, sumDMp95/nf
+		avgGs99, avgGs95 := sumGs99/nf, sumGs95/nf
+		avgEp99, avgEp95 := sumEp99/nf, sumEp95/nf
 		avgLodp99, avgLodp95 := sumLodp99/nf, sumLodp95/nf
-		avgBbp99, avgBbp95   := sumBbp99/nf, sumBbp95/nf
+		avgBbp99, avgBbp95 := sumBbp99/nf, sumBbp95/nf
 
 		// Extract per-window data and per-window p99/p95 threshold arrays.
 		n := len(stats)
@@ -1658,16 +1686,35 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		// Windows where ≥consensusMinStats statistics exceed their p99
 		// thresholds simultaneously are merged into consensus intervals.
 		// ----------------------------------------------------------------
-		chromQTLs = append(chromQTLs, detectConsensusQTLs(chrom, stats)...)
+		cQTLs := detectConsensusQTLs(chrom, stats)
+		allConsensusQTLs = append(allConsensusQTLs, cQTLs...)
 
 		// ----------------------------------------------------------------
-		// BRM blocks and Method 4: high-confidence intersection.
-		// Permutation QTLs overlapping a BRM block are promoted to
-		// HighConfidence, providing cross-method validation.
+		// BRM blocks and intersection validation
 		// ----------------------------------------------------------------
 		chromBRMBlocks := calculateBRMBlocks(chrom, stats, highBulkSize, lowBulkSize, popLevel, brmUAlpha)
 		allBRMBlocks = append(allBRMBlocks, chromBRMBlocks...)
-		chromQTLs = append(chromQTLs, intersectQTLsWithBRM(chromQTLs, chromBRMBlocks)...)
+
+		// ----------------------------------------------------------------
+		// QTL detection — Method 4: max-|Z| composite signal.
+		// ----------------------------------------------------------------
+		composite := make([]float64, n)
+		for i := range composite {
+			composite[i] = math.Max(math.Abs(hiZ[i]),
+				math.Max(math.Abs(liZ[i]),
+					math.Max(math.Abs(dsiZ[i]),
+						math.Max(math.Abs(gsZ[i]),
+							math.Max(math.Abs(edZ[i]),
+								math.Max(math.Abs(lodZ[i]), math.Abs(bblZ[i])))))))
+		}
+		maxZQTLs := detectQTLs(chrom, x, composite, zSig, "Composite_Z", "z3", false, "MaxZ")
+		allMaxZQTLs = append(allMaxZQTLs, maxZQTLs...)
+		allMaxZQTLs = append(allMaxZQTLs, intersectQTLsWithBRM(maxZQTLs, chromBRMBlocks, "CompositeHighConfidence")...)
+
+		// ----------------------------------------------------------------
+		// Method 5: high-confidence intersection (Permutation/ZScore).
+		// ----------------------------------------------------------------
+		chromQTLs = append(chromQTLs, intersectQTLsWithBRM(chromQTLs, chromBRMBlocks, "HighConfidence")...)
 		allQTLs = append(allQTLs, chromQTLs...)
 
 		robustZPage.AddCharts(createRobustZOverlayChart(chrom, x, hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ, chromBRMBlocks))
@@ -1696,7 +1743,7 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		return err
 	}
 
-	// Write QTL TSV.
+	// Write main QTL TSV (Permutation, ZScore, HighConfidence).
 	fTsv, err := os.Create(qtlOutFile)
 	if err != nil {
 		return fmt.Errorf("create qtl file: %w", err)
@@ -1706,9 +1753,32 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 		fmt.Fprintf(fTsv, "%s\t%d\t%d\t%.6f\t%s\t%s\t%s\n",
 			q.Chrom, q.Start, q.Stop, q.Peak, q.Stat, q.CI, q.Source)
 	}
-	if err := fTsv.Close(); err != nil {
-		return fmt.Errorf("close qtl file: %w", err)
+	_ = fTsv.Close()
+
+	// Write Consensus QTL TSV (Method 3).
+	// Per user request: rename PEAK to #STATS and SOURCE to STATS.
+	fCons, err := os.Create(filepath.Join(outDir, "GoBSAseq_QTL_CONSENSUS.tsv"))
+	if err != nil {
+		return fmt.Errorf("create consensus qtl file: %w", err)
 	}
+	fmt.Fprintf(fCons, "CHROM\tSTART\tSTOP\t#STATS\tSTAT\tCI\tSTATS\n")
+	for _, q := range allConsensusQTLs {
+		fmt.Fprintf(fCons, "%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
+			q.Chrom, q.Start, q.Stop, int(q.Peak), q.Stat, q.CI, q.Source)
+	}
+	_ = fCons.Close()
+
+	// Write MaxZ QTL TSV (Method 4).
+	fMaxZ, err := os.Create(filepath.Join(outDir, "GoBSAseq_QTL_MAX_Z.tsv"))
+	if err != nil {
+		return fmt.Errorf("create maxz qtl file: %w", err)
+	}
+	fmt.Fprintf(fMaxZ, "CHROM\tSTART\tSTOP\tPEAK\tSTAT\tCI\tSOURCE\n")
+	for _, q := range allMaxZQTLs {
+		fmt.Fprintf(fMaxZ, "%s\t%d\t%d\t%.6f\t%s\t%s\t%s\n",
+			q.Chrom, q.Start, q.Stop, q.Peak, q.Stat, q.CI, q.Source)
+	}
+	_ = fMaxZ.Close()
 
 	// Write BRM blocks TSV.
 	fBRM, err := os.Create(filepath.Join(outDir, "GoBSAseq_BRMBlocks.tsv"))
@@ -2070,10 +2140,30 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 		color.Red("Error generating Plots and QTLs: %v", err)
 	} else {
 		color.Green("HTML plots written to %s", outDir)
-		color.Green("QTL tabular results written to %s", qtlFile)
+		color.Green("QTL tabular results (Main, Consensus, MaxZ) written to %s", outDir)
 	}
-}
 
-// ---------------------------------------------------------------------------
-// Threshold simulation and caching
-// ---------------------------------------------------------------------------
+	// -------------------------------------------------------------------------------------------------
+	// Stage 6 - Gene space analysis
+	//--------------------------------------------------------------------------------------------------
+
+	if cfg.SnpEffDB != "" {
+		_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
+		if hasEFF {
+			fmt.Println("EFF column is present in the VCF header")
+		} else {
+			fmt.Println("EFF column is NOT present")
+			fmt.Printf("Annotate vcf")
+			err, annotatedTsvFiles, annotatedVcfFiles := annotation.RunSnpEff([]string{filteredVcfPath}, cfg.SnpEffDB, true)
+			if err != nil {
+				color.Red("Failed variant annotation with SNPEFF: %s", err)
+				return
+			}
+			color.Green("SNPEFF annotation complete")
+			color.Green("Annotated TSV files written to %s", annotatedTsvFiles)
+			color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
+		}
+
+	}
+
+}

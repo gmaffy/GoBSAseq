@@ -43,6 +43,12 @@ type AnalysisConfig struct {
 	OneBulkName  string
 	OneBulkDepth int
 	OneBulkSize  int
+
+	SnpEffDB string
+	Ref      string
+	Protein  string
+	Gff      string
+	Cds      string
 }
 
 type HardFilterConfig struct {
