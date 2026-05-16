@@ -43,6 +43,23 @@ func openVCF(path string) (io.Reader, func(), error) {
 	return f, cleanup, nil
 }
 
+func missingGeneSpaceParams(cfg utils.AnalysisConfig) []string {
+	var missing []string
+	if cfg.SnpEffDB == "" {
+		missing = append(missing, "SnpEffDB")
+	}
+	if cfg.GeneDesc == "" {
+		missing = append(missing, "GeneDesc")
+	}
+	if cfg.Prg == "" {
+		missing = append(missing, "Prg")
+	}
+	if cfg.Gff == "" {
+		missing = append(missing, "Gff")
+	}
+	return missing
+}
+
 func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
 	bold := color.New(color.Bold).SprintFunc()
 	samples := []string{cfg.HighParentName, cfg.LowParentName, cfg.OneParentName, cfg.HighBulkName, cfg.LowBulkName, cfg.OneBulkName}
@@ -81,6 +98,22 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	}
 
 	cfg.Rdr = rdr
+
+	if missing := missingGeneSpaceParams(cfg); len(missing) > 0 {
+		color.Yellow("Gene space analysis parameters missing: %s", strings.Join(missing, ", "))
+		color.Blue("Continue without gene space analysis? [y/N]: ")
+		var answer string
+		if _, err := fmt.Scan(&answer); err != nil {
+			return err
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+			color.Yellow("Continuing without gene space analysis.")
+		default:
+			color.Red("Analysis cancelled. Re-run with the missing gene space parameters.")
+			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
+		}
+	}
 
 	var highParentChoice int
 	var lowParentChoice int

@@ -2140,7 +2140,6 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	)
 	if err != nil {
 		color.Red("Error generating Plots and QTLs: %v", err)
-		return
 	} else {
 		color.Green("HTML plots written to %s", outDir)
 		color.Green("QTL tabular results (Main, Consensus, MaxZ) written to %s", outDir)
@@ -2151,36 +2150,29 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	//--------------------------------------------------------------------------------------------------
 
 	color.Cyan("\n============================ Gene space analysis ==============================\n\n")
-	geneSpaceEnabled := cfg.SnpEffDB != "" && cfg.GeneDesc != "" && cfg.Prg != "" && cfg.Gff != ""
-	if !geneSpaceEnabled {
-		color.Yellow("Skipping gene space analysis: required parameters were not provided.")
-		return
-	}
-
 	var annotatedTsvFiles []string
-	color.Green("Step 1: Annotating genes with SnpEff (creating Super VCF table)")
-	_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
-	if hasEFF {
-		color.Yellow("EFF column is already present; no Super VCF table was generated, so gene space analysis will be skipped.")
-		return
+	if cfg.SnpEffDB != "" && cfg.GeneDesc != "" && cfg.Prg != "" && cfg.Gff != "" {
+		color.Green("Step 1: Annotating genes with SnpEff (Creating Super VCF)")
+		_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
+		if hasEFF {
+			fmt.Println("EFF column is present in the VCF header")
+		} else {
+			fmt.Println("EFF column is NOT present")
+			fmt.Printf("Annotate vcf")
+			err, annotatedTsvFiles = annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
+			if err != nil {
+				color.Red("Failed variant annotation with SNPEFF: %s", err)
+				return
+			}
+			color.Green("SNPEFF annotation complete")
+			color.Green("Annotated TSV files written to %s", annotatedTsvFiles)
+			//color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
+		}
 	}
-	color.Yellow("EFF column is not present; annotating filtered VCF.")
-	err, annotatedTsvFiles = annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
-	if err != nil {
-		color.Red("Failed variant annotation with SNPEFF: %s", err)
-		return
-	}
-	if len(annotatedTsvFiles) == 0 {
-		color.Yellow("Skipping gene space analysis: SnpEff annotation did not produce an annotated TSV.")
-		return
-	}
-	color.Green("SNPEFF annotation complete.")
-	color.Green("Annotated TSV files: %v", annotatedTsvFiles)
-	//color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
 
-	color.Cyan("Performing Gene space analysis for %d QTL intervals ...", len(finalQTLs))
+	color.Cyan("Performing Gene space analysis ...")
 	for _, qtl := range finalQTLs {
-		color.Blue("GeneSpace interval: %s:%d-%d", qtl.Chrom, qtl.Start, qtl.Stop)
+		fmt.Println(qtl.Chrom, qtl.Start, qtl.Stop)
 		_, err = genespace.GeneSpace(
 			cfg.Gff, annotatedTsvFiles[0], qtl.Chrom,
 			int(qtl.Start), int(qtl.Stop), []string{cfg.HighParentName},
@@ -2190,6 +2182,5 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 			return
 		}
 	}
-	color.Green("Gene space analysis complete.")
 
 }

@@ -9876,7 +9876,6 @@ Cp4.1LG08g00040.1	null.14878	Cp4.1LG08g00040.1	protein_coding	0	1	0	6	0	0	0	0	5	
 Cp4.1LG08g00050.1	null.14879	Cp4.1LG08g00050.1	protein_coding	0	0	1	5	0	0	0	0	1	0	0	0	0	3	1	0	0	0	0	0	0	0	0	0	1	0	0
 Cp4.1LG08g00070.1	null.14876	Cp4.1LG08g00070.1	protein_coding	0	0	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	2	0	0
 Cp4.1LG08g00080.1	null.14874	Cp4.1LG08g00080.1	protein_coding	0	0	0	1	0	0	0	0	0	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0
-Cp4.1LG08g00090.1	null.14873	Cp4.1LG08g00090.1	protein_coding	0	0	0	1	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0
 Cp4.1LG08g00110.1	null.14872	Cp4.1LG08g00110.1	protein_coding	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
 Cp4.1LG08g00120.1	null.14871	Cp4.1LG08g00120.1	protein_coding	0	0	0	1	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0
 Cp4.1LG08g00180.1	null.14867	Cp4.1LG08g00180.1	protein_coding	0	0	1	0	0	0	0	0	0	0	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0
@@ -17240,10 +17239,10 @@ Cp4.1LG15g08390.1	null.20822	Cp4.1LG15g08390.1	protein_coding	0	0	0	4	0	0	0	0	2	
 Cp4.1LG15g08400.1	null.20829	Cp4.1LG15g08400.1	protein_coding	0	3	0	5	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	3	0	0	5	0	0
 Cp4.1LG15g08430.1	null.20826	Cp4.1LG15g08430.1	protein_coding	0	0	0	10	0	0	0	0	5	0	0	0	0	2	0	0	0	0	0	0	0	0	0	0	3	0	0
 Cp4.1LG15g08450.1	null.20823	Cp4.1LG15g08450.1	protein_coding	0	0	0	3	0	0	0	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	1	0	0
-Cp4.1LG15g08460.1	null.20824	Cp4.1LG15g08460.1	protein_coding	0	0	0	5	0	0	0	0	2	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	3	0	0
+Cp4.1LG15g08460.1	null.20824	Cp4.1LG15g08460.1	protein_coding	0	0	0	4	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	3	0	0
 Cp4.1LG15g08480.1	null.20818	Cp4.1LG15g08480.1	protein_coding	0	0	0	12	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	12	0	0
 Cp4.1LG15g08490.1	null.20819	Cp4.1LG15g08490.1	protein_coding	0	3	0	20	0	0	0	0	7	0	0	0	0	5	0	0	0	0	0	0	0	3	0	0	5	3	0
-Cp4.1LG15g08500.1	null.20825	Cp4.1LG15g08500.1	protein_coding	0	0	0	6	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	5	0	0
+Cp4.1LG15g08500.1	null.20825	Cp4.1LG15g08500.1	protein_coding	0	0	0	5	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	5	0	0
 Cp4.1LG15g08510.1	null.20821	Cp4.1LG15g08510.1	protein_coding	0	0	0	9	0	0	0	0	5	0	0	0	0	1	0	0	0	0	0	0	0	0	0	0	0	0	3
 Cp4.1LG15g08530.1	null.20830	Cp4.1LG15g08530.1	protein_coding	0	0	0	3	0	0	0	0	3	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0
 Cp4.1LG15g08540.1	null.20827	Cp4.1LG15g08540.1	protein_coding	0	0	0	5	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	0	5	0	0
