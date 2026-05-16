@@ -55,6 +55,7 @@ var rootCmd = &cobra.Command{
 		minQUAL_INDEL, _ := cmd.Flags().GetFloat64("min-QUAL-INDEL")
 		maxFS_INDEL, _ := cmd.Flags().GetFloat64("max-FS-INDEL")
 		minReadPosRank_INDEL, _ := cmd.Flags().GetFloat64("min-ReadPosRankSum-INDEL")
+		maxSOR_INDEL, _ := cmd.Flags().GetFloat64("max-SOR-INDEL")
 
 		snpEffDB, _ := cmd.Flags().GetString("snpEffDB")
 		gff, _ := cmd.Flags().GetString("gff")
@@ -268,6 +269,12 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
+		sor_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", maxSOR_INDEL), 64)
+		if err != nil {
+			color.Red("max-SOR-INDEL is supposed to be a float")
+			return
+		}
+
 		hfConfig := utils.HardFilterConfig{
 			SNP_QD_Min:               qd_snp,
 			SNP_QUAL_Min:             qual_snp,
@@ -280,6 +287,7 @@ var rootCmd = &cobra.Command{
 			INDEL_QUAL_Min:           qual_indel,
 			INDEL_FS_Max:             fs_indel,
 			INDEL_ReadPosRankSum_Min: readPosRank_indel,
+			INDEL_SOR_Max:            sor_indel,
 		}
 
 		a_config := utils.AnalysisConfig{
@@ -367,6 +375,7 @@ func init() {
 	rootCmd.Flags().Float64("min-QUAL-INDEL", 30.0, "Variant quality INDELs")        //INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
 	rootCmd.Flags().Float64("max-FS-INDEL", 200.0, "FisherStrand INDELs")            //INDEL_FS_Max             float64 // default 200.0 – FisherStrand
 	rootCmd.Flags().Float64("min-ReadPosRankSum-INDEL", -20.0, "ReadPosRank INDELs") //INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
+	rootCmd.Flags().Float64("max-SOR-INDEL", 10.0, "StrandOddsRatio INDELs")
 
 	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
 	rootCmd.Flags().String("gff", "", "gff3 file path")

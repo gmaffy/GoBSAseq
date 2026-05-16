@@ -62,13 +62,11 @@ func missingGeneSpaceParams(cfg utils.AnalysisConfig) []string {
 
 func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
 	bold := color.New(color.Bold).SprintFunc()
-	samples := []string{cfg.HighParentName, cfg.LowParentName, cfg.OneParentName, cfg.HighBulkName, cfg.LowBulkName, cfg.OneBulkName}
-	fmt.Printf("Samples: %v\n", samples)
 	color.Cyan("=============================== Checking parameters =====================================================\n")
 
 	fmt.Printf("VCF: %s\n", cfg.VCF)
-	fmt.Printf("High Min Parent Depth: %d\n", cfg.HighParentDepth)
-	fmt.Printf("Low Min Parent Depth: %d\n", cfg.LowParentDepth)
+	fmt.Printf("Min High Parent Depth: %d\n", cfg.HighParentDepth)
+	fmt.Printf("Min Low Parent Depth: %d\n", cfg.LowParentDepth)
 	fmt.Printf("One Min Parent Depth: %d\n", cfg.OneParentDepth)
 	fmt.Printf("High Bulk Depth: %d\n", cfg.HighBulkDepth)
 	fmt.Printf("Low Bulk Depth: %d\n", cfg.LowBulkDepth)
@@ -85,6 +83,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	fmt.Printf("Min QTL Length: %d\n", cfg.MinQTLWidth)
 	fmt.Printf("Merge Distance: %d\n", cfg.MergeDistance)
 	fmt.Printf("Output Dir: %s\n", cfg.OutputDir)
+
+	if !strings.HasSuffix(cfg.VCF, ".vcf.gz") || !strings.HasSuffix(cfg.VCF, ".vcf") {
+		color.Red("VCF file must be a .vcf or .vcf.gz file")
+		return fmt.Errorf("VCF file must be a .vcf or .vcf.gz file")
+	}
 
 	f, cleanup, err := openVCF(cfg.VCF)
 	if err != nil {
@@ -114,6 +117,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
 		}
 	}
+
 
 	var highParentChoice int
 	var lowParentChoice int

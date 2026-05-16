@@ -1924,7 +1924,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	filteredVcfPath := filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 	badVcfPath := filepath.Join(outDir, "GoBSAseq.bad_variants.vcf.gz")
 
-	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg)
+	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, 1)
 	if err != nil {
 		color.Red("Hard filter error: %v", err)
 		return
@@ -1986,7 +1986,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 				// Identify the one 'real' ALT allele index.
 				realAltIdx := -1
 				for i, alt := range variant.Alt() {
-					if !utils.IsSymbolic(alt) {
+					if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
 						realAltIdx = i
 						break
 					}

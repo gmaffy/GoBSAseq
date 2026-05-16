@@ -67,6 +67,7 @@ type HardFilterConfig struct {
 	INDEL_QUAL_Min           float64 // default 30.0  – variant quality score
 	INDEL_FS_Max             float64 // default 200.0 – FisherStrand
 	INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
+	INDEL_SOR_Max            float64
 
 	// SaveFilteredVCF writes the hard-filtered records (PASS only) to a
 	// bgzf-compressed VCF at FilteredVCFPath when true.

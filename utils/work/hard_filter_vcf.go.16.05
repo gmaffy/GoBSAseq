@@ -1,4 +1,4 @@
-package utils
+package work
 
 import (
 	"fmt"
@@ -14,82 +14,6 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// ---------------------------------------------------------------------------
-// GATK hard-filtering thresholds (germline short variants best practices).
-//
-// SNPs:
-//   QD < 2.0  |  QUAL < 30.0  |  FS > 60.0  |  SOR > 3.0
-//   MQ < 40.0  |  MQRankSum < -12.5  |  ReadPosRankSum < -8.0
-//
-// INDELs:
-//   QD < 2.0  |  QUAL < 30.0  |  FS > 200.0  |  ReadPosRankSum < -20.0
-//
-// Callers of HardFilterVcf are responsible for populating HardFilterConfig
-// with these values. Call DefaultHardFilterConfig() to get a correctly
-// initialised struct.
-// ---------------------------------------------------------------------------
-
-// DefaultHardFilterConfig returns a HardFilterConfig pre-populated with the
-// canonical GATK hard-filtering thresholds for germline short variants.
-// Override individual fields only when your data distribution justifies it.
-func DefaultHardFilterConfig() HardFilterConfig {
-	return HardFilterConfig{
-		// SNP thresholds
-		SNP_QUAL_Min:           30.0,
-		SNP_QD_Min:             2.0,
-		SNP_FS_Max:             60.0,
-		SNP_SOR_Max:            3.0,
-		SNP_MQ_Min:             40.0,
-		SNP_MQRankSum_Min:      -12.5,
-		SNP_ReadPosRankSum_Min: -8.0,
-		// INDEL thresholds
-		INDEL_QUAL_Min:           30.0,
-		INDEL_QD_Min:             2.0,
-		INDEL_FS_Max:             200.0,
-		INDEL_ReadPosRankSum_Min: -20.0,
-	}
-}
-
-// ---------------------------------------------------------------------------
-// "bad sample string" — root cause and fix
-//
-// GATK HaplotypeCaller emits FORMAT fields like PGT and PID with '.' for
-// non-phased sites, producing sample columns such as:
-//
-//   GT:AD:DP:GQ:PGT:PID:PL   0/1:18,8:26:99:.:.:186,0,704
-//
-// vcfgo's parseSample sees the '.' token for PGT (declared as String in the
-// header) and emits "bad sample string" because its internal type switch does
-// not treat '.' as a universal missing-value sentinel for String fields.
-//
-// The VCF 4.2 spec §1.4.2 states: "If the field is not present (missing), a
-// dot ('.') should be used." A '.' in any typed FORMAT column is valid.
-//
-// Fix strategy — two complementary steps:
-//
-//  1. stripProblematicFormatFields: removes PGT and PID from the header's
-//     SampleFormats map before any parsing begins. vcfgo then treats those
-//     columns as untyped strings stored in SampleGenotype.Fields, which
-//     never triggers the type-assertion path that generates the error.
-//
-//  2. parseSampleTolerant: after rdr.Read(), calls rdr.Error(), inspects
-//     the error message, and calls rdr.Clear() for known-benign "bad sample
-//     string" errors. For any other error it returns it to the caller.
-//     This is the pattern recommended by vcfgo's own documentation:
-//     "after every rdr.Read() call, the caller can check rdr.Error() and
-//     get feedback on the errors without stopping execution."
-// ---------------------------------------------------------------------------
-
-// stripProblematicFormatFields removes FORMAT fields that GATK emits with '.'
-// missing values and that vcfgo's typed parser cannot handle gracefully.
-// Removing them from the header causes vcfgo to store the raw token in
-// SampleGenotype.Fields instead of attempting type conversion.
-//
-// This must be called before the first rdr.Read().
-
-// getFloat safely retrieves a float-typed INFO field.  vcfgo can return the
-// value as float32 or float64 depending on the header declaration, so we
-// handle both.
 func getFloat(v *vcfgo.Variant, key string) (float64, bool) {
 	raw, err := v.Info().Get(key)
 	if err != nil || raw == nil {
@@ -107,14 +31,6 @@ func getFloat(v *vcfgo.Variant, key string) (float64, bool) {
 	}
 }
 
-func stripProblematicFormatFields(hdr *vcfgo.Header) {
-	for _, id := range []string{"PGT", "PID"} {
-		delete(hdr.SampleFormats, id)
-	}
-}
-
-// isBadSampleStringError returns true for the specific vcfgo error that
-// arises from GATK's legitimate use of '.' in typed FORMAT columns.
 func isBadSampleStringError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "bad sample string")
 }
@@ -123,8 +39,6 @@ func isBadSampleStringError(err error) bool {
 // Variant-type helpers
 // ---------------------------------------------------------------------------
 
-// isHomozygous returns true when every allele in the genotype is the same
-// non-missing call. An empty or all-missing GT is treated as non-homozygous.
 func isHomozygous(gt []int) bool {
 	if len(gt) == 0 {
 		return false
@@ -141,9 +55,6 @@ func isHomozygous(gt []int) bool {
 	return true
 }
 
-// IsSNP returns true when the REF and every non-symbolic ALT allele are
-// exactly one base long. Symbolic alleles (".", "*", "<...>") are skipped so
-// that a mixed record with one symbolic entry is not misclassified.
 func IsSNP(v *vcfgo.Variant) bool {
 	if len(v.Ref()) != 1 {
 		return false
@@ -159,8 +70,6 @@ func IsSNP(v *vcfgo.Variant) bool {
 	return true
 }
 
-// IsIndel returns true when any non-symbolic ALT allele differs in length
-// from the REF allele (the standard VCF left-aligned indel representation).
 func IsIndel(v *vcfgo.Variant) bool {
 	refLen := len(v.Ref())
 	for _, alt := range v.Alt() {
@@ -174,7 +83,6 @@ func IsIndel(v *vcfgo.Variant) bool {
 	return false
 }
 
-// IsSymbolic reports whether an ALT token is symbolic (not a sequence allele).
 func IsSymbolic(alt string) bool {
 	return alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')
 }
@@ -183,9 +91,6 @@ func IsSymbolic(alt string) bool {
 // GATK quality filters
 // ---------------------------------------------------------------------------
 
-// isQualitySNP applies GATK SNP hard-filtering thresholds.
-// An annotation that is absent from the INFO field is treated as passing
-// (consistent with GATK VariantFiltration behaviour: missing → not filtered).
 func isQualitySNP(v *vcfgo.Variant, cfg HardFilterConfig) bool {
 	// QUAL is a core VCF field; always present (may be '.' → 0 in vcfgo).
 	if float64(v.Quality) < cfg.SNP_QUAL_Min {
@@ -213,10 +118,6 @@ func isQualitySNP(v *vcfgo.Variant, cfg HardFilterConfig) bool {
 	return true
 }
 
-// isQualityINDEL applies GATK INDEL hard-filtering thresholds.
-// MQ, MQRankSum, and SOR are deliberately omitted for INDELs — this matches
-// the official GATK recommendation, which does not apply those filters to
-// indels because their distributions differ significantly from SNPs.
 func isQualityINDEL(v *vcfgo.Variant, cfg HardFilterConfig) bool {
 	if float64(v.Quality) < cfg.INDEL_QUAL_Min {
 		return false
@@ -237,14 +138,6 @@ func isQualityINDEL(v *vcfgo.Variant, cfg HardFilterConfig) bool {
 // BSA-seq filters
 // ---------------------------------------------------------------------------
 
-// passesTwoBulkBSAseqFilters checks that:
-//  1. The site is biallelic (exactly one ALT allele).
-//  2. All four samples (high parent, low parent, high bulk, low bulk) have
-//     fully called, non-missing genotypes.
-//  3. Both parents are homozygous and differ from each other — i.e. the
-//     parents are fixed for alternate alleles, which is the prerequisite for
-//     meaningful BSA-seq allele-frequency contrasts.
-//  4. Per-sample depth meets the configured minimums.
 func passesTwoBulkBSAseqFilters(v *vcfgo.Variant, cfg AnalysisConfig) bool {
 	// BSA-seq requires exactly one "real" (non-symbolic) ALT allele for
 	// unambiguous allele-frequency calculation between the two bulks.
@@ -308,19 +201,12 @@ func passesTwoBulkBSAseqFilters(v *vcfgo.Variant, cfg AnalysisConfig) bool {
 		lbS.DP >= cfg.LowBulkDepth
 }
 
-// ---------------------------------------------------------------------------
-// filterResult carries a variant and its keep/discard decision through the
-// pipeline. The original input index is retained so results can be written in
-// the same order as the input (required for bgzf files that will be indexed
-// with tabix).
-// ---------------------------------------------------------------------------
 type filterResult struct {
 	v    *vcfgo.Variant
 	idx  int // original read order
 	keep bool
 }
 
-// countingWriter tracks the number of bytes written to the underlying writer.
 type countingWriter struct {
 	io.Writer
 	n int64
@@ -332,7 +218,6 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// vcfRecord wraps a VCF record so it satisfies tabix.Record for index building.
 type vcfRecord struct {
 	chrom string
 	start int // 0-based
@@ -343,36 +228,11 @@ func (r vcfRecord) RefName() string { return r.chrom }
 func (r vcfRecord) Start() int      { return r.start }
 func (r vcfRecord) End() int        { return r.end }
 
-// ---------------------------------------------------------------------------
-// HardFilterVcf reads variants from rdr, applies GATK hard-filtering and
-// BSA-seq filters, writes passing variants to hardFilteredVcfPath and failing
-// variants to badVcfPath, and returns the slice of passing variants together
-// with the total and passing counts.
-//
-// Call stripProblematicFormatFields(rdr.Header) before constructing rdr if
-// the VCF was produced by GATK HaplotypeCaller (handles PGT/PID '.' values).
-//
-// Output files are written in input order (required for downstream tabix
-// indexing). Filtering itself is parallelised across all available CPUs.
-// ---------------------------------------------------------------------------
-func HardFilterVcf(
-	rdr *vcfgo.Reader,
-	hardFilteredVcfPath string,
-	badVcfPath string,
-	cfg AnalysisConfig,
-	hfcfg HardFilterConfig,
-) ([]*vcfgo.Variant, int, int, error) {
+func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath string, cfg AnalysisConfig, hfcfg HardFilterConfig) ([]*vcfgo.Variant, int, int, error) {
 
-	// ------------------------------------------------------------------ //
-	// Strip FORMAT fields that GATK emits with '.' and that vcfgo cannot
-	// parse without emitting "bad sample string" errors.
-	// Must happen before the first Read() call.
-	// ------------------------------------------------------------------ //
-	stripProblematicFormatFields(rdr.Header)
-
-	// ------------------------------------------------------------------ //
-	// Open output files
-	// ------------------------------------------------------------------ //
+	for _, id := range []string{"PGT", "PID"} {
+		delete(rdr.Header.SampleFormats, id)
+	}
 
 	hfFile, err := os.Create(hardFilteredVcfPath)
 	if err != nil {
@@ -409,20 +269,6 @@ func HardFilterVcf(
 	hfIdx.BeginColumn = 2
 	hfIdx.EndColumn = 0
 	hfIdx.MetaChar = '#'
-
-	// ------------------------------------------------------------------ //
-	// Concurrency setup
-	//
-	// Architecture:
-	//   main goroutine  →  variantChan  →  worker pool  →  resultChan
-	//                                                     ↓
-	//                                              order buffer
-	//                                                     ↓
-	//                                           writer goroutine
-	//
-	// The order buffer ensures variants are written in input order so the
-	// output VCF can be tabix-indexed without re-sorting.
-	// ------------------------------------------------------------------ //
 
 	const chanBuf = 10_000
 
