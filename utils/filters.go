@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/biogo/hts/bgzf"
 	"github.com/biogo/hts/tabix"
@@ -121,6 +124,16 @@ func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 	}
 
 	switch bsaType {
+	case 0:
+		// bulks only
+		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
+		}
+
+		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+
 	case 1:
 		// 2 parents 2 bulks filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
@@ -216,13 +229,146 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 // HardFilterVcf
 // ---------------------------------------------------------------------------
 
-// HardFilterVcf reads rdr and passes each variant through two sequential gates:
-//  1. passesHardFilter  — GATK quality thresholds (SNP / INDEL).
-//  2. bsaFilter         — caller-supplied BSA-seq sample filter.
-//
-// Variants passing both are written (bgzf-compressed) to hardFilteredVcfPath
-// with a companion .tbi index. Rejected variants go to badVcfPath.
-// Returns the passing variants, total records read, and the passing count.
+// func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath string, cfg AnalysisConfig, hfcfg HardFilterConfig, bsaseqType int) ([]*vcfgo.Variant, int, int, error) {
+
+// 	for _, id := range []string{"PGT", "PID"} {
+// 		delete(rdr.Header.SampleFormats, id)
+// 	}
+
+// 	// ── Open output files ─────────────────────────────────────────────────────
+// 	hfFile, err := os.Create(hardFilteredVcfPath)
+// 	if err != nil {
+// 		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF: %w", err)
+// 	}
+// 	defer hfFile.Close()
+
+// 	hfCounting := &countingWriter{Writer: hfFile}
+// 	hfBgzf := bgzf.NewWriter(hfCounting, 1)
+// 	hfWriter, err := vcfgo.NewWriter(hfBgzf, rdr.Header)
+// 	if err != nil {
+// 		hfBgzf.Close()
+// 		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF writer: %w", err)
+// 	}
+
+// 	badFile, err := os.Create(badVcfPath)
+// 	if err != nil {
+// 		hfBgzf.Close()
+// 		return nil, 0, 0, fmt.Errorf("create rejected VCF: %w", err)
+// 	}
+// 	defer badFile.Close()
+
+// 	badBgzf := bgzf.NewWriter(badFile, 1)
+// 	badWriter, err := vcfgo.NewWriter(badBgzf, rdr.Header)
+// 	if err != nil {
+// 		hfBgzf.Close()
+// 		badBgzf.Close()
+// 		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
+// 	}
+
+// 	hfIdx := newTabixIndex()
+
+// 	bar := progressbar.Default(-1, "Hard filtering variants")
+
+// 	var (
+// 		passedVariants []*vcfgo.Variant
+// 		original       int
+// 		skipped        int
+// 		passed         int
+// 	)
+
+// 	// ── Main read loop ────────────────────────────────────────────────────────
+
+// 	for {
+// 		v := rdr.Read()
+// 		if v == nil {
+// 			break
+// 		}
+
+// 		if err := rdr.Error(); err != nil {
+// 			if strings.Contains(err.Error(), "bad sample string") {
+// 				rdr.Clear() // benign — GT/AD/DP/GQ are still populated
+// 			} else {
+// 				hfBgzf.Close()
+// 				badBgzf.Close()
+// 				return nil, 0, 0, fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
+// 			}
+// 		}
+
+// 		// Discard gVCF reference-confidence blocks (ALT == '<NON_REF>' or '.').
+// 		alts := v.Alt()
+// 		if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
+// 			skipped++
+// 			continue
+// 		}
+
+// 		original++
+// 		_ = bar.Add(1)
+
+// 		if !passesHardFilter(v, hfcfg) || !bsaSeqFilter(v, cfg, bsaseqType) {
+// 			badWriter.WriteVariant(v)
+// 			continue
+// 		}
+
+// 		// ── Record tabix offset, write, record end offset ─────────────────────
+// 		blockOffset, _ := hfBgzf.Next()
+// 		startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
+
+// 		hfWriter.WriteVariant(v)
+
+// 		blockOffsetEnd, _ := hfBgzf.Next()
+// 		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
+
+// 		if err := addTabixRecord(hfIdx, v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
+// 			hfBgzf.Close()
+// 			badBgzf.Close()
+// 			return nil, 0, 0, fmt.Errorf("tabix add variant at %s:%d: %w", v.Chromosome, v.Pos, err)
+// 		}
+
+// 		passedVariants = append(passedVariants, v)
+// 		passed++
+// 	}
+
+// 	if err := rdr.Error(); err != nil && !strings.Contains(err.Error(), "bad sample string") {
+// 		hfBgzf.Close()
+// 		badBgzf.Close()
+// 		return nil, 0, 0, fmt.Errorf("VCF read error: %w", err)
+// 	}
+
+// 	_ = bar.Finish()
+
+// 	// ── Flush and close bgzf streams ──────────────────────────────────────────
+// 	if err = hfBgzf.Close(); err != nil {
+// 		badBgzf.Close()
+// 		return nil, 0, 0, fmt.Errorf("close hard-filtered bgzf: %w", err)
+// 	}
+// 	if err = badBgzf.Close(); err != nil {
+// 		return nil, 0, 0, fmt.Errorf("close rejected bgzf: %w", err)
+// 	}
+
+// 	// ── Write tabix index ─────────────────────────────────────────────────────
+// 	tbiFile, err := os.Create(hardFilteredVcfPath + ".tbi")
+// 	if err != nil {
+// 		return nil, 0, 0, fmt.Errorf("create tbi file: %w", err)
+// 	}
+// 	defer tbiFile.Close()
+
+// 	tbiGz := bgzf.NewWriter(tbiFile, 1)
+// 	if err := tabix.WriteTo(tbiGz, hfIdx); err != nil {
+// 		tbiGz.Close()
+// 		return nil, 0, 0, fmt.Errorf("write tabix index: %w", err)
+// 	}
+// 	if err := tbiGz.Close(); err != nil {
+// 		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
+// 	}
+
+// 	fmt.Printf(
+// 		"Hard filtering complete: %d variant records read (%d gVCF ref blocks skipped) → %d passed, %d rejected\n",
+// 		original, skipped, passed, original-passed,
+// 	)
+
+// 	return passedVariants, original, passed, nil
+// }
+
 func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath string, cfg AnalysisConfig, hfcfg HardFilterConfig, bsaseqType int) ([]*vcfgo.Variant, int, int, error) {
 
 	for _, id := range []string{"PGT", "PID"} {
@@ -260,77 +406,125 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 	}
 
 	hfIdx := newTabixIndex()
-
 	bar := progressbar.Default(-1, "Hard filtering variants")
 
+	// ── Pipeline channels ─────────────────────────────────────────────────────
+	type variantResult struct {
+		v      *vcfgo.Variant
+		passed bool
+	}
+
+	const chanBuf = 512
+	filterCh := make(chan *vcfgo.Variant, chanBuf) // reader  → filter workers
+	resultCh := make(chan variantResult, chanBuf)  // workers → writer
+	var readerErr atomic.Pointer[error]
+
+	// ── Stage 1: Reader goroutine ─────────────────────────────────────────────
 	var (
-		passedVariants []*vcfgo.Variant
-		original       int
-		skipped        int
-		passed         int
+		originalCount atomic.Int64
+		skippedCount  atomic.Int64
 	)
 
-	// ── Main read loop ────────────────────────────────────────────────────────
-	//
-	// "bad sample string" errors are benign: vcfgo still populates GT, AD, DP,
-	// GQ correctly — the error only signals that a later typed field (e.g. PGT,
-	// PID) contained '.' which vcfgo couldn't coerce to the declared type.
-	// Call rdr.Clear() after inspecting or the same errors compound on every
-	// subsequent call.
-	for {
-		v := rdr.Read()
-		if v == nil {
-			break
-		}
-
-		if err := rdr.Error(); err != nil {
-			if strings.Contains(err.Error(), "bad sample string") {
-				rdr.Clear() // benign — GT/AD/DP/GQ are still populated
-			} else {
-				hfBgzf.Close()
-				badBgzf.Close()
-				return nil, 0, 0, fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
+	go func() {
+		defer close(filterCh)
+		for {
+			v := rdr.Read()
+			if v == nil {
+				break
 			}
+			if err := rdr.Error(); err != nil {
+				if strings.Contains(err.Error(), "bad sample string") {
+					rdr.Clear()
+				} else {
+					e := fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
+					readerErr.Store(&e)
+					return
+				}
+			}
+			alts := v.Alt()
+			if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
+				skippedCount.Add(1)
+				continue
+			}
+			originalCount.Add(1)
+			_ = bar.Add(1)
+			filterCh <- v
 		}
 
-		// Discard gVCF reference-confidence blocks (ALT == '<NON_REF>' or '.').
-		alts := v.Alt()
-		if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
-			skipped++
+		if err := rdr.Error(); err != nil && !strings.Contains(err.Error(), "bad sample string") {
+			e := fmt.Errorf("VCF read error: %w", err)
+			readerErr.Store(&e)
+		}
+	}()
+
+	// ── Stage 2: Filter worker pool ───────────────────────────────────────────
+	// Filtering is CPU-bound (no shared state); run one worker per core.
+	// vcfgo.Variant fields accessed here are read-only after Read() returns,
+	// so no mutex is needed inside the workers.
+	numWorkers := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for v := range filterCh {
+				passed := passesHardFilter(v, hfcfg) && bsaSeqFilter(v, cfg, bsaseqType)
+				resultCh <- variantResult{v: v, passed: passed}
+			}
+		}()
+	}
+
+	// Close resultCh once all workers are done.
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// ── Stage 3: Writer goroutine (single, preserves order not required) ──────
+	// NOTE: bgzf / vcfgo writers are NOT goroutine-safe; keep all writes here.
+	var (
+		passedVariants []*vcfgo.Variant
+		passed         int
+		writerErr      error
+	)
+
+	for res := range resultCh {
+		if !res.passed {
+			badWriter.WriteVariant(res.v)
 			continue
 		}
 
-		original++
-		_ = bar.Add(1)
-
-		if !passesHardFilter(v, hfcfg) || !bsaSeqFilter(v, cfg, bsaseqType) {
-			badWriter.WriteVariant(v)
-			continue
-		}
-
-		// ── Record tabix offset, write, record end offset ─────────────────────
 		blockOffset, _ := hfBgzf.Next()
 		startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
 
-		hfWriter.WriteVariant(v)
+		hfWriter.WriteVariant(res.v)
 
 		blockOffsetEnd, _ := hfBgzf.Next()
 		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
 
-		if err := addTabixRecord(hfIdx, v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
-			hfBgzf.Close()
-			badBgzf.Close()
-			return nil, 0, 0, fmt.Errorf("tabix add variant at %s:%d: %w", v.Chromosome, v.Pos, err)
+		if err := addTabixRecord(hfIdx, res.v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
+			writerErr = fmt.Errorf("tabix add variant at %s:%d: %w", res.v.Chromosome, res.v.Pos, err)
+			break
 		}
 
-		passedVariants = append(passedVariants, v)
+		passedVariants = append(passedVariants, res.v)
 		passed++
 	}
 
-	if err := rdr.Error(); err != nil && !strings.Contains(err.Error(), "bad sample string") {
+	// Drain resultCh if writer broke early, so workers can unblock and exit.
+	for range resultCh {
+	}
+
+	// ── Check errors ──────────────────────────────────────────────────────────
+	if ep := readerErr.Load(); ep != nil {
 		hfBgzf.Close()
 		badBgzf.Close()
-		return nil, 0, 0, fmt.Errorf("VCF read error: %w", err)
+		return nil, 0, 0, *ep
+	}
+	if writerErr != nil {
+		hfBgzf.Close()
+		badBgzf.Close()
+		return nil, 0, 0, writerErr
 	}
 
 	_ = bar.Finish()
@@ -359,6 +553,9 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 	if err := tbiGz.Close(); err != nil {
 		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
 	}
+
+	original := int(originalCount.Load())
+	skipped := int(skippedCount.Load())
 
 	fmt.Printf(
 		"Hard filtering complete: %d variant records read (%d gVCF ref blocks skipped) → %d passed, %d rejected\n",

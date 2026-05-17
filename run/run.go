@@ -84,7 +84,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	fmt.Printf("Merge Distance: %d\n", cfg.MergeDistance)
 	fmt.Printf("Output Dir: %s\n", cfg.OutputDir)
 
-	if !strings.HasSuffix(cfg.VCF, ".vcf.gz") || !strings.HasSuffix(cfg.VCF, ".vcf") {
+	if !strings.HasSuffix(cfg.VCF, ".vcf.gz") && !strings.HasSuffix(cfg.VCF, ".vcf") {
 		color.Red("VCF file must be a .vcf or .vcf.gz file")
 		return fmt.Errorf("VCF file must be a .vcf or .vcf.gz file")
 	}
@@ -117,7 +117,6 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
 		}
 	}
-
 
 	var highParentChoice int
 	var lowParentChoice int
@@ -342,6 +341,10 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 
 	if lowBulkChoice != 0 && highBulkChoice != 0 && highParentChoice == 0 && lowParentChoice == 0 {
 		fmt.Println("Running bulks only")
+		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
+		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
+
+		twobulk.RunTwoBulk(cfg, hfCfg, 0)
 	} else if lowBulkChoice == 0 && highBulkChoice != 0 && lowParentChoice != 0 && highParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (HIGH bulk)...")
 	} else if highBulkChoice == 0 && highParentChoice != 0 && lowParentChoice != 0 {
@@ -354,7 +357,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulkTwoParents(cfg, hfCfg)
+		twobulk.RunTwoBulk(cfg, hfCfg, 1)
 
 	}
 	return nil

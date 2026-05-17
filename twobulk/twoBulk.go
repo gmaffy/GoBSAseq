@@ -1894,7 +1894,7 @@ func detectQTLsAdaptive(chrom string, x []int64, y, thresholds []float64, statNa
 	return qtls
 }
 
-func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
+func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqType int) {
 	highParIdx := cfg.HighParentIdx
 	//highParDP := cfg.HighParentDepth
 	lowParIdx := cfg.LowParentIdx
@@ -1924,7 +1924,7 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 	filteredVcfPath := filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 	badVcfPath := filepath.Join(outDir, "GoBSAseq.bad_variants.vcf.gz")
 
-	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, 1)
+	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, bsaseqType)
 	if err != nil {
 		color.Red("Hard filter error: %v", err)
 		return
