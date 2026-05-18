@@ -21,6 +21,8 @@ github.com/gmaffy/genome-whisperer v0.0.0-20260515142155-1f0b6a97603d h1:mmNs6K4
 github.com/gmaffy/genome-whisperer v0.0.0-20260515142155-1f0b6a97603d/go.mod h1:KMSseueJrGr9ZUXG/PlF46wpgM+lTA2HwizHrcauD30=
 github.com/gmaffy/genome-whisperer v0.0.0-20260516065727-8f66f1d6e91c h1:iBYK+hNsazJS3FltdT3bRaxqSz8tHJWiNofmXJReoVA=
 github.com/gmaffy/genome-whisperer v0.0.0-20260516065727-8f66f1d6e91c/go.mod h1:KMSseueJrGr9ZUXG/PlF46wpgM+lTA2HwizHrcauD30=
+github.com/gmaffy/genome-whisperer v0.0.0-20260518102727-81808b1ead60 h1:tXXEAdjDqt8nVPjJ+3t0K1E5L5KAA/I2fKCiEerxOcY=
+github.com/gmaffy/genome-whisperer v0.0.0-20260518102727-81808b1ead60/go.mod h1:KMSseueJrGr9ZUXG/PlF46wpgM+lTA2HwizHrcauD30=
 github.com/go-echarts/go-echarts/v2 v2.7.2 h1:lhypL1CekgqaLHM5V7fBPfaYGfimJ9dGylkk65aWlNI=
 github.com/go-echarts/go-echarts/v2 v2.7.2/go.mod h1:Z+spPygZRIEyqod69r0WMnkN5RV3MwhYDtw601w3G8w=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=

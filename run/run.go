@@ -344,7 +344,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulk(cfg, hfCfg, 0)
+		twobulk.RunTwoBulksOnly(cfg, hfCfg)
 	} else if lowBulkChoice == 0 && highBulkChoice != 0 && lowParentChoice != 0 && highParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (HIGH bulk)...")
 	} else if highBulkChoice == 0 && highParentChoice != 0 && lowParentChoice != 0 {
@@ -357,7 +357,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulk(cfg, hfCfg, 1)
+		twobulk.RunTwoBulkTwoParents(cfg, hfCfg)
 
 	}
 	return nil

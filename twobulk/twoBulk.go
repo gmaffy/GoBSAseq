@@ -457,17 +457,14 @@ func smoothChromosome(stats []BSAstats, windowSize int64, step int64) []Smoothed
 
 		var (
 			// DeltaSI, Gstat, LOD, BBLogBF share spatial+depth weight.
-			sumDeltaSI, sumWeightDSI float64
-			sumGstat, sumWeightGs    float64
-			sumLOD, sumWeightLod     float64
-			sumBBLogBF, sumWeightBB  float64
-			// ED has its own accumulator since it is now ED^4.
-			sumED, sumWeightED float64
-			// HighSI / LowSI use their own accumulator.
+			sumDeltaSI, sumWeightDSI         float64
+			sumGstat, sumWeightGs            float64
+			sumLOD, sumWeightLod             float64
+			sumBBLogBF, sumWeightBB          float64
+			sumED, sumWeightED               float64
 			sumHighSI, sumLowSI, sumWeightSI float64
-
-			sumHighDP, sumLowDP float64
-			nSNPs               int
+			sumHighDP, sumLowDP              float64
+			nSNPs                            int
 		)
 
 		for _, s := range stats {
@@ -1894,7 +1891,7 @@ func detectQTLsAdaptive(chrom string, x []int64, y, thresholds []float64, statNa
 	return qtls
 }
 
-func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqType int) {
+func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
 	highParIdx := cfg.HighParentIdx
 	//highParDP := cfg.HighParentDepth
 	lowParIdx := cfg.LowParentIdx
@@ -1919,16 +1916,27 @@ func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqTy
 	// -----------------------------------------------------------------------
 	// Stage 0 — hard filtering
 	// -----------------------------------------------------------------------
-	color.Cyan("============================ GATK Hard Filtering ============================\n\n")
+	color.Cyan("============================ GATK Hard Filtering (Two bulk two parents) ============================\n\n")
 
 	filteredVcfPath := filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
 	badVcfPath := filepath.Join(outDir, "GoBSAseq.bad_variants.vcf.gz")
 
-	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, bsaseqType)
+	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, 1)
 	if err != nil {
 		color.Red("Hard filter error: %v", err)
 		return
 	}
+
+	// Update indices to match subsetted samples: [HighParent, LowParent, HighBulk, LowBulk]
+	cfg.HighParentIdx = 0
+	cfg.LowParentIdx = 1
+	cfg.HighBulkIdx = 2
+	cfg.LowBulkIdx = 3
+	highParIdx = 0
+	lowParIdx = 1
+	highBulkIdx = 2
+	lowBulkIdx = 3
+
 	color.Green("Original variants: %v\nHard filtered variants: %v", original, hardFiltered)
 	// -----------------------------------------------------------------------
 	// Stage 1 — per-SNP statistics (concurrent)
@@ -1978,11 +1986,6 @@ func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqTy
 					continue
 				}
 
-				hpS := variant.Samples[highParIdx]
-				lpS := variant.Samples[lowParIdx]
-				hbS := variant.Samples[highBulkIdx]
-				lbS := variant.Samples[lowBulkIdx]
-
 				// Identify the one 'real' ALT allele index.
 				realAltIdx := -1
 				for i, alt := range variant.Alt() {
@@ -1995,6 +1998,11 @@ func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqTy
 					_ = bar.Add(1)
 					continue
 				}
+
+				hpS := variant.Samples[highParIdx]
+				lpS := variant.Samples[lowParIdx]
+				hbS := variant.Samples[highBulkIdx]
+				lbS := variant.Samples[lowBulkIdx]
 
 				// Identify which allele is from the High Parent.
 				// passesTwoBulkBSAseqFilters guarantees parents are homozygous
@@ -2185,6 +2193,293 @@ func RunTwoBulk(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig, bsaseqTy
 			cfg.Gff, annotatedTsvFiles[0], qtl.Chrom,
 			int(qtl.Start), int(qtl.Stop), []string{cfg.HighParentName},
 			[]string{cfg.LowParentName}, cfg.GeneDesc, cfg.Prg, outDir)
+		if err != nil {
+			color.Red("Failed gene space analysis: %s", err)
+			return
+		}
+	}
+	color.Green("Gene space analysis complete.")
+
+}
+
+func RunTwoBulksOnly(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
+
+	highBulkIdx := cfg.HighBulkIdx
+	lowBulkIdx := cfg.LowBulkIdx
+	vcfRdr := cfg.Rdr
+	outDir := cfg.OutputDir
+
+	windowSize := int64(cfg.WindowSize)
+	stepSize := int64(cfg.StepSize)
+	rep := cfg.Rep
+	pop := cfg.Population
+
+	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
+	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
+
+	overallStart := time.Now()
+
+	// -----------------------------------------------------------------------
+	// Stage 0 — hard filtering
+	// -----------------------------------------------------------------------
+	color.Cyan("============================ GATK Hard Filtering ============================\n\n")
+
+	filteredVcfPath := filepath.Join(outDir, "GoBSAseq.hard_filtered.vcf.gz")
+	badVcfPath := filepath.Join(outDir, "GoBSAseq.bad_variants.vcf.gz")
+
+	passedVariants, original, hardFiltered, err := utils.HardFilterVcf(vcfRdr, filteredVcfPath, badVcfPath, cfg, hfCfg, 0)
+
+	if err != nil {
+		color.Red("Hard filter error: %v", err)
+		return
+	}
+
+	// Update indices to match subsetted samples: [HighBulk, LowBulk]
+	cfg.HighBulkIdx = 0
+	cfg.LowBulkIdx = 1
+	highBulkIdx = 0
+	lowBulkIdx = 1
+
+	color.Green("Original variants: %v\nHard filtered variants: %v", original, hardFiltered)
+	// -----------------------------------------------------------------------
+	// Stage 1 — per-SNP statistics (concurrent)
+	// -----------------------------------------------------------------------
+	color.Cyan("============================ Calculating Statistics =============================\n\n")
+
+	statsChan := make(chan BSAstats, 10000)
+	rawWriteChan := make(chan BSAstats, 10000)
+
+	numWorkers := runtime.NumCPU()
+	var workerWG sync.WaitGroup
+
+	var rawWG sync.WaitGroup
+	rawWG.Add(1)
+	go func() {
+		defer rawWG.Done()
+		if err := writeRawTSV(filepath.Join(outDir, "GoBSAseq.raw.tsv"), rawWriteChan); err != nil {
+			color.Red("Error writing raw TSV: %v", err)
+		}
+	}()
+
+	bar := progressbar.Default(int64(len(passedVariants)), "Processing variants")
+
+	// Feed worker pool from the pre-filtered slice.
+	variantChan := make(chan *vcfgo.Variant, 10000)
+	go func() {
+		for _, v := range passedVariants {
+			variantChan <- v
+		}
+		close(variantChan)
+	}()
+
+	for i := 0; i < numWorkers; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for variant := range variantChan {
+				// Basic safety: Ensure samples exist for the configured indices
+				maxIdx := lowBulkIdx
+				for _, idx := range []int{highBulkIdx, lowBulkIdx} {
+					if idx > maxIdx {
+						maxIdx = idx
+					}
+				}
+				if len(variant.Samples) <= maxIdx {
+					_ = bar.Add(1)
+					continue
+				}
+
+				// Identify the one 'real' ALT allele index.
+				realAltIdx := -1
+				for i, alt := range variant.Alt() {
+					if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
+						realAltIdx = i
+						break
+					}
+				}
+				if realAltIdx == -1 {
+					_ = bar.Add(1)
+					continue
+				}
+
+				hbS := variant.Samples[highBulkIdx]
+				lbS := variant.Samples[lowBulkIdx]
+
+				// Get ADs for each bulk.
+				hbRefDep, _ := hbS.RefDepth()
+				hbAltDeps, _ := hbS.AltDepths()
+				lbRefDep, _ := lbS.RefDepth()
+				lbAltDeps, _ := lbS.AltDepths()
+
+				// Safety check: ensure the target ALT allele depth exists.
+				if len(hbAltDeps) <= realAltIdx || len(lbAltDeps) <= realAltIdx {
+					_ = bar.Add(1)
+					continue
+				}
+
+				var hbH, hbL, lbH, lbL int
+
+				hbH, hbL = hbRefDep, hbAltDeps[realAltIdx]
+				lbH, lbL = lbRefDep, lbAltDeps[realAltIdx]
+
+				// Total depth for SI calculation is the sum of relevant alleles.
+				// This is more robust than s.DP if there are symbolic/other alleles.
+				hbTotal := hbH + hbL
+				lbTotal := lbH + lbL
+
+				if hbTotal == 0 || lbTotal == 0 {
+					_ = bar.Add(1)
+					continue
+				}
+
+				hSI := float64(hbH) / float64(hbTotal)
+				lSI := float64(lbH) / float64(lbTotal)
+				minDepth := hbTotal
+				if lbTotal < minDepth {
+					minDepth = lbTotal
+				}
+
+				s := BSAstats{
+					CHROM:      variant.Chromosome,
+					POS:        int64(variant.Pos),
+					REF:        variant.Reference,
+					ALT:        variant.Alt()[realAltIdx],
+					HighBulkGT: hbS.GT,
+					HighBulkAD: fmt.Sprintf("%d,%d", hbRefDep, hbAltDeps[realAltIdx]),
+					LowBulkGT:  lbS.GT,
+					LowBulkAD:  fmt.Sprintf("%d,%d", lbRefDep, lbAltDeps[realAltIdx]),
+					HighBulkL:  hbL,
+					HighBulkH:  hbH,
+					LowBulkL:   lbL,
+					LowBulkH:   lbH,
+					HighSI:     math.Round(hSI*1e6) / 1e6,
+					LowSI:      math.Round(lSI*1e6) / 1e6,
+					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
+					Gstat:      math.Round(GStatistic(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					ED:         math.Round(euclideanDistance4(hSI, lSI)*1e6) / 1e6,
+					LOD:        math.Round(lod(hbL, hbH, lbL, lbH)*1e6) / 1e6,
+					BBLogBF:    math.Round(betaBinomialLogBF(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					Depth:      minDepth,
+				}
+				statsChan <- s
+				rawWriteChan <- s
+				_ = bar.Add(1)
+			}
+		}()
+	}
+
+	go func() {
+		workerWG.Wait()
+		close(statsChan)
+		close(rawWriteChan)
+	}()
+
+	chromStats := make(map[string][]BSAstats)
+	for s := range statsChan {
+		chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
+	}
+	_ = bar.Finish()
+	rawWG.Wait()
+
+	// ---------------------------------------------------------------------------------------------------------
+	// Stage 2 — smoothing
+	// ---------------------------------------------------------------------------------------------------------
+	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
+
+	var allSmoothed []SmoothedStats
+	for chrom, stats := range chromStats {
+		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
+		smoothed := smoothChromosome(stats, windowSize, stepSize)
+		allSmoothed = append(allSmoothed, smoothed...)
+	}
+
+	// --------------------------------------------------------------------------------------------------------
+	// Stage 3 — threshold simulation
+	// --------------------------------------------------------------------------------------------------------
+	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
+	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
+	// Attach per-window thresholds to the SmoothedStats slice so downstream
+	// QTL detection can use locally adaptive thresholds rather than chromosome averages.
+	for i := range allSmoothed {
+		allSmoothed[i].thresholds = calcThresholdsCached(
+			allSmoothed[i].MeanHighBulkDP, allSmoothed[i].MeanLowBulkDP, highSmAF, lowSmAF, rep)
+	}
+	color.Green("\nThreshold calculations complete.")
+
+	// ------------------------------------------------------------------------------------------------------
+	// Stage 4 — smoothed TSV
+	// -----------------------------------------------------------------------
+	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
+	smoothTSV := filepath.Join(outDir, "GoBSAseq.smooth.tsv")
+	if err := writeSmoothedTSV(smoothTSV, allSmoothed, highSmAF, lowSmAF, rep); err != nil {
+		color.Red("Error writing smoothed TSV: %v", err)
+	} else {
+		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), smoothTSV)
+	}
+	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
+	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
+
+	// -----------------------------------------------------------------------
+	// Stage 5 — plots and QTL detection
+	// -----------------------------------------------------------------------
+	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
+	htmlFile := filepath.Join(outDir, "GoBSAseq_RobustZScore.html")
+	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
+
+	finalQTLs, err := GenerateHtmlPlotsAndQTL(
+		allSmoothed,
+		highSmAF, lowSmAF,
+		cfg.HighBulkSize, cfg.LowBulkSize,
+		pop, cfg.Alphas, rep,
+		htmlFile, qtlFile,
+	)
+	if err != nil {
+		color.Red("Error generating Plots and QTLs: %v", err)
+		return
+	} else {
+		color.Green("HTML plots written to %s", outDir)
+		color.Green("QTL tabular results (Main, Consensus, MaxZ) written to %s", outDir)
+	}
+
+	// -------------------------------------------------------------------------------------------------
+	// Stage 6 - Gene space analysis
+	//--------------------------------------------------------------------------------------------------
+
+	color.Cyan("\n============================ Gene space analysis ==============================\n\n")
+	geneSpaceEnabled := cfg.SnpEffDB != "" && cfg.GeneDesc != "" && cfg.Prg != "" && cfg.Gff != ""
+	if !geneSpaceEnabled {
+		color.Yellow("Skipping gene space analysis: required parameters were not provided.")
+		return
+	}
+
+	var annotatedTsvFiles []string
+	color.Green("Step 1: Annotating genes with SnpEff (creating Super VCF table)")
+	_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
+	if hasEFF {
+		color.Yellow("EFF column is already present; no Super VCF table was generated, so gene space analysis will be skipped.")
+		return
+	}
+	color.Yellow("EFF column is not present; annotating filtered VCF.")
+	err, annotatedTsvFiles = annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
+	if err != nil {
+		color.Red("Failed variant annotation with SNPEFF: %s", err)
+		return
+	}
+	if len(annotatedTsvFiles) == 0 {
+		color.Yellow("Skipping gene space analysis: SnpEff annotation did not produce an annotated TSV.")
+		return
+	}
+	color.Green("SNPEFF annotation complete.")
+	color.Green("Annotated TSV files: %v", annotatedTsvFiles)
+	//color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
+
+	color.Cyan("Performing Gene space analysis for %d QTL intervals ...", len(finalQTLs))
+	for _, qtl := range finalQTLs {
+		color.Blue("GeneSpace interval: %s:%d-%d", qtl.Chrom, qtl.Start, qtl.Stop)
+		_, err = genespace.GeneSpace(
+			cfg.Gff, annotatedTsvFiles[0], qtl.Chrom,
+			int(qtl.Start), int(qtl.Stop), []string{},
+			[]string{}, cfg.GeneDesc, cfg.Prg, outDir)
 		if err != nil {
 			color.Red("Failed gene space analysis: %s", err)
 			return
