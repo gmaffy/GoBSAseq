@@ -11,6 +11,7 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/oneBulk"
 	"github.com/gmaffy/GoBSAseq/twobulk"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
@@ -349,6 +350,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Println("Working with one bulk BSAseq (HIGH bulk)...")
 	} else if highBulkChoice == 0 && highParentChoice != 0 && lowParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
+		err = oneBulk.RunTwoParentsLowBulk(cfg, hfCfg)
+		if err != nil {
+			color.Red("Error running one bulk analysis: %s", err)
+			return err
+		}
 	} else {
 		fmt.Println("Working with two bulks")
 		color.Green("=================================== Running Two Bulk Analysis =============================================\n\n")

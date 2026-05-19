@@ -66,7 +66,7 @@ func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
 	return true
 }
 
-func passesHardFilter(v *vcfgo.Variant, hfcfg HardFilterConfig) bool {
+func PassesHardFilter(v *vcfgo.Variant, hfcfg HardFilterConfig) bool {
 	isSNP, isIndel := classifyVariant(v)
 
 	switch {
@@ -117,7 +117,7 @@ func passesHardFilter(v *vcfgo.Variant, hfcfg HardFilterConfig) bool {
 	}
 }
 
-func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
+func BsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 	targetAlt := singleRealAlt(v)
 	if targetAlt < 0 {
 		return false
@@ -157,7 +157,7 @@ func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 			v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth &&
 			v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case 2:
-		// 2 parents 1 bulk filter
+		// 2 parents low bulk filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
 				return false
@@ -174,8 +174,27 @@ func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 			return false // same allele in both parents — not informative
 		}
 
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case 3:
+		// 2 parents high bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
+			return false
+		}
+		if hp.GT[0] == lp.GT[0] {
+			return false // same allele in both parents — not informative
+		}
+
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+	case 4:
 		// high parent 2 bulks filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
@@ -185,8 +204,8 @@ func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 
 		hp := v.Samples[cfg.HighParentIdx]
 		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
-	case 4:
-		// low parent 1 2 bulks filter
+	case 5:
+		// low parent  2 bulks filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
 				return false
@@ -195,15 +214,7 @@ func bsaSeqFilter(v *vcfgo.Variant, cfg AnalysisConfig, bsaType int) bool {
 		lp := v.Samples[cfg.LowParentIdx]
 		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	default:
-		// bulks only
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
-		}
-
-		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
-
+		return false
 	}
 
 }
@@ -239,11 +250,11 @@ func getKeepIndices(cfg AnalysisConfig, bsaType int) []int {
 	case 2:
 		idxs = []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx}
 	case 3:
-		idxs = []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}
+		idxs = []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx}
 	case 4:
+		idxs = []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}
+	case 5:
 		idxs = []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}
-	default:
-		idxs = []int{cfg.HighBulkIdx, cfg.LowBulkIdx}
 	}
 
 	var kept []int
@@ -390,7 +401,7 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 		go func() {
 			defer wg.Done()
 			for v := range filterCh {
-				passed := passesHardFilter(v, hfcfg) && bsaSeqFilter(v, cfg, bsaseqType)
+				passed := PassesHardFilter(v, hfcfg) && BsaSeqFilter(v, cfg, bsaseqType)
 				resultCh <- variantResult{v: v, passed: passed}
 			}
 		}()
@@ -489,143 +500,3 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 
 	return passedVariants, original, passed, nil
 }
-
-// func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath string, cfg AnalysisConfig, hfcfg HardFilterConfig, bsaseqType int) ([]*vcfgo.Variant, int, int, error) {
-
-// 	for _, id := range []string{"PGT", "PID"} {
-// 		delete(rdr.Header.SampleFormats, id)
-// 	}
-
-// 	// ── Open output files ─────────────────────────────────────────────────────
-// 	hfFile, err := os.Create(hardFilteredVcfPath)
-// 	if err != nil {
-// 		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF: %w", err)
-// 	}
-// 	defer hfFile.Close()
-
-// 	hfCounting := &countingWriter{Writer: hfFile}
-// 	hfBgzf := bgzf.NewWriter(hfCounting, 1)
-// 	hfWriter, err := vcfgo.NewWriter(hfBgzf, rdr.Header)
-// 	if err != nil {
-// 		hfBgzf.Close()
-// 		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF writer: %w", err)
-// 	}
-
-// 	badFile, err := os.Create(badVcfPath)
-// 	if err != nil {
-// 		hfBgzf.Close()
-// 		return nil, 0, 0, fmt.Errorf("create rejected VCF: %w", err)
-// 	}
-// 	defer badFile.Close()
-
-// 	badBgzf := bgzf.NewWriter(badFile, 1)
-// 	badWriter, err := vcfgo.NewWriter(badBgzf, rdr.Header)
-// 	if err != nil {
-// 		hfBgzf.Close()
-// 		badBgzf.Close()
-// 		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
-// 	}
-
-// 	hfIdx := newTabixIndex()
-
-// 	bar := progressbar.Default(-1, "Hard filtering variants")
-
-// 	var (
-// 		passedVariants []*vcfgo.Variant
-// 		original       int
-// 		skipped        int
-// 		passed         int
-// 	)
-
-// 	// ── Main read loop ────────────────────────────────────────────────────────
-
-// 	for {
-// 		v := rdr.Read()
-// 		if v == nil {
-// 			break
-// 		}
-
-// 		if err := rdr.Error(); err != nil {
-// 			if strings.Contains(err.Error(), "bad sample string") {
-// 				rdr.Clear() // benign — GT/AD/DP/GQ are still populated
-// 			} else {
-// 				hfBgzf.Close()
-// 				badBgzf.Close()
-// 				return nil, 0, 0, fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
-// 			}
-// 		}
-
-// 		// Discard gVCF reference-confidence blocks (ALT == '<NON_REF>' or '.').
-// 		alts := v.Alt()
-// 		if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
-// 			skipped++
-// 			continue
-// 		}
-
-// 		original++
-// 		_ = bar.Add(1)
-
-// 		if !passesHardFilter(v, hfcfg) || !bsaSeqFilter(v, cfg, bsaseqType) {
-// 			badWriter.WriteVariant(v)
-// 			continue
-// 		}
-
-// 		// ── Record tabix offset, write, record end offset ─────────────────────
-// 		blockOffset, _ := hfBgzf.Next()
-// 		startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
-
-// 		hfWriter.WriteVariant(v)
-
-// 		blockOffsetEnd, _ := hfBgzf.Next()
-// 		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
-
-// 		if err := addTabixRecord(hfIdx, v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
-// 			hfBgzf.Close()
-// 			badBgzf.Close()
-// 			return nil, 0, 0, fmt.Errorf("tabix add variant at %s:%d: %w", v.Chromosome, v.Pos, err)
-// 		}
-
-// 		passedVariants = append(passedVariants, v)
-// 		passed++
-// 	}
-
-// 	if err := rdr.Error(); err != nil && !strings.Contains(err.Error(), "bad sample string") {
-// 		hfBgzf.Close()
-// 		badBgzf.Close()
-// 		return nil, 0, 0, fmt.Errorf("VCF read error: %w", err)
-// 	}
-
-// 	_ = bar.Finish()
-
-// 	// ── Flush and close bgzf streams ──────────────────────────────────────────
-// 	if err = hfBgzf.Close(); err != nil {
-// 		badBgzf.Close()
-// 		return nil, 0, 0, fmt.Errorf("close hard-filtered bgzf: %w", err)
-// 	}
-// 	if err = badBgzf.Close(); err != nil {
-// 		return nil, 0, 0, fmt.Errorf("close rejected bgzf: %w", err)
-// 	}
-
-// 	// ── Write tabix index ─────────────────────────────────────────────────────
-// 	tbiFile, err := os.Create(hardFilteredVcfPath + ".tbi")
-// 	if err != nil {
-// 		return nil, 0, 0, fmt.Errorf("create tbi file: %w", err)
-// 	}
-// 	defer tbiFile.Close()
-
-// 	tbiGz := bgzf.NewWriter(tbiFile, 1)
-// 	if err := tabix.WriteTo(tbiGz, hfIdx); err != nil {
-// 		tbiGz.Close()
-// 		return nil, 0, 0, fmt.Errorf("write tabix index: %w", err)
-// 	}
-// 	if err := tbiGz.Close(); err != nil {
-// 		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
-// 	}
-
-// 	fmt.Printf(
-// 		"Hard filtering complete: %d variant records read (%d gVCF ref blocks skipped) → %d passed, %d rejected\n",
-// 		original, skipped, passed, original-passed,
-// 	)
-
-// 	return passedVariants, original, passed, nil
-// }

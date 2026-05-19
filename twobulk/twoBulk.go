@@ -32,33 +32,16 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	// minSNPsPerWindow is the minimum number of SNPs required for a smoothed
-	// window to be emitted.  Windows below this threshold (e.g. pericentromeric
-	// deserts) produce unstable averages and can generate spurious QTL peaks.
-	minSNPsPerWindow = 5
-
-	// maxGapWindows controls gap-bridging in detectQTLs: two QTL runs separated
-	// by this many or fewer sub-threshold windows are merged into a single record.
-	maxGapWindows = 3
-
-	// consensusMinStats is the minimum number of statistics that must
-	// simultaneously exceed their thresholds for a window to be called a
-	// consensus QTL.
+	minSNPsPerWindow  = 5
+	maxGapWindows     = 3
 	consensusMinStats = 3
-
-	// afpFloor is the minimum allele-frequency product used in calculateBRMBlocks
-	// to prevent the variance threshold from approaching zero near fixation.
-	afpFloor = 0.05
-
-	chartTheme  = types.ThemeWesteros
-	chartWidth  = "900px"
-	chartHeight = "500px"
-
-	// Significance Z thresholds for the overlay plots.
-	zSig  = 3.0 // ~p99 equivalent
-	zSugg = 2.0 // ~p95 equivalent
-
-	defaultBRMAlpha = 0.05
+	afpFloor          = 0.05
+	chartTheme        = types.ThemeWesteros
+	chartWidth        = "900px"
+	chartHeight       = "500px"
+	zSig              = 3.0 // ~p99 equivalent
+	zSugg             = 2.0 // ~p95 equivalent
+	defaultBRMAlpha   = 0.05
 )
 
 type BSAstats struct {
@@ -1458,16 +1441,6 @@ func writeHTMLPage(page *components.Page, path string) error {
 // Main plot + QTL entry point
 // ---------------------------------------------------------------------------
 
-// GenerateHtmlPlotsAndQTL processes smoothed window statistics, detects QTLs
-// via four complementary methods, and writes three HTML files plus QTL TSVs.
-//
-// Output files:
-//
-//	GoBSAseq_IndividualPlots.html  – raw-value charts with permutation thresholds (7 per chromosome)
-//	GoBSAseq_RobustZScore.html     – genome-wide robust Z-score overlay (all stats overlaid)
-//	GoBSAseq_CompositeSignal.html  – single max-|Z| composite signal per chromosome
-//	<qtlOutFile>                   – TSV of all QTL intervals (all detection methods)
-//	GoBSAseq_BRMBlocks.tsv        – TSV of BRM-style block intervals used for plot shading
 func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF float64, highBulkSize, lowBulkSize int,
 	population string, alphas []float64, rep int, htmlOutFile, qtlOutFile string) ([]QTLRecord, error) {
 
@@ -1799,10 +1772,6 @@ func GenerateHtmlPlotsAndQTL(allSmoothed []SmoothedStats, highSmAF, lowSmAF floa
 // detectQTLsAdaptive — per-window threshold variant of detectQTLs
 // ---------------------------------------------------------------------------
 
-// detectQTLsAdaptive calls QTLs using a per-window threshold slice rather than
-// a single chromosome-average threshold, making detection locally adaptive to
-// sequencing depth.  thresholds[i] is the significance threshold for window x[i].
-// When isValley is true, a window is considered significant if y[i] < thresholds[i].
 func detectQTLsAdaptive(chrom string, x []int64, y, thresholds []float64, statName, ci string, isValley bool, source string) []QTLRecord {
 	if len(x) == 0 || len(x) != len(y) || len(x) != len(thresholds) {
 		return nil
@@ -1893,13 +1862,10 @@ func detectQTLsAdaptive(chrom string, x []int64, y, thresholds []float64, statNa
 
 func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
 	highParIdx := cfg.HighParentIdx
-	//highParDP := cfg.HighParentDepth
 	lowParIdx := cfg.LowParentIdx
-	//lowParDP := cfg.LowParentDepth
 	highBulkIdx := cfg.HighBulkIdx
-	//highBulkDP := cfg.HighBulkDepth
 	lowBulkIdx := cfg.LowBulkIdx
-	//lowBulkDP := cfg.LowBulkDepth
+
 	vcfRdr := cfg.Rdr
 	outDir := cfg.OutputDir
 
