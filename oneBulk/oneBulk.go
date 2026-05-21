@@ -150,6 +150,7 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 				BulkAD:    fmt.Sprintf("%d,%d", bulkRefDep, bulkAltDeps[0]),
 				SI:        SI,
 				AbsSI:     math.Abs(SI - 0.5),
+				ED:        math.Pow(math.Abs(SI-0.5), 4),
 
 				Gstat:   math.Round(GStatisticOneBulk(lowBulk.GT)*1e6) / 1e6,
 				LOD:     math.Round(LodOneBulk(lowBulk.GT)*1e6) / 1e6,
