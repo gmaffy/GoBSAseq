@@ -1,29 +1,184 @@
 package oneBulk
 
 import (
+	"bufio"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
+	"sort"
 
-	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/go-echarts/go-echarts/v2/types"
+)
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const (
+	minSNPsPerWindow  = 5
+	maxGapWindows     = 3
+	consensusMinStats = 3
+	afpFloor          = 0.05
+	chartTheme        = types.ThemeWesteros
+	chartWidth        = "900px"
+	chartHeight       = "500px"
+	zSig              = 3.0 // ~p99 equivalent
+	zSugg             = 2.0 // ~p95 equivalent
+	defaultBRMAlpha   = 0.05
 )
 
 type OneBulkStats struct {
-	CHROM     string
-	POS       int64
-	REF       string
-	ALT       string
-	HighParGT []int
-	LowParGT  []int
-	BulkGT    []int
-	BulkAD    string
-	SI        float64 // ALT / (ALT+REF)
-	AbsSI     float64 // |SI - 0.5|
-	Gstat     float64 // one-bulk G vs. uniform
-	LOD       float64 // one-bulk LOD vs. p=0.5
-	BBLogBF   float64 // BF vs. p=0.5
-	ED        float64 // |SI-0.5|^4
-	Depth     int
+	CHROM            string
+	POS              int64
+	REF              string
+	ALT              string
+	HighParGT        []int
+	LowParGT         []int
+	BulkGT           []int
+	BulkAD           string
+	BulkSusAlleleCnt int
+	BulkResAlleleCnt int
+	SI               float64 // ALT / (ALT+REF)
+	AbsSI            float64 // |SI - 0.5|
+	Gstat            float64 // one-bulk G vs. uniform
+	LOD              float64 // one-bulk LOD vs. p=0.5
+	BBLogBF          float64 // BF vs. p=0.5
+	ED               float64 // |SI-0.5|^4
+	Depth            int
+}
+
+type Thresholds struct {
+	GsP99 float64
+	GsP95 float64
+
+	EdP99 float64
+	EdP95 float64
+
+	LodP99 float64
+	LodP95 float64
+
+	BbP99 float64
+	BbP95 float64
+
+	SIP99  float64
+	SIP95  float64
+	SIMp99 float64
+	SIMp95 float64
+}
+
+type SmoothedStats struct {
+	CHROM          string
+	POS            int64
+	DeltaSI        float64
+	Gstat          float64
+	ED             float64
+	LOD            float64
+	BBLogBF        float64
+	SI             float64
+	AbsSI          float64
+	NumSNPs        int
+	MeanHighBulkDP int
+	MeanLowBulkDP  int
+
+	// per-window threshold lookup (set during smoothing, used in detectQTLs)
+	thresholds Thresholds
+}
+
+func smoothChromosome(stats []OneBulkStats, windowSize int64, step int64) []SmoothedStats {
+	if len(stats) == 0 || windowSize <= 0 || step <= 0 {
+		return nil
+	}
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
+
+	var smoothed []SmoothedStats
+	chrom := stats[0].CHROM
+	minPos := stats[0].POS
+	maxPos := stats[len(stats)-1].POS
+
+	for center := minPos; center <= maxPos; center += step {
+		windowStart := center - windowSize/2
+		windowEnd := center + windowSize/2
+
+		var (
+			// DeltaSI, Gstat, LOD, BBLogBF share spatial+depth weight.
+			sumGstat, sumWeightGs    float64
+			sumLOD, sumWeightLod     float64
+			sumBBLogBF, sumWeightBB  float64
+			sumED, sumWeightED       float64
+			sumSI, sumWeightSI       float64
+			sumAbsSI, sumWeightAbsSI float64
+			sumBulkDP                float64
+			nSNPs                    int
+		)
+
+		for _, s := range stats {
+			if s.POS < windowStart || s.POS > windowEnd {
+				continue
+			}
+			nSNPs++
+
+			d := math.Abs(float64(s.POS - center))
+			w := utils.TricubeWeight(d, float64(windowSize)/2)
+			depthWeight := math.Sqrt(float64(s.Depth))
+			wStat := w * depthWeight
+
+			sumGstat += s.Gstat * wStat
+			sumWeightGs += wStat
+			sumLOD += s.LOD * wStat
+			sumWeightLod += wStat
+			sumBBLogBF += s.BBLogBF * wStat
+			sumWeightBB += wStat
+			sumED += s.ED * wStat
+			sumWeightED += wStat
+			sumSI += s.SI * wStat
+			sumWeightSI += wStat
+
+			sumAbsSI += s.AbsSI * wStat
+			sumWeightAbsSI += wStat
+			sumBulkDP += float64(s.BulkResAlleleCnt + s.BulkSusAlleleCnt)
+
+		}
+
+		// Skip sparse windows — they produce unreliable signal.
+		if nSNPs < minSNPsPerWindow {
+			continue
+		}
+
+		sm := SmoothedStats{
+			CHROM:          chrom,
+			POS:            center,
+			NumSNPs:        nSNPs,
+			MeanHighBulkDP: int(sumBulkDP / float64(nSNPs)),
+		}
+
+		if sumWeightGs > 0 {
+			sm.Gstat = sumGstat / sumWeightGs
+		}
+		if sumWeightLod > 0 {
+			sm.LOD = sumLOD / sumWeightLod
+		}
+		if sumWeightBB > 0 {
+			sm.BBLogBF = sumBBLogBF / sumWeightBB
+		}
+		if sumWeightED > 0 {
+			sm.ED = sumED / sumWeightED
+		}
+		if sumWeightSI > 0 {
+			sm.SI = sumSI / sumWeightSI
+
+		}
+		if sumWeightAbsSI > 0 {
+			sm.AbsSI = sumAbsSI / sumWeightAbsSI
+		}
+
+		smoothed = append(smoothed, sm)
+	}
+
+	return smoothed
 }
 
 func GStatisticOneBulk(gt []int) float64 {
@@ -80,6 +235,12 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	highParIdx := cfg.HighParentIdx
 	lowParIdx := cfg.LowParentIdx
 	lowBulkIdx := cfg.LowBulkIdx
+	outDir := cfg.OutputDir
+
+	windowSize := int64(cfg.WindowSize)
+	stepSize := int64(cfg.StepSize)
+	//rep := cfg.Rep
+	//pop := cfg.Population
 
 	//-------------------------------------- Remove problematic fields ---------------------------------------------- //
 	for _, id := range []string{"PGT", "PID"} {
@@ -94,8 +255,28 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	writerHeader.SampleNames = sampleNames
 
 	// ------------------------------------------------- Run -------------------------------------------------------- //
+	err := os.MkdirAll(filepath.Join(outDir, "stats"), 0755)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Writing output to: ", filepath.Join(outDir, "stats"))
+	rawFile := filepath.Join(outDir, "stats", "GoBSAseq.raw.tsv")
+	f, err := os.Create(rawFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	_, err = fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tBulkGT\tBulkAD\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
+	if err != nil {
+		return err
+	}
 
 	badVariant := 0
+	chromStats := make(map[string][]OneBulkStats)
 	for {
 		v := rdr.Read()
 		if v == nil {
@@ -128,36 +309,53 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 			bulkAltDeps, _ := lowBulk.AltDepths()
 			//fmt.Println(highPar.GT, lowPar.GT, lowBulk.GT, highPar.DP, lowPar.DP, lowBulk.DP)
 			var bulkSusAlleleCount int
-			//var bulkResAlleleCount int
+			var bulkResAlleleCount int
 			if lowBulk.GT[0] == lowPar.GT[0] {
 				bulkSusAlleleCount = bulkRefDep
-				//bulkResAlleleCount = bulkAltDeps[0]
+				bulkResAlleleCount = bulkAltDeps[0]
 			} else {
 				bulkSusAlleleCount = bulkAltDeps[0]
-				//bulkResAlleleCount = bulkRefDep
+				bulkResAlleleCount = bulkRefDep
 			}
 
 			SI := float64(bulkSusAlleleCount) / float64(lowBulk.DP)
 			fmt.Println(SI)
 			s := OneBulkStats{
-				CHROM:     v.Chromosome,
-				POS:       int64(v.Pos),
-				REF:       v.Reference,
-				ALT:       v.Alt()[0],
-				HighParGT: highPar.GT,
-				LowParGT:  lowPar.GT,
-				BulkGT:    lowBulk.GT,
-				BulkAD:    fmt.Sprintf("%d,%d", bulkRefDep, bulkAltDeps[0]),
-				SI:        SI,
-				AbsSI:     math.Abs(SI - 0.5),
-				ED:        math.Pow(math.Abs(SI-0.5), 4),
-				Gstat:     math.Round(GStatisticOneBulk(lowBulk.GT)*1e6) / 1e6,
-				LOD:       math.Round(LodOneBulk(lowBulk.GT)*1e6) / 1e6,
-				BBLogBF:   math.Round(BetaBinomialOneBulk(lowBulk.GT)*1e6) / 1e6,
-				Depth:     cfg.LowBulkDepth,
+				CHROM:            v.Chromosome,
+				POS:              int64(v.Pos),
+				REF:              v.Reference,
+				ALT:              v.Alt()[0],
+				HighParGT:        highPar.GT,
+				LowParGT:         lowPar.GT,
+				BulkGT:           lowBulk.GT,
+				BulkSusAlleleCnt: bulkSusAlleleCount,
+				BulkResAlleleCnt: bulkResAlleleCount,
+				BulkAD:           fmt.Sprintf("%d,%d", bulkRefDep, bulkAltDeps[0]),
+				SI:               SI,
+				AbsSI:            math.Abs(SI - 0.5),
+				ED:               math.Pow(math.Abs(SI-0.5), 4),
+				Gstat:            math.Round(GStatisticOneBulk(lowBulk.GT)*1e6) / 1e6,
+				LOD:              math.Round(LodOneBulk(lowBulk.GT)*1e6) / 1e6,
+				BBLogBF:          math.Round(BetaBinomialOneBulk(lowBulk.GT)*1e6) / 1e6,
+				Depth:            cfg.LowBulkDepth,
 			}
-			v.Samples = []*vcfgo.SampleGenotype{highPar, lowPar, lowBulk}
+			chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
+				s.CHROM, s.POS, s.REF, s.ALT, s.HighParGT, s.LowParGT, s.BulkGT, s.BulkAD,
+				s.SI, s.AbsSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
 		}
+	}
+
+	// ---------------------------------------------------------------------------------------------------------
+	// Stage 2 — smoothing
+	// ---------------------------------------------------------------------------------------------------------
+	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
+
+	var allSmoothed []SmoothedStats
+	for chrom, stats := range chromStats {
+		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
+		smoothed := smoothChromosome(stats, windowSize, stepSize)
+		allSmoothed = append(allSmoothed, smoothed...)
 	}
 
 	return nil

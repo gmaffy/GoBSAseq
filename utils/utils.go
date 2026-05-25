@@ -2,6 +2,7 @@ package utils
 
 import (
 	"fmt"
+	"math"
 	"math/rand/v2"
 
 	"github.com/biogo/hts/bgzf"
@@ -119,4 +120,12 @@ func SimulateAF(popStruc string, bulkSize float64, rep int) float64 {
 	}
 	return totalFreq / float64(rep)
 
+}
+
+func TricubeWeight(d, D float64) float64 {
+	if D <= 0 || d >= D {
+		return 0
+	}
+	x := 1 - math.Pow(d/D, 3)
+	return x * x * x
 }
