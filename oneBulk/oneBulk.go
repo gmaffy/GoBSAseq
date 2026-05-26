@@ -4,13 +4,17 @@ import (
 	"bufio"
 	"fmt"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/go-echarts/go-echarts/v2/types"
+	"gonum.org/v1/gonum/stat"
+	"gonum.org/v1/gonum/stat/distuv"
 )
 
 // ---------------------------------------------------------------------------
@@ -230,6 +234,74 @@ func BetaBinomialOneBulk(gt []int) float64 {
 	return logAlt - logNull
 }
 
+func calcThresholds(bulkDP int, bulkSmAF float64, rep int) Thresholds {
+	if bulkDP <= 0 || rep <= 0 {
+		return Thresholds{}
+	}
+
+	src := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(src)
+	dist := distuv.Binomial{N: float64(bulkDP), P: bulkSmAF, Src: rng}
+
+	bulkSIArr := make([]float64, rep)
+
+	absSiArr := make([]float64, rep)
+	gsArr := make([]float64, rep)
+	edArr := make([]float64, rep)
+	lodArr := make([]float64, rep)
+	bbArr := make([]float64, rep)
+
+	for i := 0; i < rep; i++ {
+		alt := dist.Rand()
+		ref := float64(bulkDP) - alt
+
+		si := math.Round((alt/float64(bulkDP))*1e6) / 1e6
+		bulkSIArr[i] = si
+
+		absSiArr[i] = math.Abs(si - 0.5) //math.Round((hSI-lSI)*1e6) / 1e6
+		gsArr[i] = math.Round(GStatisticOneBulk([]int{int(alt), int(ref)})*1e6) / 1e6
+		edArr[i] = math.Pow(math.Abs(si-0.5), 4)
+		lodArr[i] = math.Round(LodOneBulk([]int{int(alt), int(ref)})*1e6) / 1e6
+		bbArr[i] = math.Round(BetaBinomialOneBulk([]int{int(alt), int(ref)})*1e6) / 1e6
+	}
+
+	sort.Float64s(bulkSIArr)
+	sort.Float64s(absSiArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(edArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	return Thresholds{
+		HighP99:  math.Round(stat.Quantile(0.995, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighP95:  math.Round(stat.Quantile(0.95, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighMp99: math.Round(stat.Quantile(0.005, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		HighMp95: math.Round(stat.Quantile(0.05, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+
+		LowP99:  math.Round(stat.Quantile(0.995, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowP95:  math.Round(stat.Quantile(0.95, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowMp99: math.Round(stat.Quantile(0.005, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+		LowMp95: math.Round(stat.Quantile(0.05, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
+
+		DsiP99:  math.Round(stat.Quantile(0.995, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiP95:  math.Round(stat.Quantile(0.95, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiMp99: math.Round(stat.Quantile(0.005, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		DsiMp95: math.Round(stat.Quantile(0.05, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+
+		GsP99: math.Round(stat.Quantile(0.995, stat.Empirical, gsArr, nil)*1e6) / 1e6,
+		GsP95: math.Round(stat.Quantile(0.95, stat.Empirical, gsArr, nil)*1e6) / 1e6,
+
+		EdP99: math.Round(stat.Quantile(0.995, stat.Empirical, edArr, nil)*1e6) / 1e6,
+		EdP95: math.Round(stat.Quantile(0.95, stat.Empirical, edArr, nil)*1e6) / 1e6,
+
+		LodP99: math.Round(stat.Quantile(0.995, stat.Empirical, lodArr, nil)*1e6) / 1e6,
+		LodP95: math.Round(stat.Quantile(0.95, stat.Empirical, lodArr, nil)*1e6) / 1e6,
+
+		BbP99: math.Round(stat.Quantile(0.995, stat.Empirical, bbArr, nil)*1e6) / 1e6,
+		BbP95: math.Round(stat.Quantile(0.95, stat.Empirical, bbArr, nil)*1e6) / 1e6,
+	}
+}
+
 func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig) error {
 	rdr := cfg.Rdr
 	highParIdx := cfg.HighParentIdx
@@ -239,8 +311,8 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 
 	windowSize := int64(cfg.WindowSize)
 	stepSize := int64(cfg.StepSize)
-	//rep := cfg.Rep
-	//pop := cfg.Population
+	rep := cfg.Rep
+	pop := cfg.Population
 
 	//-------------------------------------- Remove problematic fields ---------------------------------------------- //
 	for _, id := range []string{"PGT", "PID"} {
@@ -357,6 +429,21 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 		smoothed := smoothChromosome(stats, windowSize, stepSize)
 		allSmoothed = append(allSmoothed, smoothed...)
 	}
+
+	// --------------------------------------------------------------------------------------------------------
+	// Stage 3 — threshold simulation
+	// --------------------------------------------------------------------------------------------------------
+	highSmAF := utils.SimulateAF(pop, float64(cfg.HighBulkSize), cfg.Rep)
+	lowSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
+	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
+	calcAllThresholds(allSmoothed, highSmAF, lowSmAF, rep)
+	// Attach per-window thresholds to the SmoothedStats slice so downstream
+	// QTL detection can use locally adaptive thresholds rather than chromosome averages.
+	for i := range allSmoothed {
+		allSmoothed[i].thresholds = calcThresholdsCached(
+			allSmoothed[i].MeanHighBulkDP, allSmoothed[i].MeanLowBulkDP, highSmAF, lowSmAF, rep)
+	}
+	color.Green("\nThreshold calculations complete.")
 
 	return nil
 
