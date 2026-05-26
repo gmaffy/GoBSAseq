@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -55,6 +56,14 @@ type OneBulkStats struct {
 }
 
 type Thresholds struct {
+	SIP99  float64
+	SIP95  float64
+	SIMp99 float64
+	SIMp95 float64
+
+	AbsSIP99 float64
+	AbsSIP95 float64
+
 	GsP99 float64
 	GsP95 float64
 
@@ -66,11 +75,6 @@ type Thresholds struct {
 
 	BbP99 float64
 	BbP95 float64
-
-	SIP99  float64
-	SIP95  float64
-	SIMp99 float64
-	SIMp95 float64
 }
 
 type SmoothedStats struct {
@@ -273,20 +277,13 @@ func calcThresholds(bulkDP int, bulkSmAF float64, rep int) Thresholds {
 	sort.Float64s(bbArr)
 
 	return Thresholds{
-		HighP99:  math.Round(stat.Quantile(0.995, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
-		HighP95:  math.Round(stat.Quantile(0.95, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
-		HighMp99: math.Round(stat.Quantile(0.005, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
-		HighMp95: math.Round(stat.Quantile(0.05, stat.Empirical, highSIArr, nil)*1e6) / 1e6,
+		SIP99:  math.Round(stat.Quantile(0.995, stat.Empirical, bulkSIArr, nil)*1e6) / 1e6,
+		SIP95:  math.Round(stat.Quantile(0.95, stat.Empirical, bulkSIArr, nil)*1e6) / 1e6,
+		SIMp99: math.Round(stat.Quantile(0.005, stat.Empirical, bulkSIArr, nil)*1e6) / 1e6,
+		SIMp95: math.Round(stat.Quantile(0.05, stat.Empirical, bulkSIArr, nil)*1e6) / 1e6,
 
-		LowP99:  math.Round(stat.Quantile(0.995, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
-		LowP95:  math.Round(stat.Quantile(0.95, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
-		LowMp99: math.Round(stat.Quantile(0.005, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
-		LowMp95: math.Round(stat.Quantile(0.05, stat.Empirical, lowSIArr, nil)*1e6) / 1e6,
-
-		DsiP99:  math.Round(stat.Quantile(0.995, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
-		DsiP95:  math.Round(stat.Quantile(0.95, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
-		DsiMp99: math.Round(stat.Quantile(0.005, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
-		DsiMp95: math.Round(stat.Quantile(0.05, stat.Empirical, dsiArr, nil)*1e6) / 1e6,
+		AbsSIP99: math.Round(stat.Quantile(0.995, stat.Empirical, absSiArr, nil)*1e6) / 1e6,
+		AbsSIP95: math.Round(stat.Quantile(0.95, stat.Empirical, absSiArr, nil)*1e6) / 1e6,
 
 		GsP99: math.Round(stat.Quantile(0.995, stat.Empirical, gsArr, nil)*1e6) / 1e6,
 		GsP95: math.Round(stat.Quantile(0.95, stat.Empirical, gsArr, nil)*1e6) / 1e6,
@@ -300,6 +297,18 @@ func calcThresholds(bulkDP int, bulkSmAF float64, rep int) Thresholds {
 		BbP99: math.Round(stat.Quantile(0.995, stat.Empirical, bbArr, nil)*1e6) / 1e6,
 		BbP95: math.Round(stat.Quantile(0.95, stat.Empirical, bbArr, nil)*1e6) / 1e6,
 	}
+}
+
+var thresholdCache sync.Map
+
+func calcThresholdsCached(bulkDP int, bulkSmAF float64, rep int) Thresholds {
+	key := fmt.Sprintf("%d_%.6f_%d", bulkDP, bulkSmAF, rep)
+	if v, ok := thresholdCache.Load(key); ok {
+		return v.(Thresholds)
+	}
+	t := calcThresholds(bulkDP, bulkSmAF, rep)
+	actual, _ := thresholdCache.LoadOrStore(key, t)
+	return actual.(Thresholds)
 }
 
 func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig) error {
