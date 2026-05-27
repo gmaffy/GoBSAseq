@@ -365,7 +365,7 @@ func calcAllThresholds(allSmoothed []SmoothedStats, bulkSmAF float64, rep int) {
 	fmt.Println()
 }
 
-func writeSmoothedTSV(filename string, data []SmoothedStats) error {
+func writeSmoothedTSV(filename string, data []SmoothedStats, bulkSmAF float64, rep int) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -385,20 +385,22 @@ func writeSmoothedTSV(filename string, data []SmoothedStats) error {
 	fmt.Fprintln(w, header)
 
 	for _, d := range data {
-		t := d.thresholds
+		t := calcThresholdsCached(d.MeanHighBulkDP, d.MeanLowBulkDP, highSmAF, lowSmAF, rep)
 		row := fmt.Sprintf(
-			"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d"+
+			"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d\t%d"+
 				"\t%.6f\t%.6f\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f\t%.6f\t%.6f"+
+				"\t%.6f\t%.6f\t%.6f\t%.6f"+
 				"\t%.6f\t%.6f"+
 				"\t%.6f\t%.6f"+
 				"\t%.6f\t%.6f"+
 				"\t%.6f\t%.6f",
 			d.CHROM, d.POS,
-			d.SI, d.AbsSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
-			d.NumSNPs, d.MeanBulkDP,
-			t.SIP99, t.SIP95, t.SIMp99, t.SIMp95,
-			t.AbsSIP99, t.AbsSIP95,
+			d.HighSI, d.LowSI, d.DeltaSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
+			d.NumSNPs, d.MeanHighBulkDP, d.MeanLowBulkDP,
+			t.HighP99, t.HighP95, t.HighMp99, t.HighMp95,
+			t.LowP99, t.LowP95, t.LowMp99, t.LowMp95,
+			t.DsiP99, t.DsiP95, t.DsiMp99, t.DsiMp95,
 			t.GsP99, t.GsP95,
 			t.EdP99, t.EdP95,
 			t.LodP99, t.LodP95,
@@ -556,7 +558,7 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	// -----------------------------------------------------------------------
 	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
 	smoothTSV := filepath.Join(outDir, "GoBSAseq.smooth.tsv")
-	if err := writeSmoothedTSV(smoothTSV, allSmoothed); err != nil {
+	if err := writeSmoothedTSV(smoothTSV, allSmoothed, highSmAF, lowSmAF, rep); err != nil {
 		color.Red("Error writing smoothed TSV: %v", err)
 	} else {
 		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), smoothTSV)
