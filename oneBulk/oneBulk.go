@@ -14,8 +14,6 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
-	"github.com/gmaffy/genome-whisperer/annotation"
-	"github.com/gmaffy/genome-whisperer/genespace"
 	"github.com/go-echarts/go-echarts/v2/types"
 	"github.com/schollz/progressbar/v3"
 	"gonum.org/v1/gonum/stat"
@@ -98,7 +96,18 @@ type SmoothedStats struct {
 	thresholds Thresholds
 }
 
-func smoothChromosome(stats []OneBulkStats, windowSize int64, step int64) []SmoothedStats {
+// BRMBlock holds one one-bulk BRM-style segregation-deviation interval.
+type BRMBlock struct {
+	Chrom      string
+	Start      int64
+	Stop       int64
+	PeakPos    int64
+	Peak       float64
+	ExpectedSI float64
+	Threshold  float64
+}
+
+func smoothChromosome(stats []OneBulkStats, windowSize int64, step int64, bulkSmAF float64, rep int) []SmoothedStats {
 	if len(stats) == 0 || windowSize <= 0 || step <= 0 {
 		return nil
 	}
@@ -186,6 +195,7 @@ func smoothChromosome(stats []OneBulkStats, windowSize int64, step int64) []Smoo
 			sm.AbsSI = sumAbsSI / sumWeightAbsSI
 		}
 
+		sm.thresholds = calcThresholdsCached(sm.MeanBulkDP, bulkSmAF, rep)
 		smoothed = append(smoothed, sm)
 	}
 
@@ -365,48 +375,93 @@ func calcAllThresholds(allSmoothed []SmoothedStats, bulkSmAF float64, rep int) {
 	fmt.Println()
 }
 
-func writeSmoothedTSV(filename string, data []SmoothedStats) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
+// calculateBRMBlocksOneBulk applies a BRM-style threshold to one-bulk windows.
+// With no second bulk, the tested signal is the signed deviation of SI from the
+// expected segregation frequency rather than a two-bulk allele-frequency
+// difference. The variance model is therefore the one-sample analogue:
+//
+//	Var(SI - p0) = p0 * (1-p0) / (2^popLevel * bulkSize)
+func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize, popLevel int, expectedSI, uAlpha float64) []BRMBlock {
+	if len(stats) == 0 || bulkSize <= 0 || uAlpha <= 0 {
+		return nil
 	}
-	defer f.Close()
 
-	w := bufio.NewWriter(f)
-	defer w.Flush()
-
-	header := "CHROM\tPOS\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tNumSNPs\tMeanBulkDP" +
-		"\tSI_p99\tSI_p95\tSI_m_p99\tSI_m_p95" +
-		"\tAbsSI_p99\tAbsSI_p95" +
-		"\tGstat_p99\tGstat_p95" +
-		"\tED4_p99\tED4_p95" +
-		"\tLOD_p99\tLOD_p95" +
-		"\tBBLogBF_p99\tBBLogBF_p95"
-	fmt.Fprintln(w, header)
-
-	for _, d := range data {
-		t := d.thresholds
-		row := fmt.Sprintf(
-			"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d"+
-				"\t%.6f\t%.6f\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f",
-			d.CHROM, d.POS,
-			d.SI, d.AbsSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
-			d.NumSNPs, d.MeanBulkDP,
-			t.SIP99, t.SIP95, t.SIMp99, t.SIMp95,
-			t.AbsSIP99, t.AbsSIP95,
-			t.GsP99, t.GsP95,
-			t.EdP99, t.EdP95,
-			t.LodP99, t.LodP95,
-			t.BbP99, t.BbP95,
-		)
-		fmt.Fprintln(w, row)
+	p0 := expectedSI
+	if math.IsNaN(p0) || math.IsInf(p0, 0) || p0 <= 0 || p0 >= 1 {
+		p0 = 0.5
 	}
-	return nil
+	if p0 < afpFloor {
+		p0 = afpFloor
+	}
+	if p0 > 1-afpFloor {
+		p0 = 1 - afpFloor
+	}
+
+	n := float64(bulkSize)
+	popScale := math.Pow(2, float64(popLevel))
+	threshold := uAlpha * math.Sqrt((p0*(1-p0))/(popScale*n))
+	if threshold <= 0 || math.IsNaN(threshold) || math.IsInf(threshold, 0) {
+		return nil
+	}
+
+	var blocks []BRMBlock
+	inBlock := false
+	startIdx := 0
+	peakIdx := 0
+	peak := 0.0
+
+	emitBlock := func(startIdx, stopIdx, peakIdx int, peak float64) {
+		start := stats[startIdx].POS
+		if startIdx > 0 {
+			start = (stats[startIdx-1].POS + stats[startIdx].POS) / 2
+		}
+		stop := stats[stopIdx].POS
+		if stopIdx < len(stats)-1 {
+			stop = (stats[stopIdx].POS + stats[stopIdx+1].POS) / 2
+		}
+		if stop < start {
+			stop = start
+		}
+		blocks = append(blocks, BRMBlock{
+			Chrom:      chrom,
+			Start:      start,
+			Stop:       stop,
+			PeakPos:    stats[peakIdx].POS,
+			Peak:       peak,
+			ExpectedSI: p0,
+			Threshold:  threshold,
+		})
+	}
+
+	for i, s := range stats {
+		deviation := s.SI - p0
+		significant := math.Abs(deviation) >= threshold
+
+		if significant {
+			if !inBlock {
+				inBlock = true
+				startIdx = i
+				peakIdx = i
+				peak = deviation
+				continue
+			}
+			if math.Abs(deviation) > math.Abs(peak) {
+				peakIdx = i
+				peak = deviation
+			}
+			continue
+		}
+
+		if inBlock {
+			emitBlock(startIdx, i-1, peakIdx, peak)
+			inBlock = false
+		}
+	}
+
+	if inBlock {
+		emitBlock(startIdx, len(stats)-1, peakIdx, peak)
+	}
+	return blocks
 }
 
 func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig) error {
@@ -421,6 +476,8 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	rep := cfg.Rep
 	pop := cfg.Population
 
+	overallStart := time.Now()
+
 	//-------------------------------------- Remove problematic fields ---------------------------------------------- //
 	for _, id := range []string{"PGT", "PID"} {
 		delete(rdr.Header.SampleFormats, id)
@@ -433,26 +490,52 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	writerHeader := *rdr.Header
 	writerHeader.SampleNames = sampleNames
 
-	// ------------------------------------------------- Run -------------------------------------------------------- //
+	// ================================================= Run ======================================================== //
+
+	// -------------------------------------------- Open output files ----------------------------------------------- //
+
+	// --------------------------------------------- Raw BSAseq tsv ------------------------------------------------- //
 	err := os.MkdirAll(filepath.Join(outDir, "stats"), 0755)
 	if err != nil {
 		return err
 	}
+
 	fmt.Println("Writing output to: ", filepath.Join(outDir, "stats"))
 	rawFile := filepath.Join(outDir, "stats", "GoBSAseq.raw.tsv")
-	f, err := os.Create(rawFile)
+	rawHandle, err := os.Create(rawFile)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer rawHandle.Close()
 
-	w := bufio.NewWriter(f)
-	defer w.Flush()
+	rawWriter := bufio.NewWriter(rawHandle)
+	defer rawWriter.Flush()
 
-	_, err = fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tBulkGT\tBulkAD\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
+	_, err = fmt.Fprintln(rawWriter, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tBulkGT\tBulkAD\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
 	if err != nil {
 		return err
 	}
+
+	// ----------------------------------------- Smoothed BSAseq tsv ------------------------------------------------ //
+
+	smoothFile := filepath.Join(outDir, "stats", "GoBSAseq.smooth.tsv")
+	smoothHandle, err := os.Create(smoothFile)
+	if err != nil {
+		return err
+	}
+	defer smoothHandle.Close()
+
+	smoothWriter := bufio.NewWriter(smoothHandle)
+	defer smoothWriter.Flush()
+
+	header := "CHROM\tPOS\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tNumSNPs\tMeanBulkDP" +
+		"\tSI_p99\tSI_p95\tSI_m_p99\tSI_m_p95" +
+		"\tAbsSI_p99\tAbsSI_p95" +
+		"\tGstat_p99\tGstat_p95" +
+		"\tED4_p99\tED4_p95" +
+		"\tLOD_p99\tLOD_p95" +
+		"\tBBLogBF_p99\tBBLogBF_p95"
+	fmt.Fprintln(smoothWriter, header)
 
 	badVariant := 0
 	chromStats := make(map[string][]OneBulkStats)
@@ -467,16 +550,6 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 			badVariant++
 			continue
 		}
-		//if err := rdr.Error(); err != nil {
-		//	if strings.Contains(err.Error(), "bad sample string") {
-		//		//fmt.Printf("Bad sample string: %s\n", v.String())
-		//		//rdr.Clear()
-		//		continue
-		//	} else {
-		//		//fmt.Printf("VCF parse error at line %d: %w", v.LineNumber, err)
-		//		continue
-		//	}
-		//}
 
 		passed := utils.PassesHardFilter(v, hfcfg) && v.Samples[cfg.HighParentIdx].DP >= cfg.HighParentDepth && v.Samples[cfg.LowParentIdx].DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 		if passed {
@@ -519,7 +592,7 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 				Depth:            cfg.LowBulkDepth,
 			}
 			chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
-			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
+			fmt.Fprintf(rawWriter, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
 				s.CHROM, s.POS, s.REF, s.ALT, s.HighParGT, s.LowParGT, s.BulkGT, s.BulkAD,
 				s.SI, s.AbsSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
 		}
@@ -529,108 +602,86 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	// Stage 2 — smoothing
 	// ---------------------------------------------------------------------------------------------------------
 	color.Cyan("\n============================ Smoothing Statistics =============================\n\n")
+	bulkSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), rep)
+	popLevel := 0
+	if pop == "F2" {
+		popLevel = 1
+	}
+	brmAlpha := defaultBRMAlpha
+	for _, alpha := range cfg.Alphas {
+		if alpha > brmAlpha && alpha < 1 {
+			brmAlpha = alpha
+		}
+	}
+	brmUAlpha := distuv.UnitNormal.Quantile(1 - brmAlpha/2)
 
 	var allSmoothed []SmoothedStats
+	var allBRMBlocks []BRMBlock
+	color.Cyan("\n============================ Smoothing & Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
 	for chrom, stats := range chromStats {
 		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
-		smoothed := smoothChromosome(stats, windowSize, stepSize)
+		smoothed := smoothChromosome(stats, windowSize, stepSize, bulkSmAF, rep)
+		for _, d := range smoothed {
+			t := d.thresholds
+			fmt.Fprintf(smoothWriter,
+				"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d"+
+					"\t%.6f\t%.6f\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f\n",
+				d.CHROM, d.POS,
+				d.SI, d.AbsSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
+				d.NumSNPs, d.MeanBulkDP,
+				t.SIP99, t.SIP95, t.SIMp99, t.SIMp95,
+				t.AbsSIP99, t.AbsSIP95,
+				t.GsP99, t.GsP95,
+				t.EdP99, t.EdP95,
+				t.LodP99, t.LodP95,
+				t.BbP99, t.BbP95,
+			)
+		}
 		allSmoothed = append(allSmoothed, smoothed...)
+		allBRMBlocks = append(allBRMBlocks, calculateBRMBlocksOneBulk(chrom, smoothed, cfg.LowBulkSize, popLevel, bulkSmAF, brmUAlpha)...)
 	}
-
-	// --------------------------------------------------------------------------------------------------------
-	// Stage 3 — threshold simulation
-	// --------------------------------------------------------------------------------------------------------
-	bulkSmAF := utils.SimulateAF(pop, float64(cfg.LowBulkSize), cfg.Rep)
-
-	color.Cyan("\n============================ Calculating Thresholds (%d simulations per depth pair) ==============================\n\n", rep)
-	calcAllThresholds(allSmoothed, bulkSmAF, rep)
-
-	for i := range allSmoothed {
-		allSmoothed[i].thresholds = calcThresholdsCached(
-			allSmoothed[i].MeanBulkDP, bulkSmAF, rep)
-	}
-	color.Green("\nThreshold calculations complete.")
-
-	// ------------------------------------------------------------------------------------------------------
-	// Stage 4 — smoothed TSV
-	// -----------------------------------------------------------------------
-	color.Cyan("\n=========================================== Writing Smoothed TSV =================================================\n\n")
-	smoothTSV := filepath.Join(outDir, "GoBSAseq.smooth.tsv")
-	if err := writeSmoothedTSV(smoothTSV, allSmoothed); err != nil {
-		color.Red("Error writing smoothed TSV: %v", err)
-	} else {
-		color.Green("Wrote %d smoothed windows to %s", len(allSmoothed), smoothTSV)
-	}
+	color.Green("\nSmoothing, threshold calculations, and smoothed TSV complete.")
 	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
 	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
 
 	// -----------------------------------------------------------------------
-	// Stage 5 — plots and QTL detection
+	// Stage 3 — BRM analysis
 	// -----------------------------------------------------------------------
-	color.Cyan("\n============================ Generating HTML Plots & QTLs ========================================\n\n")
-	htmlFile := filepath.Join(outDir, "GoBSAseq_RobustZScore.html")
-	qtlFile := filepath.Join(outDir, "GoBSAseq_QTL.tsv")
-
-	finalQTLs, err := GenerateHtmlPlotsAndQTL(
-		allSmoothed,
-		highSmAF, lowSmAF,
-		cfg.HighBulkSize, cfg.LowBulkSize,
-		pop, cfg.Alphas, rep,
-		htmlFile, qtlFile,
-	)
-	if err != nil {
-		color.Red("Error generating Plots and QTLs: %v", err)
-		return
-	} else {
-		color.Green("HTML plots written to %s", outDir)
-		color.Green("QTL tabular results (Main, Consensus, MaxZ) written to %s", outDir)
-	}
-
-	// -------------------------------------------------------------------------------------------------
-	// Stage 6 - Gene space analysis
-	//--------------------------------------------------------------------------------------------------
-
-	color.Cyan("\n============================ Gene space analysis ==============================\n\n")
-	geneSpaceEnabled := cfg.SnpEffDB != "" && cfg.GeneDesc != "" && cfg.Prg != "" && cfg.Gff != ""
-	if !geneSpaceEnabled {
-		color.Yellow("Skipping gene space analysis: required parameters were not provided.")
-		return
-	}
-
-	var annotatedTsvFiles []string
-	color.Green("Step 1: Annotating genes with SnpEff (creating Super VCF table)")
-	_, hasEFF := cfg.Rdr.Header.Infos["EFF"]
-	if hasEFF {
-		color.Yellow("EFF column is already present; no Super VCF table was generated, so gene space analysis will be skipped.")
-		return
-	}
-	color.Yellow("EFF column is not present; annotating filtered VCF.")
-	err, annotatedTsvFiles = annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
-	if err != nil {
-		color.Red("Failed variant annotation with SNPEFF: %s", err)
-		return
-	}
-	if len(annotatedTsvFiles) == 0 {
-		color.Yellow("Skipping gene space analysis: SnpEff annotation did not produce an annotated TSV.")
-		return
-	}
-	color.Green("SNPEFF annotation complete.")
-	color.Green("Annotated TSV files: %v", annotatedTsvFiles)
-	//color.Green("Annotated VCF files written to %s", annotatedVcfFiles)
-
-	color.Cyan("Performing Gene space analysis for %d QTL intervals ...", len(finalQTLs))
-	for _, qtl := range finalQTLs {
-		color.Blue("GeneSpace interval: %s:%d-%d", qtl.Chrom, qtl.Start, qtl.Stop)
-		_, err = genespace.GeneSpace(
-			cfg.Gff, annotatedTsvFiles[0], qtl.Chrom,
-			int(qtl.Start), int(qtl.Stop), []string{cfg.HighParentName},
-			[]string{cfg.LowParentName}, cfg.GeneDesc, cfg.Prg, outDir)
-		if err != nil {
-			color.Red("Failed gene space analysis: %s", err)
-			return
+	sort.Slice(allBRMBlocks, func(i, j int) bool {
+		if allBRMBlocks[i].Chrom == allBRMBlocks[j].Chrom {
+			return allBRMBlocks[i].Start < allBRMBlocks[j].Start
 		}
+		return allBRMBlocks[i].Chrom < allBRMBlocks[j].Chrom
+	})
+
+	brmFile := filepath.Join(outDir, "stats", "GoBSAseq.onebulk.BRMBlocks.tsv")
+	brmHandle, err := os.Create(brmFile)
+	if err != nil {
+		return fmt.Errorf("create one-bulk brm blocks file: %w", err)
 	}
-	color.Green("Gene space analysis complete.")
+	brmWriter := bufio.NewWriter(brmHandle)
+	fmt.Fprintln(brmWriter, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK_SI_DEVIATION\tEXPECTED_SI\tBRM_THRESHOLD\tVALIDATION")
+	for _, b := range allBRMBlocks {
+		validation := "PASS"
+		if math.Abs(b.Peak) < b.Threshold {
+			validation = "FAIL"
+		}
+		fmt.Fprintf(brmWriter, "%s\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%s\n",
+			b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.ExpectedSI, b.Threshold, validation)
+	}
+	if err := brmWriter.Flush(); err != nil {
+		_ = brmHandle.Close()
+		return fmt.Errorf("flush one-bulk brm blocks file: %w", err)
+	}
+	if err := brmHandle.Close(); err != nil {
+		return fmt.Errorf("close one-bulk brm blocks file: %w", err)
+	}
+	color.Green("One-bulk BRM-style blocks written to %s", brmFile)
 
 	return nil
 
