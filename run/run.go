@@ -348,11 +348,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		twobulk.RunTwoBulksOnly(cfg, hfCfg)
 	} else if lowBulkChoice == 0 && highBulkChoice != 0 && lowParentChoice != 0 && highParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (HIGH bulk)...")
-		err = oneBulk.RunTwoParentsHighBulk(cfg, hfCfg)
-		if err != nil {
-			color.Red("Error running one bulk analysis: %s", err)
-			return err
-		}
+		//err = oneBulk.RunTwoParentsHighBulk(cfg, hfCfg)
+		//if err != nil {
+		//	color.Red("Error running one bulk analysis: %s", err)
+		//	return err
+		//}
 	} else if highBulkChoice == 0 && highParentChoice != 0 && lowParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
 		err = oneBulk.RunTwoParentsLowBulk(cfg, hfCfg)

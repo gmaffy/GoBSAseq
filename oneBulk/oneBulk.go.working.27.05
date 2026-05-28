@@ -92,17 +92,6 @@ type SmoothedStats struct {
 	NumSNPs    int
 	MeanBulkDP int
 
-	// Genome-wide robust Z-scores (set after all chromosomes are smoothed)
-	SIZ      float64
-	AbsSIZ   float64
-	GstatZ   float64
-	EDZ      float64
-	LODZ     float64
-	BBLogBFZ float64
-
-	// max-|Z| composite signal
-	CompositeZ float64
-
 	// per-window threshold lookup (set during smoothing, used in detectQTLs)
 	thresholds Thresholds
 }
@@ -385,120 +374,6 @@ func calcAllThresholds(allSmoothed []SmoothedStats, bulkSmAF float64, rep int) {
 	fmt.Println()
 }
 
-// ---------------------------------------------------------------------------
-// Robust Z-score helpers (adapted from twoBulk)
-// ---------------------------------------------------------------------------
-
-// zQuantile returns the p-th quantile of a pre-sorted slice.
-func zQuantile(sorted []float64, p float64) float64 {
-	n := len(sorted)
-	if n == 0 {
-		return 0
-	}
-	if p <= 0 {
-		return sorted[0]
-	}
-	if p >= 1 {
-		return sorted[n-1]
-	}
-	pos := p * float64(n-1)
-	lo := int(math.Floor(pos))
-	hi := int(math.Ceil(pos))
-	if lo == hi {
-		return sorted[lo]
-	}
-	frac := pos - float64(lo)
-	return sorted[lo]*(1-frac) + sorted[hi]*frac
-}
-
-// robustBackground computes the median and MAD of vals, excluding the top
-// trimFrac proportion of values so that genuine QTL peaks do not inflate
-// the spread estimate.
-func robustBackground(vals []float64, trimFrac float64) (median, mad float64) {
-	if len(vals) == 0 {
-		return 0, 0
-	}
-	sorted := make([]float64, len(vals))
-	copy(sorted, vals)
-	sort.Float64s(sorted)
-
-	cutIdx := int(math.Round(float64(len(sorted)) * (1.0 - trimFrac)))
-	if cutIdx < 1 {
-		cutIdx = 1
-	}
-	trimmed := sorted[:cutIdx]
-
-	median = zQuantile(trimmed, 0.5)
-
-	devs := make([]float64, len(trimmed))
-	for i, v := range trimmed {
-		devs[i] = math.Abs(v - median)
-	}
-	sort.Float64s(devs)
-	mad = zQuantile(devs, 0.5)
-	return median, mad
-}
-
-// robustZScore normalises vals to genome-wide robust Z-scores.
-// The 1.4826 factor makes the MAD-based scale consistent with σ under normality.
-func robustZScoreSlice(vals []float64, median, mad float64) []float64 {
-	out := make([]float64, len(vals))
-	scale := mad * 1.4826
-	if scale == 0 {
-		return out
-	}
-	for i, v := range vals {
-		out[i] = (v - median) / scale
-	}
-	return out
-}
-
-// computeZScores calculates genome-wide robust Z-scores for each statistic
-// across all smoothed windows and assigns them (plus a max-|Z| composite)
-// back onto each SmoothedStats entry in-place.
-func computeZScores(allSmoothed []SmoothedStats) {
-	if len(allSmoothed) == 0 {
-		return
-	}
-	const trim = 0.01
-
-	collect := func(fn func(SmoothedStats) float64) []float64 {
-		v := make([]float64, len(allSmoothed))
-		for i, s := range allSmoothed {
-			v[i] = fn(s)
-		}
-		return v
-	}
-
-	siMed, siMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.SI }), trim)
-	absMed, absMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.AbsSI }), trim)
-	gsMed, gsMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.Gstat }), trim)
-	edMed, edMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.ED }), trim)
-	lodMed, lodMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.LOD }), trim)
-	bblMed, bblMAD := robustBackground(collect(func(s SmoothedStats) float64 { return s.BBLogBF }), trim)
-
-	siZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.SI }), siMed, siMAD)
-	absZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.AbsSI }), absMed, absMAD)
-	gsZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.Gstat }), gsMed, gsMAD)
-	edZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.ED }), edMed, edMAD)
-	lodZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.LOD }), lodMed, lodMAD)
-	bblZ := robustZScoreSlice(collect(func(s SmoothedStats) float64 { return s.BBLogBF }), bblMed, bblMAD)
-
-	for i := range allSmoothed {
-		allSmoothed[i].SIZ = siZ[i]
-		allSmoothed[i].AbsSIZ = absZ[i]
-		allSmoothed[i].GstatZ = gsZ[i]
-		allSmoothed[i].EDZ = edZ[i]
-		allSmoothed[i].LODZ = lodZ[i]
-		allSmoothed[i].BBLogBFZ = bblZ[i]
-		allSmoothed[i].CompositeZ = math.Max(math.Abs(siZ[i]),
-			math.Max(math.Abs(absZ[i]),
-				math.Max(math.Abs(gsZ[i]),
-					math.Max(math.Abs(edZ[i]),
-						math.Max(math.Abs(lodZ[i]), math.Abs(bblZ[i]))))))
-	}
-}
-
 // calculateBRMBlocksOneBulk applies a BRM-style threshold to one-bulk windows.
 // With no second bulk, the tested signal is the signed deviation of SI from the
 // expected segregation frequency rather than a two-bulk allele-frequency
@@ -658,8 +533,7 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 		"\tGstat_p99\tGstat_p95" +
 		"\tED4_p99\tED4_p95" +
 		"\tLOD_p99\tLOD_p95" +
-		"\tBBLogBF_p99\tBBLogBF_p95" +
-		"\tSI_Z\tAbsSI_Z\tGstat_Z\tED4_Z\tLOD_Z\tBBLogBF_Z\tComposite_Z"
+		"\tBBLogBF_p99\tBBLogBF_p95"
 	fmt.Fprintln(smoothWriter, header)
 
 	badVariant := 0
@@ -765,41 +639,31 @@ func RunTwoParentsLowBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	for chrom, stats := range chromStats {
 		color.Yellow("Smoothing %s: %d SNPs", chrom, len(stats))
 		smoothed := smoothChromosome(stats, windowSize, stepSize, bulkSmAF, rep)
+		for _, d := range smoothed {
+			t := d.thresholds
+			fmt.Fprintf(smoothWriter,
+				"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d"+
+					"\t%.6f\t%.6f\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f"+
+					"\t%.6f\t%.6f\n",
+				d.CHROM, d.POS,
+				d.SI, d.AbsSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
+				d.NumSNPs, d.MeanBulkDP,
+				t.SIP99, t.SIP95, t.SIMp99, t.SIMp95,
+				t.AbsSIP99, t.AbsSIP95,
+				t.GsP99, t.GsP95,
+				t.EdP99, t.EdP95,
+				t.LodP99, t.LodP95,
+				t.BbP99, t.BbP95,
+			)
+		}
 		allSmoothed = append(allSmoothed, smoothed...)
 		allBRMBlocks = append(allBRMBlocks, calculateBRMBlocksOneBulk(chrom, smoothed, cfg.LowBulkSize, popLevel, bulkSmAF, brmUAlpha)...)
 	}
 	color.Green("\nSmoothing, threshold calculations, and smoothed TSV complete.")
-
-	// Compute genome-wide robust Z-scores and composite Z across all windows.
-	color.Cyan("\n============================ Computing Robust Z-scores =============================\n\n")
-	computeZScores(allSmoothed)
-	color.Green("Z-score normalisation complete.")
-
-	// Write smoothed TSV (z-scores are now populated).
-	color.Cyan("\n============================ Writing Smoothed TSV =============================\n\n")
-	for _, d := range allSmoothed {
-		t := d.thresholds
-		fmt.Fprintf(smoothWriter,
-			"%s\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\t%d"+
-				"\t%.6f\t%.6f\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f"+
-				"\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",
-			d.CHROM, d.POS,
-			d.SI, d.AbsSI, d.Gstat, d.ED, d.LOD, d.BBLogBF,
-			d.NumSNPs, d.MeanBulkDP,
-			t.SIP99, t.SIP95, t.SIMp99, t.SIMp95,
-			t.AbsSIP99, t.AbsSIP95,
-			t.GsP99, t.GsP95,
-			t.EdP99, t.EdP95,
-			t.LodP99, t.LodP95,
-			t.BbP99, t.BbP95,
-			d.SIZ, d.AbsSIZ, d.GstatZ, d.EDZ, d.LODZ, d.BBLogBFZ, d.CompositeZ,
-		)
-	}
 	color.Green("Raw stats written to %s", filepath.Join(outDir, "GoBSAseq.raw.tsv"))
 	color.Green("\nTotal time: %s\n", time.Since(overallStart).Round(time.Second))
 
