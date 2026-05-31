@@ -1,4 +1,4 @@
-module github.com/gmaffy/GoBSAseq/mrefactor
+module github.com/gmaffy/GoBSAseq/crefactor
 
 go 1.26.2
 

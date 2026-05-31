@@ -236,6 +236,14 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+func newWriterWithSampleNames(w io.Writer, h *vcfgo.Header, sampleNames []string) (*vcfgo.Writer, error) {
+	originalSampleNames := h.SampleNames
+	h.SampleNames = sampleNames
+	writer, err := vcfgo.NewWriter(w, h)
+	h.SampleNames = originalSampleNames
+	return writer, err
+}
+
 // ---------------------------------------------------------------------------
 // HardFilterVcf
 // ---------------------------------------------------------------------------
@@ -300,10 +308,6 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 		}
 	}
 
-	// Create a copy of the header for writing
-	writerHeader := *rdr.Header
-	writerHeader.SampleNames = newSampleNames
-
 	for _, id := range []string{"PGT", "PID"} {
 		delete(rdr.Header.SampleFormats, id)
 	}
@@ -317,7 +321,7 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 
 	hfCounting := &countingWriter{Writer: hfFile}
 	hfBgzf := bgzf.NewWriter(hfCounting, 1)
-	hfWriter, err := vcfgo.NewWriter(hfBgzf, &writerHeader)
+	hfWriter, err := newWriterWithSampleNames(hfBgzf, rdr.Header, newSampleNames)
 	if err != nil {
 		hfBgzf.Close()
 		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF writer: %w", err)
@@ -331,7 +335,7 @@ func HardFilterVcf(rdr *vcfgo.Reader, hardFilteredVcfPath string, badVcfPath str
 	defer badFile.Close()
 
 	badBgzf := bgzf.NewWriter(badFile, 1)
-	badWriter, err := vcfgo.NewWriter(badBgzf, &writerHeader)
+	badWriter, err := newWriterWithSampleNames(badBgzf, rdr.Header, newSampleNames)
 	if err != nil {
 		hfBgzf.Close()
 		badBgzf.Close()

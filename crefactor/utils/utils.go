@@ -91,6 +91,8 @@ func SimulateAF(popStruc string, bulkSize float64, rep int) float64 {
 	switch popStruc {
 	case "F2":
 		prob = []float64{0.25, 0.5, 0.25}
+	case "F3":
+		prob = []float64{0.375, 0.25, 0.375}
 	case "RIL":
 		prob = []float64{0.5, 0.0, 0.5}
 	case "BC":

@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/mrefactor/stats"
-	"github.com/gmaffy/GoBSAseq/mrefactor/utils"
+	"github.com/gmaffy/GoBSAseq/crefactor/stats"
+	"github.com/gmaffy/GoBSAseq/crefactor/utils"
 	"github.com/gmaffy/genome-whisperer/annotation"
 	"github.com/gmaffy/genome-whisperer/genespace"
 	"github.com/go-echarts/go-echarts/v2/charts"
@@ -667,10 +667,6 @@ func runTwoParentsOneBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 
 	//-------------------------------------- Header for writing ----------------------------------------------------- //
 	fmt.Println(cfg.HighParentName, cfg.LowParentName, bulkName, highParIdx, lowParIdx, bulkIdx)
-	sampleNames := []string{cfg.HighParentName, cfg.LowParentName, bulkName}
-
-	writerHeader := *rdr.Header
-	writerHeader.SampleNames = sampleNames
 
 	// ================================================= Run ======================================================== //
 
@@ -693,7 +689,7 @@ func runTwoParentsOneBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 	rawWriter := bufio.NewWriter(rawHandle)
 	defer rawWriter.Flush()
 
-	_, err = fmt.Fprintln(rawWriter, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tBulkGT\tBulkAD\tSI\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
+	_, err = fmt.Fprintln(rawWriter, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tBulkGT\tBulkAD\tSI\tSI_L95\tSI_U95\tAbsSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
 	if err != nil {
 		return err
 	}
@@ -788,9 +784,10 @@ func runTwoParentsOneBulk(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig
 			Depth:            observedDepth,
 		}
 		chromStats[s.CHROM] = append(chromStats[s.CHROM], s)
-		fmt.Fprintf(rawWriter, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
+		siLo, siHi := stats.WilsonCI(s.BulkResAlleleCnt, observedDepth, 1.96)
+		fmt.Fprintf(rawWriter, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
 			s.CHROM, s.POS, s.REF, s.ALT, s.HighParGT, s.LowParGT, s.BulkGT, s.BulkAD,
-			s.SI, s.AbsSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
+			s.SI, siLo, siHi, s.AbsSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
 	}
 
 	// ---------------------------------------------------------------------------------------------------------

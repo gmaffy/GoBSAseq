@@ -15,8 +15,8 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/mrefactor/stats"
-	"github.com/gmaffy/GoBSAseq/mrefactor/utils"
+	"github.com/gmaffy/GoBSAseq/crefactor/stats"
+	"github.com/gmaffy/GoBSAseq/crefactor/utils"
 	"github.com/gmaffy/genome-whisperer/annotation"
 	"github.com/gmaffy/genome-whisperer/genespace"
 	"github.com/go-echarts/go-echarts/v2/charts"
@@ -64,12 +64,12 @@ type BSAstats struct {
 	HighSI    float64
 	LowSI     float64
 
-	DeltaSI  float64
-	Gstat    float64
-	ED       float64 // ED^4 power (Magwene et al.) – distinct from |DeltaSI|
-	LOD      float64
-	BBLogBF  float64
-	FisherP  float64
+	DeltaSI float64
+	Gstat   float64
+	ED      float64 // ED^4 power (Magwene et al.) – distinct from |DeltaSI|
+	LOD     float64
+	BBLogBF float64
+	FisherP float64
 
 	Depth int
 }
@@ -433,13 +433,19 @@ func writeRawTSV(filename string, statsChan <-chan BSAstats) error {
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tHighBulkGT\tHighBulkAD\tLowBulkGT\tLowBulkAD\tHighBulkL\tHighBulkH\tLowBulkL\tLowBulkH\tHighSI\tLowSI\tDeltaSI\tGstat\tED4\tLOD\tBBLogBF\tFisherP\tDepth")
+	fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tHighBulkGT\tHighBulkAD\tLowBulkGT\tLowBulkAD\tHighBulkL\tHighBulkH\tLowBulkL\tLowBulkH\tHighSI\tHighSI_L95\tHighSI_U95\tLowSI\tLowSI_L95\tLowSI_U95\tDeltaSI\tDeltaSI_L95\tDeltaSI_U95\tGstat\tED4\tLOD\tBBLogBF\tFisherP\tDepth")
 	for s := range statsChan {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6g\t%d\n",
+		highTotal := s.HighBulkH + s.HighBulkL
+		lowTotal := s.LowBulkH + s.LowBulkL
+		highLo, highHi := stats.WilsonCI(s.HighBulkH, highTotal, 1.96)
+		lowLo, lowHi := stats.WilsonCI(s.LowBulkH, lowTotal, 1.96)
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6g\t%d\n",
 			s.CHROM, s.POS, s.REF, s.ALT,
 			s.HighParGT, s.LowParGT, s.HighBulkGT, s.HighBulkAD, s.LowBulkGT, s.LowBulkAD,
 			s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH,
-			s.HighSI, s.LowSI, s.DeltaSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.FisherP, s.Depth)
+			s.HighSI, highLo, highHi, s.LowSI, lowLo, lowHi,
+			s.DeltaSI, highLo-lowHi, highHi-lowLo,
+			s.Gstat, s.ED, s.LOD, s.BBLogBF, s.FisherP, s.Depth)
 	}
 	return nil
 }
@@ -1941,12 +1947,12 @@ func RunTwoBulkTwoParents(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig
 					HighSI:     math.Round(hSI*1e6) / 1e6,
 					LowSI:      math.Round(lSI*1e6) / 1e6,
 					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
-					Gstat:     math.Round(stats.GStatisticTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					ED:        math.Round(stats.EuclideanDistance4(hSI, lSI)*1e6) / 1e6,
-					LOD:       math.Round(stats.LODTwoBulk(hbL, hbH, lbL, lbH)*1e6) / 1e6,
-					BBLogBF:   math.Round(stats.BetaBinomialLogBFTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					FisherP:   stats.FisherExact2x2(hbH, hbL, lbH, lbL),
-					Depth:     minDepth,
+					Gstat:      math.Round(stats.GStatisticTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					ED:         math.Round(stats.EuclideanDistance4(hSI, lSI)*1e6) / 1e6,
+					LOD:        math.Round(stats.LODTwoBulk(hbL, hbH, lbL, lbH)*1e6) / 1e6,
+					BBLogBF:    math.Round(stats.BetaBinomialLogBFTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					FisherP:    stats.FisherExact2x2(hbH, hbL, lbH, lbL),
+					Depth:      minDepth,
 				}
 				statsChan <- s
 				rawWriteChan <- s
@@ -2229,12 +2235,12 @@ func RunTwoBulksOnly(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) {
 					HighSI:     math.Round(hSI*1e6) / 1e6,
 					LowSI:      math.Round(lSI*1e6) / 1e6,
 					DeltaSI:    math.Round((hSI-lSI)*1e6) / 1e6,
-					Gstat:     math.Round(stats.GStatisticTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					ED:        math.Round(stats.EuclideanDistance4(hSI, lSI)*1e6) / 1e6,
-					LOD:       math.Round(stats.LODTwoBulk(hbL, hbH, lbL, lbH)*1e6) / 1e6,
-					BBLogBF:   math.Round(stats.BetaBinomialLogBFTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
-					FisherP:   stats.FisherExact2x2(hbH, hbL, lbH, lbL),
-					Depth:     minDepth,
+					Gstat:      math.Round(stats.GStatisticTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					ED:         math.Round(stats.EuclideanDistance4(hSI, lSI)*1e6) / 1e6,
+					LOD:        math.Round(stats.LODTwoBulk(hbL, hbH, lbL, lbH)*1e6) / 1e6,
+					BBLogBF:    math.Round(stats.BetaBinomialLogBFTwoBulk(hbH, hbL, lbH, lbL)*1e6) / 1e6,
+					FisherP:    stats.FisherExact2x2(hbH, hbL, lbH, lbL),
+					Depth:      minDepth,
 				}
 				statsChan <- s
 				rawWriteChan <- s

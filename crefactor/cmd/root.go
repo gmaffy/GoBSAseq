@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/mrefactor/run"
-	"github.com/gmaffy/GoBSAseq/mrefactor/utils"
+	"github.com/gmaffy/GoBSAseq/crefactor/run"
+	"github.com/gmaffy/GoBSAseq/crefactor/utils"
 
 	"github.com/spf13/cobra"
 )
@@ -155,7 +155,7 @@ var rootCmd = &cobra.Command{
 			if len(parentsDepthLst) > 2 {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(parentsDepth) == 1 {
+			} else if len(parentsDepthLst) == 1 {
 				oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
 				if err != nil {
 					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")

@@ -57,7 +57,7 @@ func BetaBinomialOneBulk(alt, ref float64, nullAF float64) float64 {
 	if total == 0 {
 		return 0
 	}
-	logNull := float64(total) * (nullAF*math.Log(nullAF) + (1-nullAF)*math.Log(1-nullAF))
+	logNull := alt*math.Log(nullAF) + ref*math.Log(1-nullAF)
 	logAlt := logBeta(alt+1, ref+1) - logBeta(1, 1)
 	return (logAlt - logNull) / math.Log(10)
 }

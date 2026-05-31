@@ -11,9 +11,9 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/mrefactor/onebulk"
-	"github.com/gmaffy/GoBSAseq/mrefactor/twobulk"
-	"github.com/gmaffy/GoBSAseq/mrefactor/utils"
+	"github.com/gmaffy/GoBSAseq/crefactor/onebulk"
+	"github.com/gmaffy/GoBSAseq/crefactor/twobulk"
+	"github.com/gmaffy/GoBSAseq/crefactor/utils"
 )
 
 func openVCF(path string) (io.Reader, func(), error) {
@@ -133,9 +133,29 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	for i, _ := range sampleNames {
 		sampleNamesDic[i+1] = sampleNames[i]
 	}
+	sampleIndex := func(name string) (int, bool) {
+		for i, sampleName := range sampleNames {
+			if sampleName == name {
+				return i, true
+			}
+		}
+		return -1, false
+	}
+	resolveNamedSample := func(label, name string) (int, error) {
+		idx, ok := sampleIndex(name)
+		if !ok {
+			return -1, fmt.Errorf("%s %q is not part of the VCF sample list", label, name)
+		}
+		delete(sampleNamesDic, idx+1)
+		return idx, nil
+	}
+	parentsProvided := cfg.HighParentName != "" || cfg.LowParentName != "" || cfg.OneParentName != ""
+	bulksOnlyFromCLI := !parentsProvided && cfg.HighBulkName != "" && cfg.LowBulkName != "" && cfg.OneBulkName == ""
 
 	fmt.Printf("------------------------------------- PARENT CHOICES ----------------------------------------\n\n")
-	if cfg.HighParentName == "" && cfg.LowParentName == "" && cfg.OneParentName == "" {
+	if bulksOnlyFromCLI {
+		color.Yellow("No parent samples supplied; running in bulks-only mode from CLI bulk names.")
+	} else if cfg.HighParentName == "" && cfg.LowParentName == "" && cfg.OneParentName == "" {
 		fmt.Printf("No parent samples specified ...\n\n")
 		color.Cyan("Enter number corresponding to the sample ...\n\n")
 
@@ -224,13 +244,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 			fmt.Printf("\n-----------------------------------------------------------\nHIGH Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.HighParentName))
 
 		} else {
-
-			for k, v := range sampleNamesDic {
-				if v == cfg.HighParentName {
-					delete(sampleNamesDic, k)
-				}
-				cfg.HighParentIdx = k - 1
+			idx, err := resolveNamedSample("HIGH PARENT", cfg.HighParentName)
+			if err != nil {
+				return err
 			}
+			cfg.HighParentIdx = idx
 
 		}
 
@@ -266,13 +284,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 			cfg.LowParentIdx = lowParentChoice - 1
 			fmt.Printf("\n-----------------------------------------------------------\nLOW Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.LowParentName))
 		} else {
-
-			for k, v := range sampleNamesDic {
-				if v == cfg.LowParentName {
-					delete(sampleNamesDic, k)
-				}
-				cfg.LowParentIdx = k - 1
+			idx, err := resolveNamedSample("LOW PARENT", cfg.LowParentName)
+			if err != nil {
+				return err
 			}
+			cfg.LowParentIdx = idx
 
 		}
 
@@ -330,6 +346,40 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		}
 		cfg.LowBulkIdx = lowBulkChoice - 1
 
+	} else {
+		// CLI path. A single --bulks value is treated as a low/affected bulk
+		// for compatibility; use "--bulks HighBulk," to force high-bulk mode.
+		if cfg.OneBulkName != "" && cfg.HighBulkName == "" && cfg.LowBulkName == "" {
+			cfg.LowBulkName = cfg.OneBulkName
+			if cfg.OneBulkDepth > 0 {
+				cfg.LowBulkDepth = cfg.OneBulkDepth
+			}
+			if cfg.OneBulkSize > 0 {
+				cfg.LowBulkSize = cfg.OneBulkSize
+			}
+			color.Yellow("Single --bulks value %q treated as one-bulk LOW/affected sample.", cfg.OneBulkName)
+		}
+
+		if cfg.HighBulkName != "" {
+			idx, err := resolveNamedSample("HIGH BULK", cfg.HighBulkName)
+			if err != nil {
+				return err
+			}
+			cfg.HighBulkIdx = idx
+		}
+		if cfg.LowBulkName != "" {
+			idx, err := resolveNamedSample("LOW BULK", cfg.LowBulkName)
+			if err != nil {
+				return err
+			}
+			cfg.LowBulkIdx = idx
+		}
+		if cfg.OneBulkName != "" {
+			cfg.OneBulkIdx = cfg.LowBulkIdx
+			if cfg.HighBulkName != "" && cfg.LowBulkName == "" {
+				cfg.OneBulkIdx = cfg.HighBulkIdx
+			}
+		}
 	}
 
 	runDir, err := utils.PrepareRunDir(cfg.OutputDir)
@@ -379,6 +429,7 @@ const (
 	modeOneBulkHigh
 	modeOneBulkLow
 	modeTwoBulkTwoParents
+	modeUnsupported
 )
 
 func resolveAnalysisMode(cfg utils.AnalysisConfig, highPar, lowPar, highBulk, lowBulk int) analysisMode {
@@ -386,9 +437,13 @@ func resolveAnalysisMode(cfg utils.AnalysisConfig, highPar, lowPar, highBulk, lo
 	hasLowPar := cfg.LowParentName != "" || lowPar > 0
 	hasHighBulk := cfg.HighBulkName != "" || highBulk > 0
 	hasLowBulk := cfg.LowBulkName != "" || lowBulk > 0
+	hasOneBulk := cfg.OneBulkName != ""
 
 	if hasHighBulk && hasLowBulk && !hasHighPar && !hasLowPar {
 		return modeBulksOnly
+	}
+	if hasHighPar && hasLowPar && hasOneBulk && !hasHighBulk && !hasLowBulk {
+		return modeOneBulkLow
 	}
 	if hasHighPar && hasLowPar && hasHighBulk && !hasLowBulk {
 		return modeOneBulkHigh
@@ -409,5 +464,5 @@ func resolveAnalysisMode(cfg utils.AnalysisConfig, highPar, lowPar, highBulk, lo
 	if highBulk == 0 && highPar != 0 && lowPar != 0 {
 		return modeOneBulkLow
 	}
-	return modeTwoBulkTwoParents
+	return modeUnsupported
 }
