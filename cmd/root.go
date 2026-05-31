@@ -38,7 +38,7 @@ var rootCmd = &cobra.Command{
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
 		rep, _ := cmd.Flags().GetInt("rep")
-		alphas, _ := cmd.Flags().GetFloat64Slice("alpha")
+		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
 		minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
 		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
@@ -296,7 +296,7 @@ var rootCmd = &cobra.Command{
 			WindowSize:    winSize,
 			StepSize:      step,
 			Rep:           rep,
-			Alphas:        alphas,
+			BrmAlpha:      brmAlpha,
 			MinQTLWidth:   minQTL,
 			MergeDistance: mergeDist,
 			OutputDir:     outputDir,
@@ -329,6 +329,7 @@ var rootCmd = &cobra.Command{
 			Cds:      cds,
 			GeneDesc: geneDescriptions,
 			Prg:      prg,
+			Alphas:   []float64{brmAlpha},
 		}
 
 		err = run.Run(a_config, hfConfig)
@@ -358,7 +359,7 @@ func init() {
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
 	rootCmd.Flags().Bool("recurrent", false, "BCAltIsRecurrent: if true, alt allele is recurrent in BC")
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
-	rootCmd.Flags().Float64Slice("alpha", []float64{0.05, 0.01}, "Significance levels (comma-separated)")
+	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
 	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
 	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
 	rootCmd.Flags().StringP("out", "o", ".", "Output directory")

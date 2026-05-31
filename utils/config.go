@@ -12,7 +12,7 @@ type AnalysisConfig struct {
 	WindowSize    int
 	StepSize      int
 	Rep           int
-	Alphas        []float64
+	BrmAlpha      float64
 	MinQTLWidth   int64
 	MergeDistance int64
 	OutputDir     string
@@ -51,6 +51,7 @@ type AnalysisConfig struct {
 	Cds      string
 	GeneDesc string
 	Prg      string
+	Alphas   []float64
 }
 
 type HardFilterConfig struct {
