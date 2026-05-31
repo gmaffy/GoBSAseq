@@ -4,36 +4,30 @@ Copyright © 2026 NAME HERE mafireyi@gmail.com
 package cmd
 
 import (
-	"bufio"
-	"compress/gzip"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/run"
-	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/gmaffy/GoBSAseq/mrefactor/run"
+	"github.com/gmaffy/GoBSAseq/mrefactor/utils"
 
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "GoBSAseq [variant.vcf]",
+	Use:   "GoBSAseq",
 	Short: "Pipeline for BSAseq analysis implemented in Go",
 	Long:  `Pipeline for BSAseq analysis implemented in Go.`,
 
 	Run: func(cmd *cobra.Command, args []string) {
-		variant, _ := cmd.Flags().GetString("variant")
-		if strings.TrimSpace(variant) == "" {
-			if len(args) == 1 {
-				variant = args[0]
-			} else {
-				cmd.Help()
-				return
-			}
+		if !cmd.Flags().Changed("variant") {
+			cmd.Help()
+			return
 		}
+
+		variant, _ := cmd.Flags().GetString("variant")
 
 		parents, _ := cmd.Flags().GetString("parents")
 		bulks, _ := cmd.Flags().GetString("bulks")
@@ -44,7 +38,9 @@ var rootCmd = &cobra.Command{
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
 		rep, _ := cmd.Flags().GetInt("rep")
-		alphas, _ := cmd.Flags().GetFloat64Slice("alpha")
+		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
+		fisherAlpha, _ := cmd.Flags().GetFloat64("fisher-alpha")
+		recurrent, _ := cmd.Flags().GetBool("recurrent")
 		minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
 		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
@@ -71,19 +67,8 @@ var rootCmd = &cobra.Command{
 		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
 		prg, _ := cmd.Flags().GetString("prg")
 
-		var promptedSelections *sampleSelections
-		promptSamples := !cmd.Flags().Changed("parents") && !cmd.Flags().Changed("bulks") && strings.TrimSpace(parents) == "" && strings.TrimSpace(bulks) == ""
-		if promptSamples {
-			selections, err := promptSamplesFromVCF(variant)
-			if err != nil {
-				color.Red("%v", err)
-				return
-			}
-			promptedSelections = &selections
-		}
-
-		parentNamesLst := splitCSV(parents)
-		bulkNamesLst := splitCSV(bulks)
+		parentNamesLst := strings.Split(parents, ",")
+		bulkNamesLst := strings.Split(bulks, ",")
 		bulksDepthLst := strings.Split(bulksDepth, ",")
 		bulkSizesLst := strings.Split(bulkSizes, ",")
 		parentsDepthLst := strings.Split(parentsDepth, ",")
@@ -110,17 +95,7 @@ var rootCmd = &cobra.Command{
 		var err error
 
 		// ========================================== Get parents =================================================== //
-		if promptedSelections != nil {
-			highParentName = promptedSelections.HighParent
-			lowParentName = promptedSelections.LowParent
-			if highParentName != "" && lowParentName == "" {
-				oneParentName = highParentName
-				highParentName = ""
-			} else if lowParentName != "" && highParentName == "" {
-				oneParentName = lowParentName
-				lowParentName = ""
-			}
-		} else if len(parentNamesLst) > 0 {
+		if len(parentNamesLst) > 0 {
 			if len(parentNamesLst) > 2 {
 				color.Red("parents is supposed to be in the form a,b (where a and b are integers)")
 				return
@@ -135,17 +110,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		// ========================================== Get Bulk Names =============================================== //
-		if promptedSelections != nil {
-			highBulkName = promptedSelections.HighBulk
-			lowBulkName = promptedSelections.LowBulk
-			if highBulkName != "" && lowBulkName == "" {
-				oneBulkName = highBulkName
-				highBulkName = ""
-			} else if lowBulkName != "" && highBulkName == "" {
-				oneBulkName = lowBulkName
-				lowBulkName = ""
-			}
-		} else if len(bulkNamesLst) > 0 {
+		if len(bulkNamesLst) > 0 {
 			if len(bulkNamesLst) > 2 {
 				color.Red("bulks is supposed to be in the form a,b (where a and b are integers)")
 				return
@@ -190,7 +155,7 @@ var rootCmd = &cobra.Command{
 			if len(parentsDepthLst) > 2 {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(parentsDepthLst) == 1 {
+			} else if len(parentsDepth) == 1 {
 				oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
 				if err != nil {
 					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
@@ -328,15 +293,17 @@ var rootCmd = &cobra.Command{
 		}
 
 		a_config := utils.AnalysisConfig{
-			VCF:           variant,
-			Population:    population,
-			WindowSize:    winSize,
-			StepSize:      step,
-			Rep:           rep,
-			Alphas:        alphas,
-			MinQTLWidth:   minQTL,
-			MergeDistance: mergeDist,
-			OutputDir:     outputDir,
+			VCF:              variant,
+			Population:       population,
+			BCAltIsRecurrent: recurrent,
+			WindowSize:       winSize,
+			StepSize:         step,
+			Rep:              rep,
+			BrmAlpha:         brmAlpha,
+			FisherAlpha:      fisherAlpha,
+			MinQTLWidth:      minQTL,
+			MergeDistance:    mergeDist,
+			OutputDir:        outputDir,
 			//HighParentIdx:    -1,
 			HighParentName:  highParentName,
 			HighParentDepth: highParentDepth,
@@ -366,6 +333,7 @@ var rootCmd = &cobra.Command{
 			Cds:      cds,
 			GeneDesc: geneDescriptions,
 			Prg:      prg,
+			Alphas:   []float64{brmAlpha},
 		}
 
 		err = run.Run(a_config, hfConfig)
@@ -383,153 +351,6 @@ func Execute() {
 	}
 }
 
-type sampleSelections struct {
-	HighParent string
-	LowParent  string
-	HighBulk   string
-	LowBulk    string
-}
-
-func splitCSV(raw string) []string {
-	var out []string
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" || strings.EqualFold(part, "none") {
-			continue
-		}
-		out = append(out, part)
-	}
-	return out
-}
-
-func promptSamplesFromVCF(vcf string) (sampleSelections, error) {
-	samples, err := readVCFSamples(vcf)
-	if err != nil {
-		return sampleSelections{}, err
-	}
-	if len(samples) == 0 {
-		return sampleSelections{}, fmt.Errorf("no VCF samples found in header")
-	}
-
-	color.Cyan("No parents or bulks were passed. Select samples from the VCF header.")
-	reader := bufio.NewReader(os.Stdin)
-	var s sampleSelections
-	used := map[string]string{}
-	if s.HighParent, err = promptSample(reader, samples, "resistant/high parent", used); err != nil {
-		return sampleSelections{}, err
-	}
-	if s.LowParent, err = promptSample(reader, samples, "susceptible/low parent", used); err != nil {
-		return sampleSelections{}, err
-	}
-	if s.HighBulk, err = promptSample(reader, samples, "high bulk", used); err != nil {
-		return sampleSelections{}, err
-	}
-	if s.LowBulk, err = promptSample(reader, samples, "low bulk", used); err != nil {
-		return sampleSelections{}, err
-	}
-	if s.HighBulk == "" && s.LowBulk == "" {
-		return sampleSelections{}, fmt.Errorf("at least one bulk sample is required")
-	}
-	return s, nil
-}
-
-func promptSample(reader *bufio.Reader, samples []string, role string, used map[string]string) (string, error) {
-	for {
-		color.White("")
-		color.White("Select %s:", role)
-		color.White("  0) None")
-		for i, sample := range samples {
-			if prevRole, ok := used[sample]; ok {
-				color.White("  %d) %s (already selected as %s)", i+1, sample, prevRole)
-			} else {
-				color.White("  %d) %s", i+1, sample)
-			}
-		}
-		color.White("Enter number or sample name: ")
-		raw, err := reader.ReadString('\n')
-		if err != nil && err != io.EOF {
-			return "", err
-		}
-		answer := strings.TrimSpace(raw)
-		if answer == "" || strings.EqualFold(answer, "none") || answer == "0" {
-			return "", nil
-		}
-		if idx, err := strconv.Atoi(answer); err == nil {
-			if idx < 0 || idx > len(samples) {
-				color.Red("Please choose a number between 0 and %d", len(samples))
-				continue
-			}
-			if idx == 0 {
-				return "", nil
-			}
-			answer = samples[idx-1]
-		}
-		if !containsSample(samples, answer) {
-			color.Red("Sample %q is not present in the VCF header", answer)
-			continue
-		}
-		if prevRole, ok := used[answer]; ok {
-			color.Red("Sample %q is already selected as %s", answer, prevRole)
-			continue
-		}
-		used[answer] = role
-		return answer, nil
-	}
-}
-
-func containsSample(samples []string, sample string) bool {
-	for _, item := range samples {
-		if item == sample {
-			return true
-		}
-	}
-	return false
-}
-
-func readVCFSamples(path string) ([]string, error) {
-	r, closeFn, err := openVCFHeaderReader(path)
-	if err != nil {
-		return nil, err
-	}
-	defer closeFn()
-
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.HasPrefix(line, "#CHROM") {
-			fields := strings.Split(line, "\t")
-			if len(fields) <= 9 {
-				return nil, nil
-			}
-			return fields[9:], nil
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return nil, fmt.Errorf("VCF header line beginning with #CHROM was not found")
-}
-
-func openVCFHeaderReader(path string) (io.Reader, func(), error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, func() {}, err
-	}
-	if strings.HasSuffix(strings.ToLower(path), ".gz") {
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			_ = f.Close()
-			return nil, func() {}, err
-		}
-		return gz, func() {
-			_ = gz.Close()
-			_ = f.Close()
-		}, nil
-	}
-	return f, func() { _ = f.Close() }, nil
-}
-
 func init() {
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
 	rootCmd.Flags().StringP("parents", "P", "", "parent names")
@@ -542,7 +363,8 @@ func init() {
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
 	rootCmd.Flags().Bool("recurrent", false, "BCAltIsRecurrent: if true, alt allele is recurrent in BC")
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
-	rootCmd.Flags().Float64Slice("alpha", []float64{0.05, 0.01}, "Significance levels (comma-separated)")
+	rootCmd.Flags().Float64("brm-alpha", 0.05, "BRM significance level")
+	rootCmd.Flags().Float64("fisher-alpha", 0.05, "Fisher exact p-value threshold for significant-SNP windows (PyBSASeq-style)")
 	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
 	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
 	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
