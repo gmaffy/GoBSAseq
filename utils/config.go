@@ -20,6 +20,21 @@ type HardFilterConfig struct {
 type AnalysisConfig struct {
 	VCF string
 	Rdr *vcfgo.Reader
+
+	HigParFwdReads   string
+	HighParRevReads  string
+	LowParFwdReads   string
+	LowParRevReads   string
+	HighBulkFwdReads string
+	HighBulkRevReads string
+	LowBulkFwdReads  string
+	LowBulkRevReads  string
+	
+	HighParBam  string
+	LowParBam   string
+	HighBulkBam string
+	LowBulkBam  string
+
 	// Parameters for the analysis
 	Population    string
 	WindowSize    int

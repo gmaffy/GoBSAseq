@@ -61,145 +61,116 @@ var rootCmd = &cobra.Command{
 		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
 		prg, _ := cmd.Flags().GetString("prg")
 
-		splitArg := func(s string) []string {
-			if strings.TrimSpace(s) == "" {
-				return []string{}
-			}
-			return strings.Split(s, ",")
-		}
-		parentNamesLst := splitArg(parents)
-		bulkNamesLst := splitArg(bulks)
-		bulksDepthLst := splitArg(bulksDepth)
-		bulkSizesLst := splitArg(bulkSizes)
-		parentsDepthLst := splitArg(parentsDepth)
+		//splitArg := func(s string) []string {
+		//	if strings.TrimSpace(s) == "" {
+		//		return []string{}
+		//	}
+		//	return strings.Split(s, ",")
+		//}
+		parentNamesLst := strings.Split(parents, ",")
+		bulkNamesLst := strings.Split(bulks, ",")           //splitArg(bulks)
+		bulksDepthLst := strings.Split(bulksDepth, ",")     //splitArg(bulksDepth)
+		bulkSizesLst := strings.Split(bulkSizes, ",")       //splitArg(bulkSizes)
+		parentsDepthLst := strings.Split(parentsDepth, ",") //splitArg(parentsDepth)
 
 		highParentName := ""
 		lowParentName := ""
-		oneParentName := ""
 
 		highBulkName := ""
 		lowBulkName := ""
-		oneBulkName := ""
 
 		highBulkDepth := 0
 		lowBulkDepth := 0
-		oneBulkDepth := 0
+
 		highParentDepth := 0
 		lowParentDepth := 0
-		oneParentDepth := 0
+
 		highBulkSize := 0
 		lowBulkSize := 0
-		oneBulkSize := 0
+
 		winSize := 0
 
 		var err error
 
 		// ========================================== Get parents =================================================== //
 		if len(parentNamesLst) > 0 {
-			if len(parentNamesLst) > 2 {
-				color.Red("parents is supposed to be in the form a,b (where a and b are integers)")
+			if len(parentNamesLst) != 2 {
+				color.Red("parents is supposed to be in the form a,b (where a and b are parent names)")
 				return
-			} else if len(parentNamesLst) == 1 {
-				oneParentName = parentNamesLst[0]
-
-			} else {
-				highParentName = parentNamesLst[0]
-				lowParentName = parentNamesLst[1]
 			}
+
+			highParentName = parentNamesLst[0]
+			lowParentName = parentNamesLst[1]
 
 		}
 
 		// ========================================== Get Bulk Names =============================================== //
 		if len(bulkNamesLst) > 0 {
-			if len(bulkNamesLst) > 2 {
-				color.Red("bulks is supposed to be in the form a,b (where a and b are integers)")
+			if len(bulkNamesLst) != 2 {
+				color.Red("bulks is supposed to be in the form a,b (where a and b are bulk names)")
 				return
-			} else if len(bulkNamesLst) == 1 {
-				oneBulkName = bulkNamesLst[0]
-
-			} else {
-				highBulkName = bulkNamesLst[0]
-				lowBulkName = bulkNamesLst[1]
 			}
+			highBulkName = bulkNamesLst[0]
+			lowBulkName = bulkNamesLst[1]
+
 		}
 
 		// ========================================== Get bulk depths =============================================== //
 		if len(bulksDepth) > 0 {
-			if len(bulksDepthLst) > 2 {
+			if len(bulksDepthLst) != 2 {
 				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(bulksDepthLst) == 1 {
-				oneBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
-				if err != nil {
-					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
+			}
 
-			} else {
-				highBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
-				if err != nil {
-					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
-				lowBulkDepth, err = strconv.Atoi(bulksDepthLst[1])
-				if err != nil {
-					color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
+			highBulkDepth, err = strconv.Atoi(bulksDepthLst[0])
+			if err != nil {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowBulkDepth, err = strconv.Atoi(bulksDepthLst[1])
+			if err != nil {
+				color.Red("bulksDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
 			}
 		}
 
 		// =========================================== Get Parent Depths============================================= //
 
 		if len(parentsDepthLst) > 0 {
-			if len(parentsDepthLst) > 2 {
+			if len(parentsDepthLst) != 2 {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(parentsDepthLst) == 1 {
-				oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
-				if err != nil {
-					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
-			} else {
-				highParentDepth, err = strconv.Atoi(parentsDepthLst[0])
-				if err != nil {
-					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
-				lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
-				if err != nil {
-					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
-				}
+			}
 
+			highParentDepth, err = strconv.Atoi(parentsDepthLst[0])
+			if err != nil {
+				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
+			if err != nil {
+				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 			}
 
 		}
 
 		// ========================================== Get Bulk Sizes ================================================ //
 		if len(bulkSizesLst) > 0 {
-			if len(bulkSizesLst) > 2 {
+			if len(bulkSizesLst) != 2 {
 				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(bulkSizesLst) == 1 {
-				oneBulkSize, err = strconv.Atoi(bulkSizesLst[0])
-				if err != nil {
-					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
-
-			} else {
-				highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
-				if err != nil {
-					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
-				lowBulkSize, err = strconv.Atoi(bulkSizesLst[1])
-				if err != nil {
-					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
-					return
-				}
 			}
+			highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+			if err != nil {
+				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+			lowBulkSize, err = strconv.Atoi(bulkSizesLst[1])
+			if err != nil {
+				color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+				return
+			}
+
 		}
 
 		// ============================================== window size ================================================//
@@ -306,27 +277,20 @@ var rootCmd = &cobra.Command{
 			MinQTLWidth:   minQTL,
 			MergeDistance: mergeDist,
 			OutputDir:     outputDir,
-			//HighParentIdx:    -1,
+
 			HighParentName:  highParentName,
 			HighParentDepth: highParentDepth,
-			//LowParentIdx:    -1,
+
 			LowParentName:  lowParentName,
 			LowParentDepth: lowParentDepth,
-			//OneParentIdx:    -1,
-			OneParentName:  oneParentName,
-			OneParentDepth: oneParentDepth,
-			//HighBulkIdx:    -1,
+
 			HighBulkName:  highBulkName,
 			HighBulkDepth: highBulkDepth,
 			HighBulkSize:  highBulkSize,
-			//LowBulkIdx:    -1,
+
 			LowBulkName:  lowBulkName,
 			LowBulkDepth: lowBulkDepth,
 			LowBulkSize:  lowBulkSize,
-			//OneBulkIdx:    -1,
-			OneBulkName:  oneBulkName,
-			OneBulkDepth: oneBulkDepth,
-			OneBulkSize:  oneBulkSize,
 
 			SnpEffDB: snpEffDB,
 			Ref:      ref,
@@ -357,8 +321,8 @@ func Execute() {
 func init() {
 	// ---------------------------------------- Input files ----------------------------------------------------- //
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
-	rootCmd.Flags().StringP("parents", "P", "", "parent names")
-	rootCmd.Flags().StringP("bulks", "B", "", "bulk names")
+	rootCmd.Flags().StringP("parents", "P", ",", "parent names (comma separated)")
+	rootCmd.Flags().StringP("bulks", "B", ",", "bulk names (comma seperated)")
 	rootCmd.Flags().String("parents-bams", ",", "parent bam files (comma separated)")
 	rootCmd.Flags().String("bulks-bams", ",", "bulk bam files (comma separated)")
 
