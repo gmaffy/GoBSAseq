@@ -173,7 +173,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		cfg.LowParentIdx = lowParentChoice - 1
 		fmt.Printf("\n-----------------------------------------------------------\nLOW Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.LowParentName))
 
-		// ============================= PARENTS ARGUMENTS PASSED ======================================================= //
+		// ============================= PARENTS ARGUMENTS PASSED ===================================================== //
 	} else if cfg.HighParentName != "" && cfg.LowParentName != "" {
 		fmt.Printf("HIGH parent is: %s \n\n", cfg.HighParentName)
 		fmt.Printf("LOW parent is: %s \n\n", cfg.LowParentName)
@@ -263,7 +263,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	fmt.Printf("\n====================================================================================================================================\n\n")
 	fmt.Printf("------------------------------------- BULK CHOICES ----------------------------------------\n\n")
 
-	if cfg.HighBulkName == "" && cfg.LowBulkName == ""{
+	if cfg.HighBulkName == "" && cfg.LowBulkName == "" {
 		color.Cyan("Choose the number corresponding to the appropriate HIGH BULK")
 		keys := slices.Sorted(maps.Keys(sampleNamesDic))
 		for _, i := range keys {
