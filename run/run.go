@@ -11,8 +11,6 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
-	"github.com/gmaffy/GoBSAseq/oneBulk"
-	"github.com/gmaffy/GoBSAseq/twobulk"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
@@ -44,7 +42,7 @@ func openVCF(path string) (io.Reader, func(), error) {
 	return f, cleanup, nil
 }
 
-func missingGeneSpaceParams(cfg utils.AnalysisConfig) []string {
+func missingGeneSpaceParams(cfg *utils.AnalysisConfig) []string {
 	var missing []string
 	if cfg.SnpEffDB == "" {
 		missing = append(missing, "SnpEffDB")
@@ -61,44 +59,25 @@ func missingGeneSpaceParams(cfg utils.AnalysisConfig) []string {
 	return missing
 }
 
-func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf string, highParentDepth int, lowParentDepth int, oneParentDepth int, highBulkDepth int, lowBulkDepth int, oneBulkDepth int, highBulkSize int, lowBulkSize int, oneBulkSize int, windowSize int, population string, recurrent bool, rep int, alpha float64, minQTL int64, mergeDist int64, outputDir string) error {
+func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
+	fmt.Printf("VCF: %s\n", cfg.VCF)
+	fmt.Printf("High bulk name: %s\n", cfg.HighBulkName)
 	bold := color.New(color.Bold).SprintFunc()
 	color.Cyan("=============================== Checking parameters =====================================================\n")
-
-	fmt.Printf("VCF: %s\n", cfg.VCF)
-	fmt.Printf("Min High Parent Depth: %d\n", cfg.HighParentDepth)
-	fmt.Printf("Min Low Parent Depth: %d\n", cfg.LowParentDepth)
-	fmt.Printf("One Min Parent Depth: %d\n", cfg.OneParentDepth)
-	fmt.Printf("High Bulk Depth: %d\n", cfg.HighBulkDepth)
-	fmt.Printf("Low Bulk Depth: %d\n", cfg.LowBulkDepth)
-	fmt.Printf("One Bulk Depth: %d\n", cfg.OneBulkDepth)
-	fmt.Printf("High Bulk Size: %d\n", cfg.HighBulkSize)
-	fmt.Printf("Low Bulk Size: %d\n", cfg.LowBulkSize)
-	fmt.Printf("One Bulk Size: %d\n", cfg.OneBulkSize)
-	fmt.Printf("Window Size: %d\n", cfg.WindowSize)
-	fmt.Printf("Step Size: %d\n", cfg.StepSize)
-	fmt.Printf("Population: %s\n", cfg.Population)
-	//fmt.Printf("Recurrent: %v\n")
-	fmt.Printf("Simulations: %d\n", cfg.Rep)
-	fmt.Printf("Alphas: %v\n", cfg.Alphas)
-	fmt.Printf("Min QTL Length: %d\n", cfg.MinQTLWidth)
-	fmt.Printf("Merge Distance: %d\n", cfg.MergeDistance)
-	fmt.Printf("Output Dir: %s\n", cfg.OutputDir)
 
 	if !strings.HasSuffix(cfg.VCF, ".vcf.gz") && !strings.HasSuffix(cfg.VCF, ".vcf") {
 		color.Red("VCF file must be a .vcf or .vcf.gz file")
 		return fmt.Errorf("VCF file must be a .vcf or .vcf.gz file")
 	}
-
 	f, cleanup, err := openVCF(cfg.VCF)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed to open VCF '%s': %w", cfg.VCF, err)
 	}
 	defer cleanup()
 
 	rdr, err := vcfgo.NewReader(f, false)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("failed to create vcf reader: %w", err)
 	}
 
 	cfg.Rdr = rdr
@@ -128,6 +107,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	color.Cyan("\n========================================== SAMPLE SELECTION =================================================\n\n")
 	fmt.Printf("Here are the samples found in your VCF file ...\n\n")
 	sampleNames := rdr.Header.SampleNames
+	fmt.Println(sampleNames)
 	sampleNamesDic := make(map[int]string)
 	sampleNamesDic[0] = "None"
 	for i, _ := range sampleNames {
@@ -227,9 +207,10 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 
 			for k, v := range sampleNamesDic {
 				if v == cfg.HighParentName {
+					cfg.HighParentIdx = k - 1
 					delete(sampleNamesDic, k)
+					break
 				}
-				cfg.HighParentIdx = k - 1
 			}
 
 		}
@@ -269,9 +250,10 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 
 			for k, v := range sampleNamesDic {
 				if v == cfg.LowParentName {
+					cfg.LowParentIdx = k - 1
 					delete(sampleNamesDic, k)
+					break
 				}
-				cfg.LowParentIdx = k - 1
 			}
 
 		}
@@ -281,7 +263,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 	fmt.Printf("\n====================================================================================================================================\n\n")
 	fmt.Printf("------------------------------------- BULK CHOICES ----------------------------------------\n\n")
 
-	if cfg.HighBulkName == "" && cfg.LowBulkName == "" && cfg.OneBulkName == "" {
+	if cfg.HighBulkName == "" && cfg.LowBulkName == ""{
 		color.Cyan("Choose the number corresponding to the appropriate HIGH BULK")
 		keys := slices.Sorted(maps.Keys(sampleNamesDic))
 		for _, i := range keys {
@@ -332,6 +314,71 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 
 	}
 
+	// If bulks were provided via flags, resolve their indices
+	if cfg.HighBulkName != "" && cfg.LowBulkName != "" {
+		// Resolve HIGH bulk index
+		if slices.Contains(sampleNames, cfg.HighBulkName) {
+			for k, v := range sampleNamesDic {
+				if v == cfg.HighBulkName {
+					cfg.HighBulkIdx = k - 1
+					delete(sampleNamesDic, k)
+					break
+				}
+			}
+		} else {
+			color.Yellow(" HIGH BULK %s is not part of the VCF sample list\n", cfg.HighBulkName)
+			color.Cyan("Choose the number corresponding to the appropriate HIGH BULK")
+			keys := slices.Sorted(maps.Keys(sampleNamesDic))
+			for _, i := range keys {
+				fmt.Printf("%v : %v\n", i, sampleNamesDic[i])
+			}
+			_, highBulkErr := fmt.Scan(&highBulkChoice)
+			if highBulkErr != nil {
+				return fmt.Errorf("HIGH BULK number should be numerical and part of the list above: %w", highBulkErr)
+			}
+			if !slices.Contains(keys, highBulkChoice) {
+				color.Red("The selected number is not in the list.")
+				return fmt.Errorf("invalid input")
+			}
+			cfg.HighBulkName = sampleNamesDic[highBulkChoice]
+			if highBulkChoice != 0 {
+				delete(sampleNamesDic, highBulkChoice)
+			}
+			cfg.HighBulkIdx = highBulkChoice - 1
+		}
+
+		// Resolve LOW bulk index
+		if slices.Contains(sampleNames, cfg.LowBulkName) {
+			for k, v := range sampleNamesDic {
+				if v == cfg.LowBulkName {
+					cfg.LowBulkIdx = k - 1
+					delete(sampleNamesDic, k)
+					break
+				}
+			}
+		} else {
+			color.Yellow(" LOW BULK %s is not part of the VCF sample list\n", cfg.LowBulkName)
+			color.Cyan("Choose the number corresponding to the appropriate LOW BULK")
+			keys := slices.Sorted(maps.Keys(sampleNamesDic))
+			for _, i := range keys {
+				fmt.Printf("%v : %v\n", i, sampleNamesDic[i])
+			}
+			_, lowBulkErr := fmt.Scan(&lowBulkChoice)
+			if lowBulkErr != nil {
+				return fmt.Errorf("LOW BULK number should be numerical and part of the list above: %w", lowBulkErr)
+			}
+			if !slices.Contains(keys, lowBulkChoice) {
+				color.Red("The selected number is not in the list.")
+				return fmt.Errorf("invalid input")
+			}
+			cfg.LowBulkName = sampleNamesDic[lowBulkChoice]
+			if lowBulkChoice != 0 {
+				delete(sampleNamesDic, lowBulkChoice)
+			}
+			cfg.LowBulkIdx = lowBulkChoice - 1
+		}
+	}
+
 	// Ensure output directory exists
 
 	if cfg.OutputDir != "." {
@@ -345,7 +392,7 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulksOnly(cfg, hfCfg)
+		//twobulk.RunTwoBulksOnly(cfg, hfCfg)
 	} else if lowBulkChoice == 0 && highBulkChoice != 0 && lowParentChoice != 0 && highParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (HIGH bulk)...")
 		//err = oneBulk.RunTwoParentsHighBulk(cfg, hfCfg)
@@ -355,11 +402,11 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		//}
 	} else if highBulkChoice == 0 && highParentChoice != 0 && lowParentChoice != 0 {
 		fmt.Println("Working with one bulk BSAseq (LOW bulk)")
-		err = oneBulk.RunTwoParentsLowBulk(cfg, hfCfg)
-		if err != nil {
-			color.Red("Error running one bulk analysis: %s", err)
-			return err
-		}
+		//err = oneBulk.RunTwoParentsLowBulk(cfg, hfCfg)
+		//if err != nil {
+		//	color.Red("Error running one bulk analysis: %s", err)
+		//	return err
+		//}
 	} else {
 		fmt.Println("Working with two bulks")
 		color.Green("=================================== Running Two Bulk Analysis =============================================\n\n")
@@ -368,8 +415,9 @@ func Run(cfg utils.AnalysisConfig, hfCfg utils.HardFilterConfig) error { //, vcf
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
 		fmt.Printf("Low Bulk: %s, Index: %v\n", cfg.LowBulkName, cfg.LowBulkIdx)
 
-		twobulk.RunTwoBulkTwoParents(cfg, hfCfg)
+		//twobulk.RunTwoBulkTwoParents(cfg, hfCfg)
 
 	}
+
 	return nil
 }

@@ -1,5 +1,5 @@
 /*
-Copyright © 2026 NAME HERE mafireyi@gmail.com
+Copyright © 2026 NAME HERE <EMAIL ADDRESS>
 */
 package cmd
 
@@ -12,21 +12,17 @@ import (
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/run"
 	"github.com/gmaffy/GoBSAseq/utils"
-
 	"github.com/spf13/cobra"
 )
 
+// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "GoBSAseq",
 	Short: "Pipeline for BSAseq analysis implemented in Go",
 	Long:  `Pipeline for BSAseq analysis implemented in Go.`,
-
+	// Uncomment the following line if your bare application
+	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
-		if !cmd.Flags().Changed("variant") {
-			cmd.Help()
-			return
-		}
-
 		variant, _ := cmd.Flags().GetString("variant")
 
 		parents, _ := cmd.Flags().GetString("parents")
@@ -65,11 +61,17 @@ var rootCmd = &cobra.Command{
 		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
 		prg, _ := cmd.Flags().GetString("prg")
 
-		parentNamesLst := strings.Split(parents, ",")
-		bulkNamesLst := strings.Split(bulks, ",")
-		bulksDepthLst := strings.Split(bulksDepth, ",")
-		bulkSizesLst := strings.Split(bulkSizes, ",")
-		parentsDepthLst := strings.Split(parentsDepth, ",")
+		splitArg := func(s string) []string {
+			if strings.TrimSpace(s) == "" {
+				return []string{}
+			}
+			return strings.Split(s, ",")
+		}
+		parentNamesLst := splitArg(parents)
+		bulkNamesLst := splitArg(bulks)
+		bulksDepthLst := splitArg(bulksDepth)
+		bulkSizesLst := splitArg(bulkSizes)
+		parentsDepthLst := splitArg(parentsDepth)
 
 		highParentName := ""
 		lowParentName := ""
@@ -153,7 +155,7 @@ var rootCmd = &cobra.Command{
 			if len(parentsDepthLst) > 2 {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
 				return
-			} else if len(parentsDepth) == 1 {
+			} else if len(parentsDepthLst) == 1 {
 				oneParentDepth, err = strconv.Atoi(parentsDepthLst[0])
 				if err != nil {
 					color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
@@ -181,6 +183,10 @@ var rootCmd = &cobra.Command{
 				return
 			} else if len(bulkSizesLst) == 1 {
 				oneBulkSize, err = strconv.Atoi(bulkSizesLst[0])
+				if err != nil {
+					color.Red("bulkSizes is supposed to be in the form a,b (where a and b are integers)")
+					return
+				}
 
 			} else {
 				highBulkSize, err = strconv.Atoi(bulkSizesLst[0])
@@ -329,17 +335,18 @@ var rootCmd = &cobra.Command{
 			Cds:      cds,
 			GeneDesc: geneDescriptions,
 			Prg:      prg,
-			Alphas:   []float64{brmAlpha},
 		}
 
-		err = run.Run(a_config, hfConfig)
+		err = run.Run(&a_config, hfConfig)
 		if err != nil {
 			return
 		}
-		//fmt.Printf("variant: %s\n", variant)
+
 	},
 }
 
+// Execute adds all child commands to the root command and sets flags appropriately.
+// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
@@ -348,22 +355,29 @@ func Execute() {
 }
 
 func init() {
+	// ---------------------------------------- Input files ----------------------------------------------------- //
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
 	rootCmd.Flags().StringP("parents", "P", "", "parent names")
 	rootCmd.Flags().StringP("bulks", "B", "", "bulk names")
+	rootCmd.Flags().String("parents-bams", ",", "parent bam files (comma separated)")
+	rootCmd.Flags().String("bulks-bams", ",", "bulk bam files (comma separated)")
+
+	// ================================================ Parameters ================================================== //
+	// -------------------------------------------------- Inputs ---------------------------------------------------- //
 	rootCmd.Flags().StringP("parents-depth", "p", "5,5", "Parents Min Depth")
 	rootCmd.Flags().StringP("bulks-depth", "b", "40,40", "Low Parent Min Depth")
 	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "High Bulk Min Depth")
+
+	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
 	rootCmd.Flags().Int64P("step-size", "s", 100000, "Step Size")
-	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
-	rootCmd.Flags().Bool("recurrent", false, "BCAltIsRecurrent: if true, alt allele is recurrent in BC")
-	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
-	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
-	rootCmd.Flags().Int64("min-qtl-length", 100000, "Minimum QTL length")
-	rootCmd.Flags().Int64("merge-distance", 500000, "Merge distance for QTLs")
-	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
 
+	// ------------------------------------------------- Threshold -------------------------------------------------- //
+	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
+	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
+	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
+
+	// ----------------------------------------------- Filtering ---------------------------------------------------- //
 	rootCmd.Flags().Float64("min-QD-SNP", 2.0, "QualByDepth SNPs") // SNP_QD_Min             float64 // default 2.0   – QualByDepth
 	rootCmd.Flags().Float64("min-QUAL-SNP", 30.0, "Variant quality SNPs")
 	rootCmd.Flags().Float64("min-SOR-SNP", 3.0, "StrandOddsRatio SNPs")
@@ -378,6 +392,8 @@ func init() {
 	rootCmd.Flags().Float64("min-ReadPosRankSum-INDEL", -20.0, "ReadPosRank INDELs") //INDEL_ReadPosRankSum_Min float64 // default -20.0 – ReadPosRankSumTest
 	rootCmd.Flags().Float64("max-SOR-INDEL", 10.0, "StrandOddsRatio INDELs")
 
+	// ------------------------------------- Gene space analysis --------------------------------------------------- //
+
 	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
 	rootCmd.Flags().String("gff", "", "gff3 file path")
 	rootCmd.Flags().String("cds", "", "cds file path")
@@ -385,5 +401,8 @@ func init() {
 	rootCmd.Flags().String("protein", "", "protein fasta path")
 	rootCmd.Flags().String("gene-descriptions", "", "gene descriptions file path")
 	rootCmd.Flags().String("prg", "", "prg blast file path ")
+
+	// ------------------------------------------- OutDir ----------------------------------------------------------- //
+	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
 
 }

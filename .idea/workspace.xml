@@ -4,15 +4,72 @@
     <option name="autoReloadType" value="ALL" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="bcea0cf6-0eba-4e35-925f-cc69b5ae3cc3" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.antigravitycli/eff33162-fbc2-4bfd-97ff-76b1f4d95233.json" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/go.imports.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/old.zip" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/output.vcf" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/snpEff_genes.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/snpEff_summary.html" beforeDir="false" />
+    <list default="true" id="5e2b679d-da18-491c-a5c6-def3748adb0a" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/cmd/root.go" beforeDir="false" afterPath="$PROJECT_DIR$/cmd/root.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/IMPLEMENTATION.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/README.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/cmd/root.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/go.mod" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/go.sum" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/main.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/onebulk/pipeline.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/run/run.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/run/run_test.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/snpEff_genes.txt" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/snpEff_summary.html" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/confidence.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/confidence_test.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/fisher.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/onebulk.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/onebulk_test.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/stats/twobulk.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/twobulk/pipeline.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/utils/config.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/utils/filters.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/utils/output.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/utils/utils.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/crefactor/utils/utils_test.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.cursor" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.gem" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.mine" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.working.27.05" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk_plot.go.cursor" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk_plotting.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/plotting.ipynb" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/run.go" beforeDir="false" afterPath="$PROJECT_DIR$/run/run.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/work/run.go.huh" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/work/run.go.old" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/work/run.go.survey" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/twoBulk.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/plotting.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/plotting.go.working" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/thresholds.go.works_5_thresh" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.123" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.15.05.PERECT" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.3" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.CURRENT" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.copil" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.goat" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.thresh1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.tt" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.unclean_great" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.working" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.works.no_thresh" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.works_5_thresh" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulks.go.2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/config.go" beforeDir="false" afterPath="$PROJECT_DIR$/utils/config.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/filters.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/utils.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/work/hardFilter.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/work/hard_filter_vcf.go.1" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/work/hard_filter_vcf.go.16.05" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/utils/work/utils.go" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -20,10 +77,17 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="62" />
+    <option name="cachedIndexableFilesCount" value="14" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
-  <component name="GOROOT" url="file://$USER_HOME$/sdk/go1.26.2" />
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Go File" />
+      </list>
+    </option>
+  </component>
+  <component name="GOROOT" url="file://$USER_HOME$/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.3.windows-amd64" />
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
@@ -31,38 +95,110 @@
     <commands />
     <urls />
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "customColor": "",
-  "associatedIndex": 0
-}]]></component>
-  <component name="ProjectId" id="3EB5JZZeltW3J5Ro51MqJf1MgJA" />
+  <component name="NextEditCompletionFeaturesState">
+    <decayedCancelled>
+      <entry key="MS100" value="1.0157678137067707" />
+      <entry key="MS500" value="2.054461081394475" />
+      <entry key="S2" value="4.787759177826011" />
+      <entry key="S5" value="6.3990029014868215" />
+      <entry key="S10" value="7.133116374596898" />
+      <entry key="S30" value="7.694711384426827" />
+      <entry key="S60" value="7.845207270937689" />
+      <entry key="M2" value="7.922059387735455" />
+      <entry key="M5" value="8.026426994782305" />
+      <entry key="M10" value="10.03774530093755" />
+      <entry key="M15" value="14.76018882829524" />
+      <entry key="M30" value="31.106726305003257" />
+      <entry key="H1" value="55.56212954625943" />
+      <entry key="H2" value="84.25490894212528" />
+      <entry key="H4" value="109.92793025471774" />
+      <entry key="D1" value="142.6551347497801" />
+      <entry key="W1" value="149.7635986162182" />
+    </decayedCancelled>
+    <decayedSelected>
+      <entry key="MS100" value="0.0" />
+      <entry key="MS500" value="0.0" />
+      <entry key="S2" value="0.0" />
+      <entry key="S5" value="2.294874318045699E-218" />
+      <entry key="S10" value="2.5974577368142845E-109" />
+      <entry key="S30" value="1.3240706233829979E-36" />
+      <entry key="S60" value="1.9924458614404687E-18" />
+      <entry key="M2" value="2.4446760727316183E-9" />
+      <entry key="M5" value="6.943101347859202E-4" />
+      <entry key="M10" value="0.04566258410660101" />
+      <entry key="M15" value="0.18568243373886434" />
+      <entry key="M30" value="0.8379571209310298" />
+      <entry key="H1" value="2.246671093809993" />
+      <entry key="H2" value="4.242574417163276" />
+      <entry key="H4" value="6.091387666421496" />
+      <entry key="D1" value="8.417071755311705" />
+      <entry key="W1" value="8.913913184792888" />
+    </decayedSelected>
+    <decayedShown>
+      <entry key="MS100" value="0.9878856522692913" />
+      <entry key="MS500" value="2.041283597058523" />
+      <entry key="S2" value="4.777092968285001" />
+      <entry key="S5" value="6.392577719121984" />
+      <entry key="S10" value="7.129382834953388" />
+      <entry key="S30" value="7.693330796773679" />
+      <entry key="S60" value="7.8444985297902505" />
+      <entry key="M2" value="7.921700292775495" />
+      <entry key="M5" value="8.026971412500492" />
+      <entry key="M10" value="10.08320251177001" />
+      <entry key="M15" value="14.94547774085076" />
+      <entry key="M30" value="31.94373781458744" />
+      <entry key="H1" value="57.80702426392643" />
+      <entry key="H2" value="88.49538347476874" />
+      <entry key="H4" value="116.01763249106428" />
+      <entry key="D1" value="151.0717819178593" />
+      <entry key="W1" value="158.67744659266054" />
+    </decayedShown>
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;customColor&quot;: &quot;&quot;,
+  &quot;associatedIndex&quot;: 0
+}</component>
+  <component name="ProjectId" id="3EWZPAvAseVaKDlr9SYTws5r5bb" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "ModuleVcsDetector.initialDetectionPerformed": "true",
-    "RunOnceActivity.GoLinterPluginOnboardingV2": "true",
-    "RunOnceActivity.GoLinterPluginStorageMigration": "true",
-    "RunOnceActivity.MCP Project settings loaded": "true",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "RunOnceActivity.go.analysis.ui.options.defaults": "true",
-    "RunOnceActivity.go.formatter.settings.were.checked": "true",
-    "RunOnceActivity.go.modules.go.list.on.any.changes.was.set": "true",
-    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
-    "codeWithMe.voiceChat.enabledByDefault": "false",
-    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
-    "git-widget-placeholder": "main",
-    "go.sdk.automatically.set": "true",
-    "junie.onboarding.icon.badge.shown": "true",
-    "last_opened_file_path": "D:/GitHub/GoBSAseq",
-    "to.speed.mode.migration.done": "true"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;DefaultGoTemplateProperty&quot;: &quot;Go File&quot;,
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.GoLinterPluginOnboardingV2&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.GoLinterPluginStorageMigration&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.MCP Project settings loaded&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.go.analysis.ui.options.defaults&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.go.formatter.settings.were.checked&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.go.modules.go.list.on.any.changes.was.set&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
+    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
+    &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;go.sdk.automatically.set&quot;: &quot;true&quot;,
+    &quot;junie.onboarding.icon.badge.shown&quot;: &quot;true&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/GodwinMafireyi&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;run.configurations.included.in.services&quot;: &quot;true&quot;,
+    &quot;to.speed.mode.migration.done&quot;: &quot;true&quot;
   }
-}]]></component>
+}</component>
+  <component name="RunDashboard">
+    <option name="configurationTypes">
+      <set>
+        <option value="GoApplicationRunConfiguration" />
+      </set>
+    </option>
+  </component>
   <component name="RunManager" selected="Go Build.go build github.com/gmaffy/GoBSAseq">
-    <configuration name="go build github.com/gmaffy/GoBSAseq" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+    <configuration name="go build GoBSAseq/" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
       <module name="GoBSAseq" />
       <working_directory value="$PROJECT_DIR$" />
       <kind value="PACKAGE" />
@@ -71,13 +207,22 @@
       <auto_managed_config_id value="$PROJECT_DIR$" />
       <method v="2" />
     </configuration>
-    <configuration name="go build github.com/gmaffy/GoBSAseq/best_of_both" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+    <configuration name="go build github.com/gmaffy/GoBSAseq" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
       <module name="GoBSAseq" />
-      <working_directory value="$PROJECT_DIR$/best_of_both" />
+      <working_directory value="$PROJECT_DIR$/v1" />
       <kind value="PACKAGE" />
-      <package value="github.com/gmaffy/GoBSAseq/best_of_both" />
+      <package value="github.com/gmaffy/GoBSAseq" />
       <directory value="$PROJECT_DIR$" />
-      <auto_managed_config_id value="$PROJECT_DIR$/best_of_both" />
+      <auto_managed_config_id value="$PROJECT_DIR$/v1" />
+      <method v="2" />
+    </configuration>
+    <configuration name="go build github.com/gmaffy/GoBSAseq/crefactor" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+      <module name="GoBSAseq" />
+      <working_directory value="$PROJECT_DIR$/v1/crefactor" />
+      <kind value="PACKAGE" />
+      <package value="github.com/gmaffy/GoBSAseq/crefactor" />
+      <directory value="$PROJECT_DIR$" />
+      <auto_managed_config_id value="$PROJECT_DIR$/v1/crefactor" />
       <method v="2" />
     </configuration>
   </component>
@@ -91,15 +236,45 @@
   </component>
   <component name="TaskManager">
     <task active="true" id="Default" summary="Default task">
-      <changelist id="bcea0cf6-0eba-4e35-925f-cc69b5ae3cc3" name="Changes" comment="" />
-      <created>1779639051052</created>
+      <changelist id="5e2b679d-da18-491c-a5c6-def3748adb0a" name="Changes" comment="" />
+      <created>1780296259196</created>
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
-      <updated>1779639051052</updated>
+      <updated>1780296259196</updated>
     </task>
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VgoModernizerVersionTracker">
+    <upgrades>
+      <map>
+        <entry key="$PROJECT_DIR$/go.mod">
+          <value>
+            <VersionUpgradeInfo>
+              <version>1.26.3</version>
+              <timestamp>1780297683788</timestamp>
+            </VersionUpgradeInfo>
+          </value>
+        </entry>
+        <entry key="$PROJECT_DIR$/v1/go.mod">
+          <value>
+            <VersionUpgradeInfo>
+              <version>1.26.2</version>
+              <timestamp>1780297661547</timestamp>
+            </VersionUpgradeInfo>
+          </value>
+        </entry>
+        <entry key="$PROJECT_DIR$/v1/go.mod">
+          <value>
+            <VersionUpgradeInfo>
+              <version>1.26.2</version>
+              <timestamp>1780297661547</timestamp>
+            </VersionUpgradeInfo>
+          </value>
+        </entry>
+      </map>
+    </upgrades>
   </component>
 </project>
