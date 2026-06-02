@@ -118,11 +118,14 @@ func categorise(cfg *utils.AnalysisConfig) (analysisCategory, error) {
 	}
 }
 
-// ─── Run ──────────────────────────────────────────────────────────────────────
-
 func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
-	// ── Gene space check ────────────────────────────────────────────────────
+	fmt.Printf("HighParent: %s\n", cfg.HighParentName)
+	fmt.Printf("LowParent: %s\n", cfg.LowParentName)
+	fmt.Printf("HighBulk: %s\n", cfg.HighBulkName)
+	fmt.Printf("LowBulk: %s\n", cfg.LowBulkName)
+
+	// =========================================== Gene Space Check ================================================= //
 	if missing := missingGeneSpaceParams(cfg); len(missing) > 0 {
 		color.Yellow("Gene space analysis parameters missing: %s", strings.Join(missing, ", "))
 		color.Blue("Continue without gene space analysis? [y/N]: ")
@@ -138,7 +141,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		}
 	}
 
-	// ── VCF setup ───────────────────────────────────────────────────────────
+	// ========================================== Open VCF ========================================================== //
 	fmt.Println("Running BSAseq using a VCF file ...")
 
 	bold := color.New(color.Bold).SprintFunc()
@@ -159,13 +162,14 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	}
 	cfg.Rdr = rdr
 
-	// ── Sample map ──────────────────────────────────────────────────────────
+	// ================================================ Sample Map ================================================== //
 	sampleNames := rdr.Header.SampleNames
 	sampleMap := map[int]string{0: "None"}
 	for i, name := range sampleNames {
 		sampleMap[i+1] = name
 	}
 
+	// ================================================= Sample selection =========================================== //
 	color.Cyan("\n========================================== SAMPLE SELECTION =================================================\n\n")
 	fmt.Printf("Here are the samples found in your VCF file ...\n\n")
 	fmt.Println(sampleNames)
@@ -175,8 +179,121 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	var highBulkChoice int
 	var lowBulkChoice int
 
-	// ── PARENTS ─────────────────────────────────────────────────────────────
 	fmt.Printf("------------------------------------- PARENT CHOICES ----------------------------------------\n\n")
+
+	keys := slices.Sorted(maps.Keys(sampleMap))
+	for _, i := range keys {
+		fmt.Printf("%v : %v\n", i, sampleMap[i])
+	}
+
+	if cfg.HighParentName == "" {
+		color.Blue("\nEnter HIGH PARENT number:")
+		_, err := fmt.Scan(&highParentChoice)
+		if err != nil {
+			color.Red("HIGH PARENT number should be numerical and part of the list above: %s\n", err)
+			return err
+		}
+		if !slices.Contains(keys, highParentChoice) {
+			color.Red("The selected number is not in the list.")
+			return fmt.Errorf("invalid input")
+		}
+
+		cfg.HighParentName = sampleMap[highParentChoice]
+		fmt.Printf("\n-----------------------------------------------------------\nHIGH Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.HighParentName))
+		if highParentChoice != 0 {
+			delete(sampleMap, highParentChoice)
+		}
+		cfg.HighParentIdx = highParentChoice - 1
+
+	} else {
+		fmt.Printf("HIGH parent is: %s \n\n", cfg.HighParentName)
+		if !slices.Contains(sampleNames, cfg.HighParentName) {
+			color.Yellow(" HIGH PARENT %s is not part of the VCF sample list\n", cfg.HighParentName)
+			color.Cyan("Choose the number corresponding to the appropriate HIGH parent")
+			//keys := slices.Sorted(maps.Keys(sampleMap))
+			for _, i := range keys {
+				fmt.Printf("%v : %v\n", i, sampleMap[i])
+			}
+			_, err := fmt.Scan(&highParentChoice)
+			if err != nil {
+				fmt.Printf("HIGH PARENT number should be numerical and part of the list above: %s\n", err)
+				return err
+			}
+			if !slices.Contains(keys, highParentChoice) {
+				color.Red("The selected number is not in the list.")
+				return fmt.Errorf("invalid input")
+			}
+			cfg.HighParentName = sampleMap[highParentChoice]
+			if highParentChoice != 0 {
+				delete(sampleMap, highParentChoice)
+			}
+			cfg.HighParentIdx = highParentChoice - 1
+			fmt.Printf("\n-----------------------------------------------------------\nHIGH Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.HighParentName))
+		} else {
+			for k, v := range sampleMap {
+				if v == cfg.HighParentName {
+					cfg.HighParentIdx = k - 1
+					delete(sampleMap, k)
+					break
+				}
+			}
+		}
+	}
+
+	if cfg.LowParentName == "" {
+		color.Blue("\nEnter LOW PARENT number:")
+		_, err := fmt.Scan(&lowParentChoice)
+		if err != nil {
+			fmt.Printf("LOW PARENT number should be numerical and part of the list above: %s\n", err)
+			return err
+		}
+
+		if !slices.Contains(keys, lowParentChoice) {
+			color.Red("The selected number is not in the list.")
+			return fmt.Errorf("invalid input")
+		}
+		cfg.LowParentName = sampleMap[lowParentChoice]
+		if lowParentChoice != 0 {
+			delete(sampleMap, lowParentChoice)
+		}
+		cfg.LowParentIdx = lowParentChoice - 1
+		fmt.Printf("\n-----------------------------------------------------------\nLOW Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.LowParentName))
+	} else {
+		fmt.Printf("LOW parent is: %s \n\n", cfg.LowParentName)
+
+		if !slices.Contains(sampleNames, cfg.LowParentName) {
+			color.Yellow("LOW PARENT %s is not part of the VCF sample list\n", cfg.LowParentName)
+			color.Cyan("Choose the number corresponding to the appropriate LOW parent")
+			//keys := slices.Sorted(maps.Keys(sampleMap))
+			for _, i := range keys {
+				fmt.Printf("%v : %v\n", i, sampleMap[i])
+			}
+			_, err := fmt.Scan(&lowParentChoice)
+			if err != nil {
+				fmt.Printf("LOW PARENT number should be numerical and part of the list above: %s\n", err)
+				return err
+			}
+			if !slices.Contains(keys, lowParentChoice) {
+				color.Red("The selected number is not in the list.")
+				return fmt.Errorf("invalid input")
+			}
+			cfg.LowParentName = sampleMap[lowParentChoice]
+			if lowParentChoice != 0 {
+				delete(sampleMap, lowParentChoice)
+			}
+			cfg.LowParentIdx = lowParentChoice - 1
+			fmt.Printf("\n-----------------------------------------------------------\nLOW Parent is: %s\n-----------------------------------------------------------\n\n", bold(cfg.LowParentName))
+		} else {
+			for k, v := range sampleMap {
+				if v == cfg.LowParentName {
+					cfg.LowParentIdx = k - 1
+					delete(sampleMap, k)
+					break
+				}
+			}
+		}
+
+	}
 
 	if cfg.HighParentName == "" && cfg.LowParentName == "" {
 		fmt.Printf("No parent samples specified ...\n\n")
@@ -426,6 +543,21 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		return err
 	}
 
+	color.Green("\n=== Running: %s ===\n", bold(cat))
+	if cfg.HighParentName != "" && cfg.HighParentName != "None" {
+		fmt.Printf("  %-14s %s [%d]\n", "High Parent:", cfg.HighParentName, cfg.HighParentIdx)
+	}
+	if cfg.LowParentName != "" && cfg.LowParentName != "None" {
+		fmt.Printf("  %-14s %s [%d]\n", "Low Parent:", cfg.LowParentName, cfg.LowParentIdx)
+	}
+	if cfg.HighBulkName != "" && cfg.HighBulkName != "None" {
+		fmt.Printf("  %-14s %s [%d]\n", "High Bulk:", cfg.HighBulkName, cfg.HighBulkIdx)
+	}
+	if cfg.LowBulkName != "" && cfg.LowBulkName != "None" {
+		fmt.Printf("  %-14s %s [%d]\n", "Low Bulk:", cfg.LowBulkName, cfg.LowBulkIdx)
+	}
+	fmt.Println()
+
 	// ── Output directory ────────────────────────────────────────────────────
 	if cfg.OutputDir != "." {
 		if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
@@ -436,8 +568,8 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	// ── Dispatch ────────────────────────────────────────────────────────────
 	switch cat {
 	case TwoParentsTwoBulks:
-		//fmt.Println("Working with two bulks")
-		color.Green("=================================== Running Two Parents 2 Bulk Analysis =============================================\n\n")
+		fmt.Println("Working with two bulks")
+		color.Green("=================================== Running Two Bulk Analysis =============================================\n\n")
 		fmt.Printf("High Parent: %s, Index: %v\n", cfg.HighParentName, cfg.HighParentIdx)
 		fmt.Printf("Low Parent: %s, Index: %v\n", cfg.LowParentName, cfg.LowParentIdx)
 		fmt.Printf("High Bulk: %s, Index: %v\n", cfg.HighBulkName, cfg.HighBulkIdx)
