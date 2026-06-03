@@ -11,6 +11,7 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/filter"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
@@ -48,6 +49,63 @@ func missingGeneSpaceParams(cfg *utils.AnalysisConfig) []string {
 		missing = append(missing, "Gff")
 	}
 	return missing
+}
+
+func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
+	hp := cfg.HighParentName != "" && cfg.HighParentName != "None"
+	lp := cfg.LowParentName != "" && cfg.LowParentName != "None"
+	hb := cfg.HighBulkName != "" && cfg.HighBulkName != "None"
+	lb := cfg.LowBulkName != "" && cfg.LowBulkName != "None"
+
+	switch {
+	case hp && lp && hb && lb:
+		fmt.Println("========== Running 2 parent 2 bulk analysis ==========")
+		return "2p2b", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
+
+	case hp && lp && hb && !lb:
+		fmt.Println("Running 2 parent High Bulk")
+		return "2phb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx}, nil
+	case hp && lp && !hb && lb:
+		fmt.Println("Running 2 parent Low bulk")
+		return "2plb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx}, nil
+	case hp && !lp && hb && lb:
+		fmt.Println("Running High parent 2 bulks")
+		return "hp2b", []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
+	case hp && !lp && hb && !lb:
+		fmt.Println("Running high parent high bulk")
+		return "hphb", []int{cfg.HighParentIdx, cfg.HighBulkIdx}, nil
+	case hp && !lp && !hb && lb:
+		fmt.Println("Running High parent low bulk")
+		return "hplb", []int{cfg.HighParentIdx, cfg.LowBulkIdx}, nil
+	case !hp && lp && hb && lb:
+		fmt.Println("Running Low parent 2 bulks")
+		return "lp2b", []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
+	case !hp && lp && hb && !lb:
+		fmt.Println("Running Low parent high bulk")
+		return "lphb", []int{cfg.LowParentIdx, cfg.HighBulkIdx}, nil
+	case !hp && lp && !hb && lb:
+		fmt.Println("Running Low parent low bulk")
+		return "lplb", []int{cfg.LowParentIdx, cfg.LowBulkIdx}, nil
+	case !hp && !lp && hb && lb:
+		fmt.Println("Running bulks only")
+		return "2b", []int{cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
+	default:
+		return "bad", []int{}, fmt.Errorf("invalid combination — at least one bulk is required")
+	}
+
+}
+
+func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype string, idxs []int) error {
+	//--------------------------------------- Filter -----------------------------------------------------------------//
+	fmt.Printf("Filtering %s with bsaseq Type %v\n", cfg.VCF, btype)
+	_, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
+
+	if err != nil {
+		return err
+	}
+	color.Cyan("Original variants: %s\nFiltered Variants: %s", original, passed)
+
+	return nil
 }
 
 func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
@@ -362,46 +420,14 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
 	// ================================================== Run ================================================== //
 
-	hp := cfg.HighParentName != "" && cfg.HighParentName != "None"
-	lp := cfg.LowParentName != "" && cfg.LowParentName != "None"
-	hb := cfg.HighBulkName != "" && cfg.HighBulkName != "None"
-	lb := cfg.LowBulkName != "" && cfg.LowBulkName != "None"
-
-	if !hb && !lb {
-		return fmt.Errorf("at least one bulk must be selected")
+	bType, idxs, err := bsaseqType(cfg)
+	if err != nil {
+		return err
 	}
 
-	switch {
-	case hp && lp && hb && lb:
-		fmt.Println("========== Running 2 parent 2 bulk analysis ==========")
-		fmt.Printf("High Parent: %s [%v]\n", cfg.HighParentName, cfg.HighParentIdx)
-		fmt.Printf("Low Parent: %s [%v]\n", cfg.LowParentName, cfg.LowParentIdx)
-	case hp && lp && hb && !lb:
-		fmt.Println("Running 2 parent High Bulk")
-	case hp && lp && !hb && lb:
-		fmt.Println("Running 2 parent Low bulk")
-	case hp && !lp && hb && lb:
-		fmt.Println("Running High parent 2 bulks")
-	case hp && !lp && hb && !lb:
-		fmt.Println("Running high parent high bulk")
-		//return HighParentHighBulk, nil
-	case hp && !lp && !hb && lb:
-		fmt.Println("Running High parent low bulk")
-		//return HighParentLowBulk, nil
-	case !hp && lp && hb && lb:
-		fmt.Println("Running Low parent 2 bulks")
-		//return LowParentTwoBulks, nil
-	case !hp && lp && hb && !lb:
-		fmt.Println("Running Low parent high bulk")
-		//return LowParentHighBulk, nil
-	case !hp && lp && !hb && lb:
-		fmt.Println("Running Low parent low bulk")
-		//return LowParentLowBulk, nil
-	case !hp && !lp && hb && lb:
-		fmt.Println("Running bulks only")
-		//return BulksOnly
-	default:
-		return fmt.Errorf("invalid combination — at least one bulk is required")
+	err = bsaseq(cfg, &hf, bType, idxs)
+	if err != nil {
+		return err
 	}
 
 	return nil
