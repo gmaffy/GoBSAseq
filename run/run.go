@@ -12,6 +12,7 @@ import (
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
+	"github.com/gmaffy/GoBSAseq/stats"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
@@ -59,20 +60,20 @@ func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
 
 	switch {
 	case hp && lp && hb && lb:
-		fmt.Println("========== Running 2 parent 2 bulk analysis ==========")
+		fmt.Println("================================ Running 2 parent 2 bulk analysis ==========================================")
 		return "2p2b", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 
 	case hp && lp && hb && !lb:
-		fmt.Println("Running 2 parent High Bulk")
+		fmt.Println("=================================== Running 2 parent High Bulk ============================================")
 		return "2phb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx}, nil
 	case hp && lp && !hb && lb:
-		fmt.Println("Running 2 parent Low bulk")
+		fmt.Println("=================================== Running 2 parent Low bulk =============================================")
 		return "2plb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx}, nil
 	case hp && !lp && hb && lb:
-		fmt.Println("Running High parent 2 bulks")
+		fmt.Println("=================================== Running High parent 2 bulks ===========================================")
 		return "hp2b", []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	case hp && !lp && hb && !lb:
-		fmt.Println("Running high parent high bulk")
+		fmt.Println("=================================== Running high parent high bulk ===========================================")
 		return "hphb", []int{cfg.HighParentIdx, cfg.HighBulkIdx}, nil
 	case hp && !lp && !hb && lb:
 		fmt.Println("Running High parent low bulk")
@@ -98,12 +99,19 @@ func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
 func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype string, idxs []int) error {
 	//--------------------------------------- Filter -----------------------------------------------------------------//
 	fmt.Printf("Filtering %s with bsaseq Type %v\n", cfg.VCF, btype)
-	_, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
+	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
 	if err != nil {
 		return err
 	}
 	color.Cyan("Original variants: %v\nFiltered Variants: %v", original, passed)
+
+	// ----------------------------------------- Stats ---------------------------------------------------------------//
+	if _, err := stats.RawStats(*cfg, btype, idxs, passedVariants); err != nil {
+		return err
+	}
+
+	// ---------------------------------------- smoothing -----------------------------------------------------------//
 
 	return nil
 }
