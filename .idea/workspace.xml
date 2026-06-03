@@ -5,71 +5,13 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="5e2b679d-da18-491c-a5c6-def3748adb0a" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/filter/filter.go" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/stats/stats.go" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/utils/utils.go" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/cmd/root.go" beforeDir="false" afterPath="$PROJECT_DIR$/cmd/root.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/IMPLEMENTATION.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/README.md" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/cmd/root.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/go.mod" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/go.sum" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/main.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/onebulk/pipeline.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/run/run.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/run/run_test.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/snpEff_genes.txt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/snpEff_summary.html" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/confidence.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/confidence_test.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/fisher.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/onebulk.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/onebulk_test.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/stats/twobulk.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/twobulk/pipeline.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/utils/config.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/utils/filters.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/utils/output.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/utils/utils.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/crefactor/utils/utils_test.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.cursor" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.gem" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.mine" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk.go.working.27.05" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk_plot.go.cursor" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/oneBulk/oneBulk_plotting.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/plotting.ipynb" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/run/run.go" beforeDir="false" afterPath="$PROJECT_DIR$/run/run.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/work/run.go.huh" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/work/run.go.old" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/work/run.go.survey" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/twoBulk.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/plotting.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/plotting.go.working" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/thresholds.go.works_5_thresh" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.123" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.15.05.PERECT" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.3" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.CURRENT" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.copil" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.goat" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.thresh1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.tt" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.unclean_great" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.working" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.works.no_thresh" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulk.go.works_5_thresh" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/twobulk/work/twoBulks.go.2" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/config.go" beforeDir="false" afterPath="$PROJECT_DIR$/utils/config.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/filters.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/utils.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/work/hardFilter.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/work/hard_filter_vcf.go.1" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/work/hard_filter_vcf.go.16.05" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/work/utils.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/run.go.2" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/run/run2.go.1" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -77,7 +19,7 @@
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="14" />
+    <option name="cachedIndexableFilesCount" value="17" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
   <component name="FileTemplateManagerImpl">
@@ -87,71 +29,83 @@
       </list>
     </option>
   </component>
-  <component name="GOROOT" url="file://$USER_HOME$/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.3.windows-amd64" />
+  <component name="GOROOT" url="file:///opt/homebrew/opt/go/libexec" />
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;gmaffy&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/gmaffy/GoBSAseq.git&quot;,
+    &quot;accountId&quot;: &quot;931e77e7-2873-4cd6-80f9-fb66442afba7&quot;
+  }
+}</component>
   <component name="McpProjectServerCommands">
     <commands />
     <urls />
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.0157678137067707" />
-      <entry key="MS500" value="2.054461081394475" />
-      <entry key="S2" value="4.787759177826011" />
-      <entry key="S5" value="6.3990029014868215" />
-      <entry key="S10" value="7.133116374596898" />
-      <entry key="S30" value="7.694711384426827" />
-      <entry key="S60" value="7.845207270937689" />
-      <entry key="M2" value="7.922059387735455" />
-      <entry key="M5" value="8.026426994782305" />
-      <entry key="M10" value="10.03774530093755" />
-      <entry key="M15" value="14.76018882829524" />
-      <entry key="M30" value="31.106726305003257" />
-      <entry key="H1" value="55.56212954625943" />
-      <entry key="H2" value="84.25490894212528" />
-      <entry key="H4" value="109.92793025471774" />
-      <entry key="D1" value="142.6551347497801" />
-      <entry key="W1" value="149.7635986162182" />
+      <entry key="MS100" value="3.4262580267022875E-19" />
+      <entry key="MS500" value="2.0275147072531575E-4" />
+      <entry key="S2" value="0.11932762676746457" />
+      <entry key="S5" value="0.42726409772038765" />
+      <entry key="S10" value="0.6536544176553752" />
+      <entry key="S30" value="0.8678594828505152" />
+      <entry key="S60" value="0.9319567178585111" />
+      <entry key="M2" value="1.0256309767553269" />
+      <entry key="M5" value="3.1660283240293503" />
+      <entry key="M10" value="10.764706062658382" />
+      <entry key="M15" value="18.94488736397678" />
+      <entry key="M30" value="40.164100894233854" />
+      <entry key="H1" value="71.76988153600398" />
+      <entry key="H2" value="119.36838802056303" />
+      <entry key="H4" value="183.4192624311564" />
+      <entry key="D1" value="308.69007629061275" />
+      <entry key="W1" value="343.6184854420454" />
     </decayedCancelled>
     <decayedSelected>
-      <entry key="MS100" value="0.0" />
-      <entry key="MS500" value="0.0" />
-      <entry key="S2" value="0.0" />
-      <entry key="S5" value="2.294874318045699E-218" />
-      <entry key="S10" value="2.5974577368142845E-109" />
-      <entry key="S30" value="1.3240706233829979E-36" />
-      <entry key="S60" value="1.9924458614404687E-18" />
-      <entry key="M2" value="2.4446760727316183E-9" />
-      <entry key="M5" value="6.943101347859202E-4" />
-      <entry key="M10" value="0.04566258410660101" />
-      <entry key="M15" value="0.18568243373886434" />
-      <entry key="M30" value="0.8379571209310298" />
-      <entry key="H1" value="2.246671093809993" />
-      <entry key="H2" value="4.242574417163276" />
-      <entry key="H4" value="6.091387666421496" />
-      <entry key="D1" value="8.417071755311705" />
-      <entry key="W1" value="8.913913184792888" />
+      <entry key="MS100" value="1.0" />
+      <entry key="MS500" value="1.0" />
+      <entry key="S2" value="1.0" />
+      <entry key="S5" value="1.0" />
+      <entry key="S10" value="1.0" />
+      <entry key="S30" value="1.0000000000557754" />
+      <entry key="S60" value="1.0000106033299754" />
+      <entry key="M2" value="1.0048861768765363" />
+      <entry key="M5" value="1.2342788670717917" />
+      <entry key="M10" value="1.9397950079850408" />
+      <entry key="M15" value="2.5609985493710257" />
+      <entry key="M30" value="4.217651926274001" />
+      <entry key="H1" value="7.536893980577284" />
+      <entry key="H2" value="13.071303903991149" />
+      <entry key="H4" value="19.97210246493989" />
+      <entry key="D1" value="32.18762580050648" />
+      <entry key="W1" value="35.41615221197388" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="0.9878856522692913" />
-      <entry key="MS500" value="2.041283597058523" />
-      <entry key="S2" value="4.777092968285001" />
-      <entry key="S5" value="6.392577719121984" />
-      <entry key="S10" value="7.129382834953388" />
-      <entry key="S30" value="7.693330796773679" />
-      <entry key="S60" value="7.8444985297902505" />
-      <entry key="M2" value="7.921700292775495" />
-      <entry key="M5" value="8.026971412500492" />
-      <entry key="M10" value="10.08320251177001" />
-      <entry key="M15" value="14.94547774085076" />
-      <entry key="M30" value="31.94373781458744" />
-      <entry key="H1" value="57.80702426392643" />
-      <entry key="H2" value="88.49538347476874" />
-      <entry key="H4" value="116.01763249106428" />
-      <entry key="D1" value="151.0717819178593" />
-      <entry key="W1" value="158.67744659266054" />
+      <entry key="MS100" value="3.828114024967279E-19" />
+      <entry key="MS500" value="2.083989378885753E-4" />
+      <entry key="S2" value="0.15237684106894697" />
+      <entry key="S5" value="0.6818081669741057" />
+      <entry key="S10" value="1.157962226909544" />
+      <entry key="S30" value="1.6637719985631378" />
+      <entry key="S60" value="1.8240945900180683" />
+      <entry key="M2" value="1.9747241218377993" />
+      <entry key="M5" value="4.373038481584402" />
+      <entry key="M10" value="12.681979183224616" />
+      <entry key="M15" value="21.484626639915643" />
+      <entry key="M30" value="44.36357197779897" />
+      <entry key="H1" value="79.2924080972524" />
+      <entry key="H2" value="132.4289855113408" />
+      <entry key="H4" value="203.38393114904378" />
+      <entry key="D1" value="340.87583855169254" />
+      <entry key="W1" value="379.0343473124929" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -182,7 +136,7 @@
     &quot;git-widget-placeholder&quot;: &quot;main&quot;,
     &quot;go.sdk.automatically.set&quot;: &quot;true&quot;,
     &quot;junie.onboarding.icon.badge.shown&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;C:/Users/GodwinMafireyi&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/Users/godwinmafireyi&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
