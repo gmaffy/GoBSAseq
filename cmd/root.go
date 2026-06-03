@@ -252,6 +252,14 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
+		// --------------------------------- Output dir --------------------------------------------------//
+
+		resultsDir, err := utils.CreateResultsDir(outputDir)
+		if err != nil {
+			fmt.Println("Error creating results directory:", err)
+			return
+		}
+
 		hfConfig := utils.HardFilterConfig{
 			SNP_QD_Min:               qd_snp,
 			SNP_QUAL_Min:             qual_snp,
@@ -276,7 +284,7 @@ var rootCmd = &cobra.Command{
 			BrmAlpha:      brmAlpha,
 			MinQTLWidth:   minQTL,
 			MergeDistance: mergeDist,
-			OutputDir:     outputDir,
+			OutputDir:     resultsDir,
 
 			HighParentName:  highParentName,
 			HighParentDepth: highParentDepth,

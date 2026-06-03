@@ -326,108 +326,6 @@ func addTabixRecord(idx *tabix.Index, v *vcfgo.Variant, chunk bgzf.Chunk) error 
 	return idx.Add(rec, chunk, true, true)
 }
 
-//func HardFilterVcf(rdr *vcfgo.Reader, cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsaseqType string, keepIndices []int) ([]*vcfgo.Variant, int, int, error) {
-//
-//	err := os.MkdirAll(filepath.Join(cfg.OutputDir, "stats"), 0775)
-//	if err != nil {
-//		return nil, 0, 0, err
-//	}
-//	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", bsaseqType))
-//	badVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.lowqaul.vcf.gz", bsaseqType))
-//
-//	origSampleNames := rdr.Header.SampleNames
-//
-//	var newSampleNames []string
-//	for _, idx := range keepIndices {
-//		if idx >= 0 && idx < len(origSampleNames) {
-//			newSampleNames = append(newSampleNames, origSampleNames[idx])
-//		}
-//	}
-//
-//	writerHeader := *rdr.Header
-//	writerHeader.SampleNames = newSampleNames
-//
-//	for _, id := range []string{"PGT", "PID"} {
-//		delete(rdr.Header.SampleFormats, id)
-//	}
-//
-//	// ── Open output files ─────────────────────────────────────────────────────
-//	hfFile, err := os.Create(hardFilteredVcfPath)
-//	if err != nil {
-//		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF: %w", err)
-//	}
-//	defer hfFile.Close()
-//
-//	hfCounting := &countingWriter{Writer: hfFile}
-//	hfBgzf := bgzf.NewWriter(hfCounting, 1)
-//	hfWriter, err := vcfgo.NewWriter(hfBgzf, &writerHeader)
-//	if err != nil {
-//		hfBgzf.Close()
-//		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF writer: %w", err)
-//	}
-//
-//	badFile, err := os.Create(badVcfPath)
-//	if err != nil {
-//		hfBgzf.Close()
-//		return nil, 0, 0, fmt.Errorf("create rejected VCF: %w", err)
-//	}
-//	defer badFile.Close()
-//
-//	badBgzf := bgzf.NewWriter(badFile, 1)
-//	badWriter, err := vcfgo.NewWriter(badBgzf, &writerHeader)
-//	if err != nil {
-//		hfBgzf.Close()
-//		badBgzf.Close()
-//		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
-//	}
-//	passedCount, totalCount := 0, 0
-//
-//	for {
-//		v := rdr.Read()
-//		if v == nil {
-//			break
-//		}
-//		totalCount++
-//
-//		if err := rdr.Error(); err != nil {
-//			if strings.Contains(err.Error(), "bad sample string") {
-//				rdr.Clear()
-//			} else {
-//				return nil, 0, 0, fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
-//			}
-//		}
-//		alts := v.Alt()
-//		if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
-//			// skippedCount.Add(1)
-//			continue
-//		}
-//		passed := PassesHardFilter(v, hfcfg) && BsaSeqFilter(v, cfg, bsaseqType)
-//
-//		if passed {
-//			// Write to the biogo/hts writer
-//			// If biogo/hts requires a specific struct, map v to vcf.Record here
-//			if err := hfWriter.Write(v); err != nil {
-//				return 0, 0, err
-//			}
-//			passedCount++
-//		}
-//	}
-//
-//	// Critical: Close the writer to finish BGZF blocks
-//	if err := bw.Close(); err != nil {
-//		return 0, 0, err
-//	}
-//	f.Close()
-//
-//	// Perform the Tabix Indexing
-//	// This creates the .tbi file from the .vcf.gz file on disk
-//	if err := tabix.Index(outPath, "vcf"); err != nil {
-//		return 0, 0, fmt.Errorf("failed to index VCF: %w", err)
-//	}
-//
-//	return passedCount, totalCount, nil
-//}
-
 func sanitizeVariant(v *vcfgo.Variant, keepIndices []int) {
 	// Subset samples
 	newSamples := make([]*vcfgo.SampleGenotype, len(keepIndices))
@@ -470,9 +368,13 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 
 	writerHeader := *rdr.Header
 	writerHeader.SampleNames = newSampleNames
+	writerHeader.SampleFormats = make(map[string]*vcfgo.SampleFormat, len(rdr.Header.SampleFormats))
+	for id, format := range rdr.Header.SampleFormats {
+		writerHeader.SampleFormats[id] = format
+	}
 
 	for _, id := range []string{"PGT", "PID"} {
-		delete(rdr.Header.SampleFormats, id)
+		delete(writerHeader.SampleFormats, id)
 	}
 
 	// ── Open output files ─────────────────────────────────────────────────────

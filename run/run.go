@@ -103,7 +103,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	if err != nil {
 		return err
 	}
-	color.Cyan("Original variants: %s\nFiltered Variants: %s", original, passed)
+	color.Cyan("Original variants: %v\nFiltered Variants: %v", original, passed)
 
 	return nil
 }
