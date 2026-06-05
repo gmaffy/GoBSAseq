@@ -107,11 +107,30 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("Original variants: %v\nFiltered Variants: %v", original, passed)
 
 	// ----------------------------------------- Stats ---------------------------------------------------------------//
-	if _, err := stats.RawStats(*cfg, btype, idxs, passedVariants); err != nil {
+	rawStats, err := stats.RawStats(*cfg, btype, idxs, passedVariants)
+	if err != nil {
 		return err
 	}
 
-	// ---------------------------------------- smoothing -----------------------------------------------------------//
+	// ---------------------------------------- smoothing ------------------------------------------------------------//
+	smoothedStats, err := stats.SmoothStats(*cfg, btype, rawStats)
+	if err != nil {
+		return err
+	}
+
+	// ---------------------------------------- normalise stats ------------------------------------------------------//
+	if err := stats.NormalizeSmoothedStats(*cfg, btype, smoothedStats); err != nil {
+		return err
+	}
+
+	// ----------------------------------------- Threshold calculation -----------------------------------------------//
+	if err := stats.Thresholds(*cfg, btype, smoothedStats); err != nil {
+		return err
+	}
+
+	// ------------------------------------------ BRM & Fisher STATS ------------------------------------------------ //
+
+	// ------------------------------------------ Plots ------------------------------------------------------------- //
 
 	return nil
 }
@@ -375,10 +394,10 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 			fmt.Printf("LOW BULK number should be numerical and part of the list above: %s\n", err)
 			return fmt.Errorf("invalid input")
 		}
-		if lowBulkChoice == highBulkChoice || lowBulkChoice == highParentChoice || lowBulkChoice == lowParentChoice {
-			fmt.Println("Your LOW bulk cannot be the same as any of the parents OR the HIGH bulk")
-			return fmt.Errorf("invalid input")
-		}
+		// if lowBulkChoice == highBulkChoice || lowBulkChoice == highParentChoice || lowBulkChoice == lowParentChoice {
+		// 	fmt.Println("Your LOW bulk cannot be the same as any of the parents OR the HIGH bulk")
+		// 	return fmt.Errorf("invalid input")
+		// }
 		if !slices.Contains(keys, lowBulkChoice) {
 			color.Red("The selected number is not in the list.")
 			return fmt.Errorf("invalid input")
@@ -402,10 +421,10 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 			if err != nil {
 				return fmt.Errorf("LOW BULK number should be numerical and part of the list above: %w", err)
 			}
-			if lowBulkChoice == highBulkChoice || lowBulkChoice == highParentChoice || lowBulkChoice == lowParentChoice {
-				fmt.Println("Your LOW bulk cannot be the same as any of the parents OR the HIGH bulk")
-				return fmt.Errorf("invalid input")
-			}
+			// if lowBulkChoice == highBulkChoice || lowBulkChoice == highParentChoice || lowBulkChoice == lowParentChoice {
+			// 	fmt.Println("Your LOW bulk cannot be the same as any of the parents OR the HIGH bulk")
+			// 	return fmt.Errorf("invalid input")
+			// }
 			if !slices.Contains(keys, lowBulkChoice) {
 				color.Red("The selected number is not in the list.")
 				return fmt.Errorf("invalid input")

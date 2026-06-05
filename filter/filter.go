@@ -166,7 +166,6 @@ func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bo
 				return false
 			}
 		}
-
 		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "2p2b":
@@ -366,9 +365,17 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 		}
 	}
 
-	writerHeader := *rdr.Header
-	writerHeader.SampleNames = newSampleNames
-	writerHeader.SampleFormats = make(map[string]*vcfgo.SampleFormat, len(rdr.Header.SampleFormats))
+	writerHeader := vcfgo.Header{
+		SampleNames:   newSampleNames,
+		Infos:         rdr.Header.Infos,
+		SampleFormats: make(map[string]*vcfgo.SampleFormat, len(rdr.Header.SampleFormats)),
+		Filters:       rdr.Header.Filters,
+		Extras:        rdr.Header.Extras,
+		FileFormat:    rdr.Header.FileFormat,
+		Contigs:       rdr.Header.Contigs,
+		Samples:       rdr.Header.Samples,
+		Pedigrees:     rdr.Header.Pedigrees,
+	}
 	for id, format := range rdr.Header.SampleFormats {
 		writerHeader.SampleFormats[id] = format
 	}

@@ -174,83 +174,22 @@ var rootCmd = &cobra.Command{
 		}
 
 		// ============================================== window size ================================================//
-		winSize, err = strconv.Atoi(fmt.Sprintf("%d", windowSize))
-		if err != nil {
-			color.Red("windowSize is supposed to be an integer")
-			return
-		}
+		winSize = int(windowSize)
+		step := int(stepSize)
 
-		// ============================================= Step size ================================================ //
-		step, err := strconv.Atoi(fmt.Sprintf("%d", stepSize))
-		if err != nil {
-			color.Red("stepSize is supposed to be an integer")
-			return
-		}
+		qd_snp := minQD_SNP
+		qual_snp := minQUAL_SNP
+		sor_snp := minSOR_SNP
+		fs_snp := minFS_SNP
+		mq_snp := minMQ_SNP
+		mqRank_snp := minMQRank
+		readPosRank_snp := minReadPosRank
 
-		// ==================================== Hard Filter config ================================================== //
-
-		qd_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minQD_SNP), 64)
-		if err != nil {
-			color.Red("min-QD-SNP is supposed to be a float")
-			return
-		}
-		qual_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minQUAL_SNP), 64)
-		if err != nil {
-			color.Red("min-QUAL-SNP is supposed to be a float")
-			return
-		}
-		sor_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minSOR_SNP), 64)
-		if err != nil {
-			color.Red("min-SOR-SNP is supposed to be a float")
-			return
-		}
-		fs_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minFS_SNP), 64)
-		if err != nil {
-			color.Red("min-FS-SNP is supposed to be a float")
-			return
-		}
-		mq_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minMQ_SNP), 64)
-		if err != nil {
-			color.Red("min-MQ-SNP is supposed to be a float")
-			return
-		}
-		mqRank_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minMQRank), 64)
-		if err != nil {
-			color.Red("min-MQRankSum-SNP is supposed to be a float")
-			return
-		}
-		readPosRank_snp, err := strconv.ParseFloat(fmt.Sprintf("%f", minReadPosRank), 64)
-		if err != nil {
-			color.Red("min-ReadPosRankSum-SNP is supposed to be a float")
-			return
-		}
-
-		qd_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minQD_INDEL), 64)
-		if err != nil {
-			color.Red("min-QD-INDEL is supposed to be a float")
-			return
-		}
-		qual_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minQUAL_INDEL), 64)
-		if err != nil {
-			color.Red("min-QUAL-INDEL is supposed to be a float")
-			return
-		}
-		fs_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", maxFS_INDEL), 64)
-		if err != nil {
-			color.Red("max-FS-INDEL is supposed to be a float")
-			return
-		}
-		readPosRank_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", minReadPosRank_INDEL), 64)
-		if err != nil {
-			color.Red("min-ReadPosRankSum-INDEL is supposed to be a float")
-			return
-		}
-
-		sor_indel, err := strconv.ParseFloat(fmt.Sprintf("%f", maxSOR_INDEL), 64)
-		if err != nil {
-			color.Red("max-SOR-INDEL is supposed to be a float")
-			return
-		}
+		qd_indel := minQD_INDEL
+		qual_indel := minQUAL_INDEL
+		fs_indel := maxFS_INDEL
+		readPosRank_indel := minReadPosRank_INDEL
+		sor_indel := maxSOR_INDEL
 
 		// --------------------------------- Output dir --------------------------------------------------//
 
@@ -346,7 +285,7 @@ func init() {
 
 	// ------------------------------------------------- Threshold -------------------------------------------------- //
 	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
-	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, BC, RIL)")
+	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, RIL, BC1H, BC1L, BC2H, BC2L, ...)")
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
 
 	// ----------------------------------------------- Filtering ---------------------------------------------------- //

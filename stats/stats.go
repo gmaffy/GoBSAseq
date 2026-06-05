@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -35,11 +37,16 @@ type BSAstats struct {
 	HighSI    float64
 	LowSI     float64
 
-	DeltaSI float64
-	Gstat   float64
-	ED      float64
-	LOD     float64
-	BBLogBF float64
+	DeltaSI        float64
+	Gstat          float64
+	ED             float64
+	LOD            float64
+	BBLogBF        float64
+	OneBulkP0      float64
+	OneBulkAFDev   float64
+	OneBulkGstat   float64
+	OneBulkLOD     float64
+	OneBulkBBLogBF float64
 
 	Depth int
 }
@@ -73,6 +80,16 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 		highBulkIdx, lowBulkIdx = 0, 1
 	default:
 		return nil, fmt.Errorf("unsupported bsaseq type %q", bsaType)
+	}
+
+	hasOneBulk := (highBulkIdx >= 0) != (lowBulkIdx >= 0)
+	oneBulkP0 := 0.0
+	if hasOneBulk {
+		p0, err := expectedHighAlleleP0(cfg.Population)
+		if err != nil {
+			return nil, err
+		}
+		oneBulkP0 = p0
 	}
 
 	outDir := filepath.Join(cfg.OutputDir, "stats")
@@ -208,6 +225,21 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 					s.LOD = math.Round(lod(s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH)*1e6) / 1e6
 					s.BBLogBF = math.Round(betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
 				}
+				if hasOneBulk {
+					s.OneBulkP0 = oneBulkP0
+					switch {
+					case highTotal > 0:
+						s.OneBulkAFDev = math.Round((s.HighSI-oneBulkP0)*1e6) / 1e6
+						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+						s.OneBulkLOD = math.Round(oneBulkLOD(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+					case lowTotal > 0:
+						s.OneBulkAFDev = math.Round((s.LowSI-oneBulkP0)*1e6) / 1e6
+						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+						s.OneBulkLOD = math.Round(oneBulkLOD(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+					}
+				}
 
 				if s.Depth > 0 {
 					results[i] = s
@@ -228,7 +260,7 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 	}
 
 	rawPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.raw.tsv", bsaType))
-	if err := writeRawTSV(rawPath, stats); err != nil {
+	if err := writeRawTSV(rawPath, stats, bsaType); err != nil {
 		return nil, err
 	}
 
@@ -236,7 +268,7 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 	return stats, nil
 }
 
-func writeRawTSV(filename string, stats []BSAstats) error {
+func writeRawTSV(filename string, stats []BSAstats, bsaType string) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -246,13 +278,63 @@ func writeRawTSV(filename string, stats []BSAstats) error {
 	w := bufio.NewWriter(f)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "CHROM\tPOS\tREF\tALT\tHighParGT\tLowParGT\tHighBulkGT\tHighBulkAD\tLowBulkGT\tLowBulkAD\tHighBulkL\tHighBulkH\tLowBulkL\tLowBulkH\tHighSI\tLowSI\tDeltaSI\tGstat\tED4\tLOD\tBBLogBF\tDepth")
+	hasHighParent := strings.Contains(bsaType, "hp") || strings.Contains(bsaType, "2p")
+	hasLowParent := strings.Contains(bsaType, "lp") || strings.Contains(bsaType, "2p")
+	hasHighBulk := strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
+	hasLowBulk := strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
+	hasBothBulks := hasHighBulk && hasLowBulk
+	hasOneBulk := hasHighBulk != hasLowBulk
+
+	header := []string{"CHROM", "POS", "REF", "ALT"}
+	if hasHighParent {
+		header = append(header, "HighParGT")
+	}
+	if hasLowParent {
+		header = append(header, "LowParGT")
+	}
+	if hasHighBulk {
+		header = append(header, "HighBulkGT", "HighBulkAD", "HighBulkL", "HighBulkH", "HighSI")
+	}
+	if hasLowBulk {
+		header = append(header, "LowBulkGT", "LowBulkAD", "LowBulkL", "LowBulkH", "LowSI")
+	}
+	if hasBothBulks {
+		header = append(header, "DeltaSI", "Gstat", "ED4", "LOD", "BBLogBF")
+	}
+	if hasOneBulk {
+		header = append(header, "P0", "AFDev", "Gstat1", "LOD1", "BBLogBF1")
+	}
+	header = append(header, "Depth")
+
+	fmt.Fprintln(w, strings.Join(header, "\t"))
+
 	for _, s := range stats {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%v\t%v\t%v\t%s\t%v\t%s\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%d\n",
-			s.CHROM, s.POS, s.REF, s.ALT,
-			s.HighParGT, s.LowParGT, s.HighBulkGT, s.HighBulkAD, s.LowBulkGT, s.LowBulkAD,
-			s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH,
-			s.HighSI, s.LowSI, s.DeltaSI, s.Gstat, s.ED, s.LOD, s.BBLogBF, s.Depth)
+		row := []string{
+			s.CHROM,
+			fmt.Sprintf("%d", s.POS),
+			s.REF,
+			s.ALT,
+		}
+		if hasHighParent {
+			row = append(row, fmt.Sprintf("%v", s.HighParGT))
+		}
+		if hasLowParent {
+			row = append(row, fmt.Sprintf("%v", s.LowParGT))
+		}
+		if hasHighBulk {
+			row = append(row, fmt.Sprintf("%v", s.HighBulkGT), s.HighBulkAD, fmt.Sprintf("%d", s.HighBulkL), fmt.Sprintf("%d", s.HighBulkH), fmt.Sprintf("%.6f", s.HighSI))
+		}
+		if hasLowBulk {
+			row = append(row, fmt.Sprintf("%v", s.LowBulkGT), s.LowBulkAD, fmt.Sprintf("%d", s.LowBulkL), fmt.Sprintf("%d", s.LowBulkH), fmt.Sprintf("%.6f", s.LowSI))
+		}
+		if hasBothBulks {
+			row = append(row, fmt.Sprintf("%.6f", s.DeltaSI), fmt.Sprintf("%.6f", s.Gstat), fmt.Sprintf("%.6f", s.ED), fmt.Sprintf("%.6f", s.LOD), fmt.Sprintf("%.6f", s.BBLogBF))
+		}
+		if hasOneBulk {
+			row = append(row, fmt.Sprintf("%.6f", s.OneBulkP0), fmt.Sprintf("%.6f", s.OneBulkAFDev), fmt.Sprintf("%.6f", s.OneBulkGstat), fmt.Sprintf("%.6f", s.OneBulkLOD), fmt.Sprintf("%.6f", s.OneBulkBBLogBF))
+		}
+		row = append(row, fmt.Sprintf("%d", s.Depth))
+		fmt.Fprintln(w, strings.Join(row, "\t"))
 	}
 	return nil
 }
@@ -294,6 +376,110 @@ func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
 func euclideanDistance4(hSI, lSI float64) float64 {
 	d := hSI - lSI
 	return d * d * d * d
+}
+
+func expectedHighAlleleP0(population string) (float64, error) {
+	pop := strings.ToUpper(strings.TrimSpace(population))
+	pop = strings.NewReplacer("-", "", "_", "", " ", "").Replace(pop)
+
+	switch pop {
+	case "", "F2", "F3", "RIL", "RILS":
+		return 0.5, nil
+	case "BC":
+		return 0, fmt.Errorf("population %q is ambiguous for one-bulk stats; use BC1H/BC1L, BC2H/BC2L, etc.", population)
+	}
+
+	if !strings.HasPrefix(pop, "BC") {
+		return 0, fmt.Errorf("unsupported population %q for one-bulk stats", population)
+	}
+
+	rest := strings.TrimPrefix(pop, "BC")
+	recurrent := ""
+	switch {
+	case strings.HasSuffix(rest, "HIGH"):
+		recurrent = "H"
+		rest = strings.TrimSuffix(rest, "HIGH")
+	case strings.HasSuffix(rest, "LOW"):
+		recurrent = "L"
+		rest = strings.TrimSuffix(rest, "LOW")
+	case strings.HasSuffix(rest, "H"):
+		recurrent = "H"
+		rest = strings.TrimSuffix(rest, "H")
+	case strings.HasSuffix(rest, "L"):
+		recurrent = "L"
+		rest = strings.TrimSuffix(rest, "L")
+	default:
+		return 0, fmt.Errorf("backcross population %q must specify recurrent parent as H/high or L/low", population)
+	}
+
+	generation := 1
+	if rest != "" {
+		n, err := strconv.Atoi(rest)
+		if err != nil || n < 1 {
+			return 0, fmt.Errorf("invalid backcross generation in population %q", population)
+		}
+		generation = n
+	}
+
+	residualF1 := 1 / math.Pow(2, float64(generation+1))
+	if recurrent == "H" {
+		return 1 - residualF1, nil
+	}
+	return residualF1, nil
+}
+
+func oneBulkGStatistic(success, fail int, p0 float64) float64 {
+	n := float64(success + fail)
+	if n == 0 || p0 <= 0 || p0 >= 1 {
+		return 0
+	}
+
+	obsSuccess := float64(success)
+	obsFail := float64(fail)
+	expSuccess := n * p0
+	expFail := n * (1 - p0)
+
+	g := 0.0
+	if obsSuccess > 0 {
+		g += obsSuccess * math.Log(obsSuccess/expSuccess)
+	}
+	if obsFail > 0 {
+		g += obsFail * math.Log(obsFail/expFail)
+	}
+	return 2 * g
+}
+
+func oneBulkLOD(success, fail int, p0 float64) float64 {
+	n := float64(success + fail)
+	if n == 0 || p0 <= 0 || p0 >= 1 {
+		return 0
+	}
+
+	phat := float64(success) / n
+	logAlt := binomialLogLikelihood(float64(success), n, phat)
+	logNull := binomialLogLikelihood(float64(success), n, p0)
+	return (logAlt - logNull) / math.Log(10)
+}
+
+func oneBulkBetaBinomialLogBF(success, fail int, p0 float64) float64 {
+	if success+fail == 0 || p0 <= 0 || p0 >= 1 {
+		return 0
+	}
+
+	logAlt := logBeta(0.5+float64(success), 0.5+float64(fail)) - logBeta(0.5, 0.5)
+	logNull := float64(success)*math.Log(p0) + float64(fail)*math.Log(1-p0)
+	return (logAlt - logNull) / math.Log(10)
+}
+
+func binomialLogLikelihood(k, n, p float64) float64 {
+	const eps = 1e-10
+	if p <= 0 {
+		p = eps
+	}
+	if p >= 1 {
+		p = 1 - eps
+	}
+	return k*math.Log(p) + (n-k)*math.Log(1-p)
 }
 
 func logBeta(a, b float64) float64 {

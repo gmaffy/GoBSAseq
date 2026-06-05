@@ -2,7 +2,6 @@ package utils
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"time"
@@ -30,10 +29,8 @@ func getFloat(v *vcfgo.Variant, key string) (float64, bool) {
 func CreateResultsDir(outputDir string) (string, error) {
 
 	baseDir := filepath.Join(outputDir, "goBSAseqResults")
-	bErr := os.MkdirAll(filepath.Join(outputDir, "goBSAseqResults"), 0755)
-	if bErr != nil {
-		log.Fatalf("Error creating results directory: %s\n", bErr)
-		return "", bErr
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return "", fmt.Errorf("error creating results directory: %w", err)
 	}
 
 	now := time.Now()
@@ -41,9 +38,7 @@ func CreateResultsDir(outputDir string) (string, error) {
 
 	err := os.MkdirAll(resultsDir, 0755)
 	if err != nil {
-		log.Fatalf("Error creating results directory: %s\n", err)
-		return "", err
-
+		return "", fmt.Errorf("error creating results directory: %w", err)
 	}
 	fmt.Printf("Created results directory at %s ..\n\n", resultsDir)
 
