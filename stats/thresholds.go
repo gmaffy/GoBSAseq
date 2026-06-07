@@ -1,43 +1,92 @@
 package stats
 
 import (
-	"bufio"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
-// Thresholds calculates per-chromosome thresholds for a selection of smoothed
-// statistics (both on the smoothed scale and on the robust z-score / normalized
-// scale). It writes a TSV file with one row per (chrom, stat, metric).
-// The implementation keeps readability high and avoids unnecessary helpers.
-func Thresholds(cfg utils.AnalysisConfig, bsaType string, smoothed []BSASmoothStats) error {
-	hasHighBulk := strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
-	hasLowBulk := strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
-	hasBothBulks := hasHighBulk && hasLowBulk
-	hasOneBulk := hasHighBulk != hasLowBulk
+// simple Thresholds struct for results
+type ThresholdValues struct {
+	DeltaSI  float64
+	Gstat    float64
+	ED       float64
+	LOD      float64
+	BBLogBF  float64
+	AFDev    float64 // one-bulk
+	CompositeZ float64
+	MaxAbsZ  float64
+}
 
-	// group by chromosome
-	byChrom := make(map[string][]BSASmoothStats)
-	chroms := make([]string, 0)
-	seen := make(map[string]bool)
-	for _, s := range smoothed {
-		byChrom[s.CHROM] = append(byChrom[s.CHROM], s)
-		if !seen[s.CHROM] {
-			chroms = append(chroms, s.CHROM)
-			seen[s.CHROM] = true
-		}
+// empQuantile returns the empirical quantile at q (0..1) using the "ceiling" method
+// i.e., the smallest value v such that at least q fraction of observations are <= v.
+func empQuantile(vals []float64, q float64) float64 {
+	n := len(vals)
+	if n == 0 {
+		return 0
+	}
+	sorted := make([]float64, n)
+	copy(sorted, vals)
+	sort.Float64s(sorted)
+	if q <= 0 {
+		return sorted[0]
+	}
+	if q >= 1 {
+		return sorted[n-1]
+	}
+	idx := int(math.Ceil(q*float64(n))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+// Thresholds computes simple empirical thresholds for smoothed raw statistics,
+// their robust Z-scores, and consolidated scores (CompositeZ, MaxAbsZ). It
+// writes a TSV file under cfg.OutputDir/stats and prints a short summary.
+func Thresholds(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) error {
+	if len(sm) == 0 {
+		return fmt.Errorf("no smoothed stats supplied")
 	}
 
-	if len(chroms) == 0 {
-		color.Yellow("No smoothed windows found; skipping threshold calculation")
-		return nil
+	_, _, hasBoth, hasOne := bulkFlags(bsaType)
+
+	// collect smoothed raw values and Z-scores
+	var sDelta, sG, sE, sL, sB []float64
+	var zDelta, zG, zE, zL, zB []float64
+	var sAF, zAF []float64
+	var compAbs, maxAbs []float64
+
+	for i := range sm {
+		s := sm[i]
+		if hasBoth {
+			sDelta = append(sDelta, math.Abs(s.SmDeltaSI))
+			sG = append(sG, s.SmGstat)
+			sE = append(sE, s.SmED)
+			sL = append(sL, s.SmLOD)
+			sB = append(sB, s.SmBBLogBF)
+
+			zDelta = append(zDelta, math.Abs(s.ZDeltaSI))
+			zG = append(zG, math.Abs(s.ZGstat))
+			zE = append(zE, math.Abs(s.ZED))
+			zL = append(zL, math.Abs(s.ZLOD))
+			zB = append(zB, math.Abs(s.ZBBLogBF))
+		}
+		if hasOne {
+			sAF = append(sAF, math.Abs(s.SmAFDev))
+			zAF = append(zAF, math.Abs(s.ZAFDev))
+		}
+		// consolidated
+		compAbs = append(compAbs, math.Abs(s.CompositeZ))
+		maxAbs = append(maxAbs, math.Abs(s.MaxAbsZ))
 	}
 
 	outDir := filepath.Join(cfg.OutputDir, "stats")
@@ -50,196 +99,48 @@ func Thresholds(cfg utils.AnalysisConfig, bsaType string, smoothed []BSASmoothSt
 		return err
 	}
 	defer f.Close()
-	w := bufio.NewWriter(f)
-	defer w.Flush()
 
-	header := []string{"CHROM", "STAT", "SMOOTHED_P95", "SMOOTHED_P99", "SMOOTHED_P999", "NORML_Z3", "NORML_P95", "NORML_P99", "NORML_P999"}
-	fmt.Fprintln(w, strings.Join(header, "\t"))
+	w := f
+	// header: Stat, Smoothed_p95, Smoothed_p99, Z_p95, Z_p99
+	fmt.Fprintln(w, "Stat\tSmoothed_p95\tSmoothed_p99\tZ_p95\tZ_p99\tSmoothed_p95_neg\tSmoothed_p99_neg\tZ_p95_neg\tZ_p99_neg")
 
-	// local helpers kept inside function for readability
-	percentile := func(vals []float64, p float64) float64 {
-		if len(vals) == 0 {
-			return math.NaN()
-		}
-		s := append([]float64(nil), vals...)
-		sort.Float64s(s)
-		if p <= 0 {
-			return s[0]
-		}
-		if p >= 1 {
-			return s[len(s)-1]
-		}
-		idx := p*float64(len(s)-1)
-		lo := int(math.Floor(idx))
-		hi := int(math.Ceil(idx))
-		if lo == hi {
-			return s[lo]
-		}
-		fract := idx - float64(lo)
-		return s[lo]*(1-fract) + s[hi]*fract
+	alphas := []float64{0.05, 0.01}
+	qs := []float64{1 - alphas[0], 1 - alphas[1]} // 0.95, 0.99
+
+	// generic writer: fills neg columns as empty (used by non-DeltaSI stats)
+	writeRow := func(name string, smVals, zVals []float64) {
+		p95 := empQuantile(smVals, qs[0])
+		p99 := empQuantile(smVals, qs[1])
+		z95 := empQuantile(zVals, qs[0])
+		z99 := empQuantile(zVals, qs[1])
+		fmt.Fprintf(w, "%s\t%.6f\t%.6f\t%.6f\t%.6f\t\t\t\t\n", name, p95, p99, z95, z99)
 	}
 
-	// robust z-score (median + MAD fallback to sd) — same logic as normalising.go
-	robustZ := func(values []float64) []float64 {
-		z := make([]float64, len(values))
-		if len(values) == 0 {
-			return z
-		}
+	if hasBoth {
+		// DeltaSI: explicitly emit signed thresholds (pos and neg) for plotting convenience
+		p95 := empQuantile(sDelta, qs[0])
+		p99 := empQuantile(sDelta, qs[1])
+		z95 := empQuantile(zDelta, qs[0])
+		z99 := empQuantile(zDelta, qs[1])
+		fmt.Fprintf(w, "DeltaSI\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n", p95, p99, z95, z99, -p95, -p99, -z95, -z99)
 
-		sorted := append([]float64(nil), values...)
-		sort.Float64s(sorted)
-		median := sorted[len(sorted)/2]
-		if len(sorted)%2 == 0 {
-			median = (sorted[len(sorted)/2-1] + sorted[len(sorted)/2]) / 2
-		}
-
-		dev := make([]float64, len(values))
-		for i, v := range values {
-			dev[i] = math.Abs(v - median)
-		}
-		sort.Float64s(dev)
-		mad := dev[len(dev)/2]
-		if len(dev)%2 == 0 {
-			mad = (dev[len(dev)/2-1] + dev[len(dev)/2]) / 2
-		}
-
-		if mad > 0 {
-			for i, v := range values {
-				z[i] = math.Round((0.6745*(v-median)/mad)*1e6) / 1e6
-			}
-			return z
-		}
-
-		// fallback to mean/std
-		mean := 0.0
-		for _, v := range values {
-			mean += v
-		}
-		mean /= float64(len(values))
-		variance := 0.0
-		for _, v := range values {
-			d := v - mean
-			variance += d * d
-		}
-		sd := math.Sqrt(variance / float64(len(values)))
-		if sd == 0 {
-			return z
-		}
-		for i, v := range values {
-			z[i] = math.Round(((v-mean)/sd)*1e6) / 1e6
-		}
-		return z
+		writeRow("Gstat", sG, zG)
+		writeRow("ED", sE, zE)
+		writeRow("LOD", sL, zL)
+		writeRow("BBLogBF", sB, zB)
+	}
+	if hasOne {
+		writeRow("AFDev", sAF, zAF)
 	}
 
-	for _, chrom := range chroms {
-		windows := byChrom[chrom]
-		if len(windows) == 0 {
-			continue
-		}
+	// CompositeZ and MaxAbsZ (Z-space only). For consistency write zeros in Smoothed columns.
+	c95 := empQuantile(compAbs, qs[0])
+	c99 := empQuantile(compAbs, qs[1])
+	fmt.Fprintf(w, "CompositeZ\t%.6f\t%.6f\t%.6f\t%.6f\n", 0.0, 0.0, c95, c99)
 
-		// collect arrays for each stat
-		delta := make([]float64, 0, len(windows))
-		gprime := make([]float64, 0, len(windows))
-		ed := make([]float64, 0, len(windows))
-		lod := make([]float64, 0, len(windows))
-		bb := make([]float64, 0, len(windows))
-		high := make([]float64, 0, len(windows))
-		low := make([]float64, 0, len(windows))
-		afdev := make([]float64, 0, len(windows))
-		oneG := make([]float64, 0, len(windows))
-		oneLOD := make([]float64, 0, len(windows))
-		oneBB := make([]float64, 0, len(windows))
-
-		for _, w := range windows {
-			if hasBothBulks {
-				delta = append(delta, w.DeltaSI)
-				gprime = append(gprime, w.Gprime)
-				ed = append(ed, w.ED)
-				lod = append(lod, w.LOD)
-				bb = append(bb, w.BBLogBF)
-			}
-			if hasHighBulk {
-				high = append(high, w.HighSI)
-			}
-			if hasLowBulk {
-				low = append(low, w.LowSI)
-			}
-			if hasOneBulk {
-				afdev = append(afdev, w.OneBulkAFDev)
-				oneG = append(oneG, w.OneBulkGprime)
-				oneLOD = append(oneLOD, w.OneBulkLOD)
-				oneBB = append(oneBB, w.OneBulkBBLogBF)
-			}
-		}
-
-		// compute normalized z-scores per-chrom
-		deltaZ := robustZ(delta)
-		gZ := robustZ(gprime)
-		edZ := robustZ(ed)
-		lodZ := robustZ(lod)
-		bbZ := robustZ(bb)
-		highZ := robustZ(high)
-		lowZ := robustZ(low)
-		afdevZ := robustZ(afdev)
-		oneGZ := robustZ(oneG)
-		oneLODZ := robustZ(oneLOD)
-		oneBBZ := robustZ(oneBB)
-
-		// for each stat write thresholds: smoothed percentiles and normalized z thresholds
-		writeRow := func(stat string, smoothedVals []float64, normZ []float64) {
-			s95 := percentile(smoothedVals, 0.95)
-			s99 := percentile(smoothedVals, 0.99)
-			s999 := percentile(smoothedVals, 0.999)
-			// normalized thresholds: fixed Z=3 and percentile thresholds on Z
-			z3 := 3.0
-			z95 := percentile(normZ, 0.95)
-			z99 := percentile(normZ, 0.99)
-			z999 := percentile(normZ, 0.999)
-			fmt.Fprintf(w, "%s\t%s\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", chrom, stat, s95, s99, s999, z3, z95, z99, z999)
-		}
-
-		if hasBothBulks {
-			writeRow("DeltaSI", delta, deltaZ)
-			writeRow("Gprime", gprime, gZ)
-			writeRow("ED4", ed, edZ)
-			writeRow("LOD", lod, lodZ)
-			writeRow("BBLogBF", bb, bbZ)
-			// also write negative tail for DeltaSI (two-sided)
-			// report negative percentiles as lower tail values
-			if len(delta) > 0 {
-				small95 := percentile(delta, 0.05)
-				small99 := percentile(delta, 0.01)
-				small999 := percentile(delta, 0.001)
-				fmt.Fprintf(w, "%s\t%s_LO\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", chrom, "DeltaSI", small95, small99, small999, -3.0, -percentile(deltaZ, 0.05), -percentile(deltaZ, 0.01), -percentile(deltaZ, 0.001))
-			}
-		}
-		if hasHighBulk {
-			writeRow("HighSI", high, highZ)
-			// negative tail for HighSI
-			if len(high) > 0 {
-				small95 := percentile(high, 0.05)
-				small99 := percentile(high, 0.01)
-				small999 := percentile(high, 0.001)
-				fmt.Fprintf(w, "%s\t%s_LO\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", chrom, "HighSI", small95, small99, small999, -3.0, -percentile(highZ, 0.05), -percentile(highZ, 0.01), -percentile(highZ, 0.001))
-			}
-		}
-		if hasLowBulk {
-			writeRow("LowSI", low, lowZ)
-			// negative tail for LowSI
-			if len(low) > 0 {
-				small95 := percentile(low, 0.05)
-				small99 := percentile(low, 0.01)
-				small999 := percentile(low, 0.001)
-				fmt.Fprintf(w, "%s\t%s_LO\t%v\t%v\t%v\t%v\t%v\t%v\t%v\n", chrom, "LowSI", small95, small99, small999, -3.0, -percentile(lowZ, 0.05), -percentile(lowZ, 0.01), -percentile(lowZ, 0.001))
-			}
-		}
-		if hasOneBulk {
-			writeRow("AFDev", afdev, afdevZ)
-			writeRow("Gprime1", oneG, oneGZ)
-			writeRow("LOD1", oneLOD, oneLODZ)
-			writeRow("BBLogBF1", oneBB, oneBBZ)
-		}
-	}
+	m95 := empQuantile(maxAbs, qs[0])
+	m99 := empQuantile(maxAbs, qs[1])
+	fmt.Fprintf(w, "MaxAbsZ\t%.6f\t%.6f\t%.6f\t%.6f\n", 0.0, 0.0, m95, m99)
 
 	color.Green("Thresholds written to %s", outPath)
 	return nil

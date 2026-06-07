@@ -5,25 +5,39 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c8fd8c0f-4d75-492d-a3fe-ad2db847de31" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/cmd/root.go" beforeDir="false" afterPath="$PROJECT_DIR$/cmd/root.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/filter/filter.go" beforeDir="false" afterPath="$PROJECT_DIR$/filter/filter.go" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/plots/plots.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/run/run.go" beforeDir="false" afterPath="$PROJECT_DIR$/run/run.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/stats.go" beforeDir="false" afterPath="$PROJECT_DIR$/stats/stats.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/utils/utils.go" beforeDir="false" afterPath="$PROJECT_DIR$/utils/utils.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/brm.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/fisher.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/normalising.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/smoothing.go" beforeDir="false" afterPath="$PROJECT_DIR$/stats/smoothing.go" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/thresholds.go" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
   </component>
+  <component name="CopilotPersistence">
+    <persistenceIdMap>
+      <entry key="_D:/GitHub/GoBSAseq" value="3EiiUf39on6IwODULDa31ZPEDsO" />
+    </persistenceIdMap>
+  </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="22" />
+    <option name="cachedIndexableFilesCount" value="36" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
-  <component name="GOROOT" url="file://C:/Program Files/Go" />
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Go File" />
+      </list>
+    </option>
+  </component>
+  <component name="GOROOT" url="file://$USER_HOME$/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.3.windows-amd64" />
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
@@ -33,23 +47,23 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.0000003490652314" />
-      <entry key="MS500" value="1.05153926400573" />
-      <entry key="S2" value="1.618684053081289" />
-      <entry key="S5" value="2.202360308106223" />
-      <entry key="S10" value="2.5397709469913607" />
-      <entry key="S30" value="2.8335467849616442" />
-      <entry key="S60" value="3.0100712788038786" />
-      <entry key="M2" value="3.538050833506553" />
-      <entry key="M5" value="4.797968085936331" />
-      <entry key="M10" value="5.67731605505339" />
-      <entry key="M15" value="6.059302846787281" />
-      <entry key="M30" value="6.497318784113469" />
-      <entry key="H1" value="6.739985105216717" />
-      <entry key="H2" value="6.867745210589988" />
-      <entry key="H4" value="6.933300600906156" />
-      <entry key="D1" value="6.988803109886287" />
-      <entry key="W1" value="6.998398465599313" />
+      <entry key="MS100" value="1.7955364837549186" />
+      <entry key="MS500" value="1.9552829363824373" />
+      <entry key="S2" value="1.9886282245672153" />
+      <entry key="S5" value="1.995444445960586" />
+      <entry key="S10" value="2.0033792075143753" />
+      <entry key="S30" value="2.546744535193636" />
+      <entry key="S60" value="3.870811864452409" />
+      <entry key="M2" value="5.564177335056165" />
+      <entry key="M5" value="7.320713686689868" />
+      <entry key="M10" value="8.09811173437102" />
+      <entry key="M15" value="8.38394311863183" />
+      <entry key="M30" value="8.710984499738228" />
+      <entry key="H1" value="9.551717099904181" />
+      <entry key="H2" value="13.458573751830727" />
+      <entry key="H4" value="22.828562180703845" />
+      <entry key="D1" value="50.0969718302974" />
+      <entry key="W1" value="59.263647254545724" />
     </decayedCancelled>
     <decayedSelected>
       <entry key="MS100" value="0.0" />
@@ -57,43 +71,43 @@
       <entry key="S2" value="0.0" />
       <entry key="S5" value="0.0" />
       <entry key="S10" value="0.0" />
-      <entry key="S30" value="0.0" />
-      <entry key="S60" value="0.0" />
-      <entry key="M2" value="0.0" />
-      <entry key="M5" value="0.0" />
-      <entry key="M10" value="0.0" />
-      <entry key="M15" value="0.0" />
-      <entry key="M30" value="0.0" />
-      <entry key="H1" value="0.0" />
-      <entry key="H2" value="0.0" />
-      <entry key="H4" value="0.0" />
-      <entry key="D1" value="0.0" />
-      <entry key="W1" value="0.0" />
+      <entry key="S30" value="4.73746605936785E-224" />
+      <entry key="S60" value="4.287962083303987E-112" />
+      <entry key="M2" value="4.124194389872174E-56" />
+      <entry key="M5" value="1.6103235657025452E-22" />
+      <entry key="M10" value="2.5375132214242107E-11" />
+      <entry key="M15" value="1.3706966409706502E-7" />
+      <entry key="M30" value="7.404434136425687E-4" />
+      <entry key="H1" value="0.05442190347786922" />
+      <entry key="H2" value="0.46656945944225664" />
+      <entry key="H4" value="1.3661173634705495" />
+      <entry key="D1" value="3.3442441455580205" />
+      <entry key="W1" value="3.8989811131405294" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="0.8827033065547311" />
-      <entry key="MS500" value="1.0256943002584742" />
-      <entry key="S2" value="1.6088307310425132" />
-      <entry key="S5" value="2.1970378223232556" />
-      <entry key="S10" value="2.5367107392343904" />
-      <entry key="S30" value="2.8324104361873754" />
-      <entry key="S60" value="3.009446538122388" />
-      <entry key="M2" value="3.5375808162158413" />
-      <entry key="M5" value="4.7975816165952585" />
-      <entry key="M10" value="5.6770453978721855" />
-      <entry key="M15" value="6.059099145195135" />
-      <entry key="M30" value="6.4972033465114025" />
-      <entry key="H1" value="6.739923572110053" />
-      <entry key="H2" value="6.86771343328596" />
-      <entry key="H4" value="6.933284452085086" />
-      <entry key="D1" value="6.98880038163036" />
-      <entry key="W1" value="6.998398074938988" />
+      <entry key="MS100" value="0.8888426811841169" />
+      <entry key="MS500" value="0.9837690971399703" />
+      <entry key="S2" value="1.2840000046864388" />
+      <entry key="S5" value="1.6070263285602182" />
+      <entry key="S10" value="1.7841605754184886" />
+      <entry key="S30" value="2.435076013749659" />
+      <entry key="S60" value="3.7754654728003687" />
+      <entry key="M2" value="5.492865880740556" />
+      <entry key="M5" value="7.282934784406687" />
+      <entry key="M10" value="8.07724831383944" />
+      <entry key="M15" value="8.369557329215757" />
+      <entry key="M30" value="8.704281521911103" />
+      <entry key="H1" value="9.602308790259483" />
+      <entry key="H2" value="13.92305144767966" />
+      <entry key="H4" value="24.1934554559715" />
+      <entry key="D1" value="53.44094658410678" />
+      <entry key="W1" value="63.16258723416408" />
     </decayedShown>
   </component>
-  <component name="ProjectColorInfo"><![CDATA[{
-  "customColor": "",
-  "associatedIndex": 0
-}]]></component>
+  <component name="ProjectColorInfo">{
+  &quot;customColor&quot;: &quot;&quot;,
+  &quot;associatedIndex&quot;: 0
+}</component>
   <component name="ProjectId" id="3EiiUf39on6IwODULDa31ZPEDsO" />
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
@@ -101,11 +115,13 @@
   </component>
   <component name="PropertiesComponent"><![CDATA[{
   "keyToString": {
+    "DefaultGoTemplateProperty": "Go File",
     "ModuleVcsDetector.initialDetectionPerformed": "true",
     "RunOnceActivity.GoLinterPluginOnboardingV2": "true",
     "RunOnceActivity.GoLinterPluginStorageMigration": "true",
     "RunOnceActivity.MCP Project settings loaded": "true",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "RunOnceActivity.go.analysis.ui.options.defaults": "true",
     "RunOnceActivity.go.formatter.settings.were.checked": "true",
@@ -116,13 +132,24 @@
     "git-widget-placeholder": "main",
     "go.sdk.automatically.set": "true",
     "junie.onboarding.icon.badge.shown": "true",
-    "last_opened_file_path": "C:/Users/GodwinMafireyi",
+    "last_opened_file_path": "C:/Users/mafir",
     "node.js.detected.package.eslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
     "to.speed.mode.migration.done": "true"
   }
 }]]></component>
+  <component name="RunManager">
+    <configuration name="go build github.com/gmaffy/GoBSAseq" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+      <module name="GoBSAseq" />
+      <working_directory value="$PROJECT_DIR$" />
+      <kind value="PACKAGE" />
+      <package value="github.com/gmaffy/GoBSAseq" />
+      <directory value="$PROJECT_DIR$" />
+      <auto_managed_config_id value="$PROJECT_DIR$" />
+      <method v="2" />
+    </configuration>
+  </component>
   <component name="SharedIndexes">
     <attachedChunks>
       <set>
@@ -143,5 +170,21 @@
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" type="DlvLineBreakpoint">
+          <url>file://$PROJECT_DIR$/stats/stats.go</url>
+          <line>526</line>
+          <option name="timeStamp" value="1" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" type="DlvLineBreakpoint">
+          <url>file://$PROJECT_DIR$/stats/thresholds.go</url>
+          <line>14</line>
+          <option name="timeStamp" value="5" />
+        </line-breakpoint>
+      </breakpoints>
+    </breakpoint-manager>
   </component>
 </project>

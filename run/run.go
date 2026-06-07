@@ -12,6 +12,7 @@ import (
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
+	"github.com/gmaffy/GoBSAseq/plots"
 	"github.com/gmaffy/GoBSAseq/stats"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
@@ -73,13 +74,13 @@ func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
 		fmt.Println("=================================== Running High parent 2 bulks ===========================================")
 		return "hp2b", []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	case hp && !lp && hb && !lb:
-		fmt.Println("=================================== Running high parent high bulk ===========================================")
+		fmt.Println("=================================== Running high parent high bulk ==========================================")
 		return "hphb", []int{cfg.HighParentIdx, cfg.HighBulkIdx}, nil
 	case hp && !lp && !hb && lb:
-		fmt.Println("Running High parent low bulk")
+		fmt.Println("=================================== Running High parent low bulk ===========================================")
 		return "hplb", []int{cfg.HighParentIdx, cfg.LowBulkIdx}, nil
 	case !hp && lp && hb && lb:
-		fmt.Println("Running Low parent 2 bulks")
+		fmt.Println("=================================== Running Low parent 2 bulks =============================================")
 		return "lp2b", []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	case !hp && lp && hb && !lb:
 		fmt.Println("Running Low parent high bulk")
@@ -113,24 +114,29 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	}
 
 	// ---------------------------------------- smoothing ------------------------------------------------------------//
-	smoothedStats, err := stats.SmoothStats(*cfg, btype, rawStats)
+	smoothedStats, err := stats.SmoothAndNormalise(*cfg, btype, rawStats)
 	if err != nil {
 		return err
 	}
 
-	// ---------------------------------------- normalise stats ------------------------------------------------------//
-	if err := stats.NormalizeSmoothedStats(*cfg, btype, smoothedStats); err != nil {
-		return err
-	}
+	fmt.Println(len(smoothedStats))
 
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
 	if err := stats.Thresholds(*cfg, btype, smoothedStats); err != nil {
 		return err
 	}
 
-	// ------------------------------------------ BRM & Fisher STATS ------------------------------------------------ //
+	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
+	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Detected %d BRM blocks\n", len(brmBlocks))
 
 	// ------------------------------------------ Plots ------------------------------------------------------------- //
+	if err := plots.CreatePlots(*cfg, btype, smoothedStats, brmBlocks); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -394,10 +400,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 			fmt.Printf("LOW BULK number should be numerical and part of the list above: %s\n", err)
 			return fmt.Errorf("invalid input")
 		}
-		// if lowBulkChoice == highBulkChoice || lowBulkChoice == highParentChoice || lowBulkChoice == lowParentChoice {
-		// 	fmt.Println("Your LOW bulk cannot be the same as any of the parents OR the HIGH bulk")
-		// 	return fmt.Errorf("invalid input")
-		// }
+
 		if !slices.Contains(keys, lowBulkChoice) {
 			color.Red("The selected number is not in the list.")
 			return fmt.Errorf("invalid input")

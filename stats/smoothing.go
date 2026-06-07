@@ -1,8 +1,50 @@
 package stats
 
+// smoothing.go — post-processing pipeline for GoBSAseq raw statistics
+//
+// Pipeline:
+//
+//  1. SMOOTHING  — depth-weighted Gaussian kernel smoothing per chromosome.
+//     Each smoothed value is the depth-weighted mean of neighbouring raw
+//     values, with weights = depth × Gaussian(Δpos, σ).
+//     σ (bandwidth) is derived directly from cfg.WindowSize:
+//       σ = WindowSize / 2
+//     A Gaussian with this σ places ~95% of its kernel weight within one
+//     WindowSize, matching the intuition of the existing sliding-window
+//     analysis while avoiding the hard edge artefacts of a rectangular window.
+//     cfg.StepSize is not used here: the kernel evaluates at every variant
+//     position rather than at fixed grid steps.
+//     Depth weighting follows Magwene et al. 2011 and is essential because
+//     BSA coverage is heterogeneous; low-depth sites would otherwise inflate
+//     variance at QTL boundaries.
+//     A 3σ bandwidth cutoff is applied to limit each kernel's influence to
+//     variants within 3 × σ bp, reducing the per-chromosome O(n²) cost to
+//     O(n × m) where m is the average number of variants within 3σ.
+//     Windows with fewer than minVariantsInKernel contributing variants are
+//     skipped (guard against sparse regions, mirrors the original
+//     minSNPsPerWindow = 5 guard in the sliding-window code).
+//
+//  2. NORMALISATION — per-statistic robust Z-score across ALL chromosomes:
+//       Z = (x − median) / (1.4826 × MAD)
+//     MAD = median(|x − median(x)|); the 1.4826 factor makes MAD a consistent
+//     estimator of σ under normality (Rousseeuw & Croux 1993).
+//     When MAD = 0 (constant-valued statistics), the function falls back to
+//     classical Z = (x − mean) / SD, and if SD is also 0 it returns zeros.
+//
+//  3. CONSOLIDATION — Stouffer's Z combination across all valid statistics:
+//       composite_Z = Σ Z_i / √k
+//     This is strictly more powerful than max|Z| when statistics agree
+//     (which they do at genuine QTLs), preserves signal direction from
+//     DeltaSI / OneBulkAFDev, and is the approach recommended by
+//     Magwene et al. 2011 for multi-statistic BSA-seq.
+//     The composite is written alongside max|Z| so users can compare.
+
 import (
+	"bufio"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -10,165 +52,563 @@ import (
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
-const minSNPsPerWindow = 5
+// minVariantsInKernel is the minimum number of variants that must contribute
+// non-zero kernel weight to a smoothed position.  Mirrors the original
+// minSNPsPerWindow = 5 guard in the sliding-window implementation.
+const minVariantsInKernel = 5
 
-type BSASmoothStats struct {
-	CHROM        string
-	WindowStart  int64
-	WindowEnd    int64
-	WindowCenter int64
-	NSites       int
-	MeanDepth    float64
+// kernelCutoffSigmas is the Gaussian truncation radius in units of σ.
+// Variants further than this from the query position receive zero weight.
+// 3σ retains 99.7 % of a Gaussian's area while giving ~O(n × m) complexity
+// instead of the O(n²) incurred by an untruncated kernel.
+const kernelCutoffSigmas = 3.0
 
-	HighSI  float64
-	LowSI   float64
-	DeltaSI float64
-	Gprime  float64
-	ED      float64
-	LOD     float64
-	BBLogBF float64
+// SmoothedStats holds the smoothed, normalised, and consolidated results for
+// one variant position.  All "Sm" fields are smoothed raw values; "Z" fields
+// are robust Z-scores of the smoothed values; CompositeZ is Stouffer's Z;
+// MaxAbsZ is the max|Z| across statistics (retained for comparison with
+// older pipelines).
+type SmoothedStats struct {
+	CHROM string
+	POS   int64
+	REF   string
+	ALT   string
+	Depth int
 
-	OneBulkP0      float64
-	OneBulkAFDev   float64
-	OneBulkGprime  float64
-	OneBulkLOD     float64
-	OneBulkBBLogBF float64
+	// ── smoothed raw values ─────────────────────────────────────────────
+	// Two-bulk
+	SmHighSI  float64
+	SmLowSI   float64
+	SmDeltaSI float64
+	SmGstat   float64
+	SmED      float64
+	SmLOD     float64
+	SmBBLogBF float64
+	// One-bulk
+	OneBulkP0      float64 // carries the per-site prior (not smoothed; taken from last contributor)
+	SmAFDev        float64
+	SmOneBulkG     float64
+	SmOneBulkLOD   float64
+	SmOneBulkBBLogBF float64
+
+	// ── robust Z-scores of smoothed values ──────────────────────────────
+	ZHighSI  float64
+	ZLowSI   float64
+	ZDeltaSI float64
+	ZGstat   float64
+	ZED      float64
+	ZLOD     float64
+	ZBBLogBF float64
+	ZAFDev         float64
+	ZOneBulkG      float64
+	ZOneBulkLOD    float64
+	ZOneBulkBBLogBF float64
+
+	// ── consolidated scores ──────────────────────────────────────────────
+	// Stouffer's Z: Σ Z_i / √k  (signed; sign from DeltaSI / AFDev)
+	CompositeZ float64
+	// max|Z| across all valid statistics (unsigned)
+	MaxAbsZ float64
 }
 
-func SmoothStats(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]BSASmoothStats, error) {
+// SmoothAndNormalise is the main entry point.  It takes the raw BSAstats
+// slice, applies the full pipeline, writes the output TSV, and returns the
+// SmoothedStats slice.
+//
+// Gaussian kernel σ (bandwidth) is derived from cfg.WindowSize:
+//
+//	σ = WindowSize / 2
+//
+// This places ~95% of each kernel's weight within one WindowSize, matching
+// the intuition of the existing sliding-window analysis while avoiding hard
+// edge artefacts.  cfg.StepSize is not consumed here: the kernel evaluates
+// at every variant position rather than on a fixed grid.
+func SmoothAndNormalise(
+	cfg utils.AnalysisConfig,
+	bsaType string,
+	rawStats []BSAstats,
+) ([]SmoothedStats, error) {
+
+	if len(rawStats) == 0 {
+		return nil, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
+	}
 	if cfg.WindowSize <= 0 {
-		return nil, fmt.Errorf("window size must be greater than 0")
-	}
-	if cfg.StepSize <= 0 {
-		return nil, fmt.Errorf("step size must be greater than 0")
+		return nil, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
 	}
 
-	hasHighBulk := strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
-	hasLowBulk := strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
-	hasBothBulks := hasHighBulk && hasLowBulk
-	hasOneBulk := hasHighBulk != hasLowBulk
+	bw := float64(cfg.WindowSize) / 2.0
 
-	byChrom := make(map[string][]BSAstats)
-	chroms := make([]string, 0)
-	seenChrom := make(map[string]bool)
-	for _, s := range rawStats {
-		byChrom[s.CHROM] = append(byChrom[s.CHROM], s)
-		if !seenChrom[s.CHROM] {
-			chroms = append(chroms, s.CHROM)
-			seenChrom[s.CHROM] = true
+	color.Cyan("\n============================ Smoothing & Normalising (%s) ============================\n\n", bsaType)
+	color.Cyan("Gaussian kernel σ = %.0f bp  (WindowSize=%d / 2)\n\n", bw, cfg.WindowSize)
+
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
+
+	// ── 1. Gaussian kernel smoothing per chromosome ──────────────────────
+	smoothed, err := gaussianSmooth(rawStats, bw, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+	if err != nil {
+		return nil, err
+	}
+
+	// ── 2. Robust Z-score normalisation (global, across all chroms) ───────
+	normalise(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+
+	// ── 3. Stouffer's Z consolidation ─────────────────────────────────────
+	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+
+	// ── 4. Write TSV ───────────────────────────────────────────────────────
+	outDir := filepath.Join(cfg.OutputDir, "stats")
+	if err := os.MkdirAll(outDir, 0775); err != nil {
+		return nil, err
+	}
+	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.smoothed_and_normalised.tsv", bsaType))
+	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk); err != nil {
+		return nil, err
+	}
+
+	color.Green("Smoothed & normalised stats written to %s (%d variants)\n", outPath, len(smoothed))
+	return smoothed, nil
+}
+
+// ─── smoothing ─────────────────────────────────────────────────────────────────
+
+// gaussianSmooth applies depth-weighted Gaussian kernel smoothing to each
+// numeric statistic independently, grouped by chromosome.
+// bw is the Gaussian σ in base-pairs (= cfg.WindowSize / 2).
+// Variants further than kernelCutoffSigmas × bw bp from the query position
+// are excluded, reducing per-chromosome complexity from O(n²) to O(n × m).
+func gaussianSmooth(
+	raw []BSAstats,
+	bw float64,
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
+) ([]SmoothedStats, error) {
+
+	cutoff := kernelCutoffSigmas * bw // hard distance cutoff in bp
+
+	// Sort a working index by CHROM then POS.
+	idx := make([]int, len(raw))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(a, b int) bool {
+		sa, sb := raw[idx[a]], raw[idx[b]]
+		if sa.CHROM != sb.CHROM {
+			return sa.CHROM < sb.CHROM
+		}
+		return sa.POS < sb.POS
+	})
+
+	out := make([]SmoothedStats, len(raw))
+
+	i := 0
+	for i < len(idx) {
+		// Find the full extent of the current chromosome.
+		chrom := raw[idx[i]].CHROM
+		j := i
+		for j < len(idx) && raw[idx[j]].CHROM == chrom {
+			j++
+		}
+		chromIdx := idx[i:j]
+		n := len(chromIdx)
+
+		// Pre-extract position and depth for this chromosome.
+		pos := make([]float64, n)
+		depth := make([]float64, n)
+		for k, ci := range chromIdx {
+			pos[k] = float64(raw[ci].POS)
+			depth[k] = math.Max(float64(raw[ci].Depth), 1)
+		}
+
+		// smooth1 computes one depth-weighted Gaussian smoothed slice.
+		// The inner loop uses binary search to find the [lo, hi) range of
+		// variants within the cutoff, avoiding a full O(n) scan per query.
+		smooth1 := func(vals []float64) ([]float64, []int) {
+			smVals := make([]float64, n)
+			nContrib := make([]int, n) // number of variants with w > 0
+			for k := range n {
+				pK := pos[k]
+				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
+				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
+
+				wSum, wValSum := 0.0, 0.0
+				for m := lo; m < hi; m++ {
+					d := (pos[m] - pK) / bw
+					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
+					if w <= 0 {
+						continue
+					}
+					wSum += w
+					wValSum += w * vals[m]
+					nContrib[k]++
+				}
+				if wSum > 0 {
+					smVals[k] = wValSum / wSum
+				}
+			}
+			return smVals, nContrib
+		}
+
+		// Collect (raw values, setter) pairs for every active statistic.
+		type statPair struct {
+			vals   []float64
+			setter func(sm *SmoothedStats, v float64)
+		}
+		var pairs []statPair
+
+		if hasHighBulk {
+			hsi := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.HighSI })
+			pairs = append(pairs, statPair{hsi, func(sm *SmoothedStats, v float64) { sm.SmHighSI = v }})
+		}
+		if hasLowBulk {
+			lsi := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.LowSI })
+			pairs = append(pairs, statPair{lsi, func(sm *SmoothedStats, v float64) { sm.SmLowSI = v }})
+		}
+		if hasBothBulks {
+			dsi := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.DeltaSI })
+			gst := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.Gstat })
+			ed := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.ED })
+			lod := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.LOD })
+			bb := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.BBLogBF })
+			pairs = append(pairs,
+				statPair{dsi, func(sm *SmoothedStats, v float64) { sm.SmDeltaSI = v }},
+				statPair{gst, func(sm *SmoothedStats, v float64) { sm.SmGstat = v }},
+				statPair{ed, func(sm *SmoothedStats, v float64) { sm.SmED = v }},
+				statPair{lod, func(sm *SmoothedStats, v float64) { sm.SmLOD = v }},
+				statPair{bb, func(sm *SmoothedStats, v float64) { sm.SmBBLogBF = v }},
+			)
+		}
+		if hasOneBulk {
+			afd := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.OneBulkAFDev })
+			og := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.OneBulkGstat })
+			ol := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.OneBulkLOD })
+			ob := extractFloat(raw, chromIdx, func(s BSAstats) float64 { return s.OneBulkBBLogBF })
+			pairs = append(pairs,
+				statPair{afd, func(sm *SmoothedStats, v float64) { sm.SmAFDev = v }},
+				statPair{og, func(sm *SmoothedStats, v float64) { sm.SmOneBulkG = v }},
+				statPair{ol, func(sm *SmoothedStats, v float64) { sm.SmOneBulkLOD = v }},
+				statPair{ob, func(sm *SmoothedStats, v float64) { sm.SmOneBulkBBLogBF = v }},
+			)
+		}
+
+		// Smooth each statistic and record the per-position contributor count
+		// from the first stat (all stats share the same position grid and depth
+		// weights, so counts are identical regardless of which stat is used).
+		smoothedVals := make([][]float64, len(pairs))
+		var nContrib []int
+		for p, sp := range pairs {
+			sv, nc := smooth1(sp.vals)
+			smoothedVals[p] = sv
+			if nContrib == nil {
+				nContrib = nc
+			}
+		}
+
+		// Assign to output; skip positions with insufficient kernel coverage.
+		for k, ci := range chromIdx {
+			if nContrib != nil && nContrib[k] < minVariantsInKernel {
+				// Mark as invalid by leaving POS = 0; filtered out in caller.
+				// We still need identity fields for the skip to be detectable.
+				out[ci].CHROM = raw[ci].CHROM
+				out[ci].POS = -1 // sentinel: too sparse
+				continue
+			}
+			s := &out[ci]
+			s.CHROM = raw[ci].CHROM
+			s.POS = raw[ci].POS
+			s.REF = raw[ci].REF
+			s.ALT = raw[ci].ALT
+			s.Depth = raw[ci].Depth
+			if hasOneBulk {
+				s.OneBulkP0 = raw[ci].OneBulkP0
+			}
+			for p, sp := range pairs {
+				sp.setter(s, smoothedVals[p][k])
+			}
+		}
+
+		i = j
+	}
+
+	// Filter out sentinel (sparse) positions.
+	valid := out[:0]
+	for _, s := range out {
+		if s.POS >= 0 {
+			valid = append(valid, s)
 		}
 	}
 
-	for _, chrom := range chroms {
-		sort.Slice(byChrom[chrom], func(i, j int) bool {
-			return byChrom[chrom][i].POS < byChrom[chrom][j].POS
-		})
+	color.Cyan("Smoothed %d variants (%d removed — fewer than %d kernel contributors)\n",
+		len(valid), len(out)-len(valid), minVariantsInKernel)
+
+	return valid, nil
+}
+
+// extractFloat builds a float64 slice for the variants referenced by chromIdx.
+func extractFloat(raw []BSAstats, chromIdx []int, fn func(BSAstats) float64) []float64 {
+	vals := make([]float64, len(chromIdx))
+	for k, ci := range chromIdx {
+		vals[k] = fn(raw[ci])
+	}
+	return vals
+}
+
+// ─── normalisation ─────────────────────────────────────────────────────────────
+
+// normalise computes global robust Z-scores for every smoothed statistic.
+// The Z-scores are stored in place (Z* fields of each SmoothedStats).
+func normalise(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+	type field struct {
+		get func(*SmoothedStats) float64
+		set func(*SmoothedStats, float64)
+	}
+	var fields []field
+	if hasHighBulk {
+		fields = append(fields,
+			field{func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }},
+		)
+	}
+	if hasLowBulk {
+		fields = append(fields,
+			field{func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }},
+		)
+	}
+	if hasBothBulks {
+		fields = append(fields,
+			field{func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmLOD }, func(s *SmoothedStats, v float64) { s.ZLOD = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmBBLogBF }, func(s *SmoothedStats, v float64) { s.ZBBLogBF = v }},
+		)
+	}
+	if hasOneBulk {
+		fields = append(fields,
+			field{func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkLOD }, func(s *SmoothedStats, v float64) { s.ZOneBulkLOD = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(s *SmoothedStats, v float64) { s.ZOneBulkBBLogBF = v }},
+		)
 	}
 
-	color.Cyan("============================ Smoothing Statistics (%s) ============================\n\n", bsaType)
+	for _, f := range fields {
+		vals := make([]float64, len(sm))
+		for i := range sm {
+			vals[i] = f.get(&sm[i])
+		}
+		zs := robustZScores(vals)
+		for i := range sm {
+			f.set(&sm[i], zs[i])
+		}
+	}
+}
 
-	smoothed := make([]BSASmoothStats, 0)
-	windowSize := int64(cfg.WindowSize)
-	stepSize := int64(cfg.StepSize)
-	halfWindow := float64(windowSize) / 2
+// robustZScores returns Z = (x − median) / (1.4826 × MAD) for a slice.
+// When MAD = 0 (all values identical or one outlier drives deviations to zero),
+// falls back to classical Z = (x − mean) / SD.
+// If SD is also 0 (fully constant), returns a zero slice.
+// The 1.4826 factor makes MAD a consistent estimator of σ under normality
+// (Rousseeuw & Croux 1993).
+func robustZScores(vals []float64) []float64 {
+	const consistencyFactor = 1.4826 // MAD → σ consistency factor
 
-	for _, chrom := range chroms {
-		chromStats := byChrom[chrom]
-		if len(chromStats) == 0 {
+	n := len(vals)
+	if n == 0 {
+		return nil
+	}
+
+	med := medianOf(vals)
+	absDeviations := make([]float64, n)
+	for i, v := range vals {
+		absDeviations[i] = math.Abs(v - med)
+	}
+	mad := medianOf(absDeviations) * consistencyFactor
+
+	zs := make([]float64, n)
+	if mad > 0 {
+		for i, v := range vals {
+			zs[i] = math.Round(((v-med)/mad)*1e6) / 1e6
+		}
+		return zs
+	}
+
+	// MAD = 0 fallback: classical Z-score.
+	var mean float64
+	for _, v := range vals {
+		mean += v
+	}
+	mean /= float64(n)
+
+	var variance float64
+	for _, v := range vals {
+		d := v - mean
+		variance += d * d
+	}
+	sd := math.Sqrt(variance / float64(n))
+	if sd == 0 {
+		return zs // all zeros; caller handles this gracefully
+	}
+	for i, v := range vals {
+		zs[i] = math.Round(((v-mean)/sd)*1e6) / 1e6
+	}
+	return zs
+}
+
+// medianOf returns the median of a float64 slice without modifying the original.
+func medianOf(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(vals))
+	copy(sorted, vals)
+	sort.Float64s(sorted)
+	n := len(sorted)
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
+}
+
+// ─── consolidation ─────────────────────────────────────────────────────────────
+
+// consolidate fills CompositeZ (Stouffer's Z) and MaxAbsZ for every variant.
+//
+// Stouffer's Z:
+//
+//	composite = Σ Z_i / √k
+//
+// where Z_i are the signed robust Z-scores and k is the number of statistics
+// available for that variant.  Direction is meaningful: high DeltaSI / AFDev
+// pushes CompositeZ positive; low values push it negative.
+//
+// MaxAbsZ is retained as a secondary column for compatibility with pipelines
+// that use it (e.g. certain ΔSNPindex implementations).
+func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+	for i := range sm {
+		s := &sm[i]
+		var zs []float64
+
+		if hasHighBulk {
+			zs = append(zs, s.ZHighSI)
+		}
+		if hasLowBulk {
+			zs = append(zs, s.ZLowSI)
+		}
+		if hasBothBulks {
+			zs = append(zs, s.ZDeltaSI, s.ZGstat, s.ZED, s.ZLOD, s.ZBBLogBF)
+		}
+		if hasOneBulk {
+			zs = append(zs, s.ZAFDev, s.ZOneBulkG, s.ZOneBulkLOD, s.ZOneBulkBBLogBF)
+		}
+
+		if len(zs) == 0 {
 			continue
 		}
 
-		left := 0
-		minPos := chromStats[0].POS
-		maxPos := chromStats[len(chromStats)-1].POS
-		for start := minPos; start <= maxPos; start += stepSize {
-			end := start + windowSize - 1
-			center := start + windowSize/2
-			for left < len(chromStats) && chromStats[left].POS < start {
-				left++
+		sum, maxAbs := 0.0, 0.0
+		for _, z := range zs {
+			sum += z
+			if a := math.Abs(z); a > maxAbs {
+				maxAbs = a
 			}
-
-			row := BSASmoothStats{
-				CHROM:        chrom,
-				WindowStart:  start,
-				WindowEnd:    end,
-				WindowCenter: center,
-			}
-
-			var depthWeightSum, tricubeWeightSum float64
-			var highSISum, lowSISum, deltaSISum, edSum, afDevSum float64
-			var depthSum, gprimeSum, lodSum, bbLogBFSum float64
-			var oneBulkGprimeSum, oneBulkLODSum, oneBulkBBLogBFSum float64
-
-			for i := left; i < len(chromStats) && chromStats[i].POS <= end; i++ {
-				s := chromStats[i]
-				distance := math.Abs(float64(s.POS - center))
-				scaledDistance := distance / halfWindow
-				if scaledDistance > 1 {
-					continue
-				}
-
-				tricubeWeight := math.Pow(1-math.Pow(scaledDistance, 3), 3)
-				depthWeight := tricubeWeight * math.Sqrt(float64(s.Depth))
-				if tricubeWeight <= 0 || depthWeight <= 0 {
-					continue
-				}
-
-				row.NSites++
-				tricubeWeightSum += tricubeWeight
-				depthWeightSum += depthWeight
-				depthSum += tricubeWeight * float64(s.Depth)
-
-				if hasHighBulk {
-					highSISum += depthWeight * s.HighSI
-				}
-				if hasLowBulk {
-					lowSISum += depthWeight * s.LowSI
-				}
-				if hasBothBulks {
-					deltaSISum += depthWeight * s.DeltaSI
-					edSum += depthWeight * s.ED
-					gprimeSum += depthWeight * s.Gstat
-					lodSum += tricubeWeight * s.LOD
-					bbLogBFSum += tricubeWeight * s.BBLogBF
-				}
-				if hasOneBulk {
-					row.OneBulkP0 = s.OneBulkP0
-					afDevSum += depthWeight * s.OneBulkAFDev
-					oneBulkGprimeSum += depthWeight * s.OneBulkGstat
-					oneBulkLODSum += tricubeWeight * s.OneBulkLOD
-					oneBulkBBLogBFSum += tricubeWeight * s.OneBulkBBLogBF
-				}
-			}
-
-			if row.NSites < minSNPsPerWindow || tricubeWeightSum == 0 || depthWeightSum == 0 {
-				continue
-			}
-
-			row.MeanDepth = math.Round((depthSum/tricubeWeightSum)*1e6) / 1e6
-			if hasHighBulk {
-				row.HighSI = math.Round((highSISum/depthWeightSum)*1e6) / 1e6
-			}
-			if hasLowBulk {
-				row.LowSI = math.Round((lowSISum/depthWeightSum)*1e6) / 1e6
-			}
-			if hasBothBulks {
-				row.DeltaSI = math.Round((deltaSISum/depthWeightSum)*1e6) / 1e6
-				row.ED = math.Round((edSum/depthWeightSum)*1e6) / 1e6
-				row.Gprime = math.Round((gprimeSum/depthWeightSum)*1e6) / 1e6
-				row.LOD = math.Round(lodSum*1e6) / 1e6
-				row.BBLogBF = math.Round(bbLogBFSum*1e6) / 1e6
-			}
-			if hasOneBulk {
-				row.OneBulkAFDev = math.Round((afDevSum/depthWeightSum)*1e6) / 1e6
-				row.OneBulkGprime = math.Round((oneBulkGprimeSum/depthWeightSum)*1e6) / 1e6
-				row.OneBulkLOD = math.Round(oneBulkLODSum*1e6) / 1e6
-				row.OneBulkBBLogBF = math.Round(oneBulkBBLogBFSum*1e6) / 1e6
-			}
-			smoothed = append(smoothed, row)
 		}
+		s.CompositeZ = math.Round((sum/math.Sqrt(float64(len(zs))))*1e6) / 1e6
+		s.MaxAbsZ = math.Round(maxAbs*1e6) / 1e6
 	}
+}
 
-	color.Green("Smoothed %d windows", len(smoothed))
-	return smoothed, nil
+// ─── TSV output ────────────────────────────────────────────────────────────────
+
+func writeSmoothedTSV(
+	filename string,
+	sm []SmoothedStats,
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
+) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	defer w.Flush()
+
+	// Build header.
+	header := []string{"CHROM", "POS", "REF", "ALT", "Depth"}
+	if hasHighBulk {
+		header = append(header, "Sm_HighSI", "Z_HighSI")
+	}
+	if hasLowBulk {
+		header = append(header, "Sm_LowSI", "Z_LowSI")
+	}
+	if hasBothBulks {
+		header = append(header,
+			"Sm_DeltaSI", "Z_DeltaSI",
+			"Sm_Gstat", "Z_Gstat",
+			"Sm_ED4", "Z_ED4",
+			"Sm_LOD", "Z_LOD",
+			"Sm_BBLogBF", "Z_BBLogBF",
+		)
+	}
+	if hasOneBulk {
+		header = append(header,
+			"P0",
+			"Sm_AFDev", "Z_AFDev",
+			"Sm_OneBulkGstat", "Z_OneBulkGstat",
+			"Sm_OneBulkLOD", "Z_OneBulkLOD",
+			"Sm_OneBulkBBLogBF", "Z_OneBulkBBLogBF",
+		)
+	}
+	header = append(header, "CompositeZ", "MaxAbsZ")
+	fmt.Fprintln(w, strings.Join(header, "\t"))
+
+	// Write rows.
+	f6 := func(v float64) string { return fmt.Sprintf("%.6f", v) }
+	for _, s := range sm {
+		row := []string{
+			s.CHROM,
+			fmt.Sprintf("%d", s.POS),
+			s.REF,
+			s.ALT,
+			fmt.Sprintf("%d", s.Depth),
+		}
+		if hasHighBulk {
+			row = append(row, f6(s.SmHighSI), f6(s.ZHighSI))
+		}
+		if hasLowBulk {
+			row = append(row, f6(s.SmLowSI), f6(s.ZLowSI))
+		}
+		if hasBothBulks {
+			row = append(row,
+				f6(s.SmDeltaSI), f6(s.ZDeltaSI),
+				f6(s.SmGstat), f6(s.ZGstat),
+				f6(s.SmED), f6(s.ZED),
+				f6(s.SmLOD), f6(s.ZLOD),
+				f6(s.SmBBLogBF), f6(s.ZBBLogBF),
+			)
+		}
+		if hasOneBulk {
+			row = append(row,
+				f6(s.OneBulkP0),
+				f6(s.SmAFDev), f6(s.ZAFDev),
+				f6(s.SmOneBulkG), f6(s.ZOneBulkG),
+				f6(s.SmOneBulkLOD), f6(s.ZOneBulkLOD),
+				f6(s.SmOneBulkBBLogBF), f6(s.ZOneBulkBBLogBF),
+			)
+		}
+		row = append(row, f6(s.CompositeZ), f6(s.MaxAbsZ))
+		fmt.Fprintln(w, strings.Join(row, "\t"))
+	}
+	return nil
+}
+
+// ─── helpers ───────────────────────────────────────────────────────────────────
+
+// bulkFlags returns (hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk) for
+// a given bsaType string.  All four flags are derived from the same string so
+// callers do not need to repeat the logic.
+func bulkFlags(bsaType string) (hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+	hasHighBulk = strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
+	hasLowBulk = strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
+	hasBothBulks = hasHighBulk && hasLowBulk
+	hasOneBulk = hasHighBulk != hasLowBulk
+	return
 }
