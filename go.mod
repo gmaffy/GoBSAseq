@@ -9,6 +9,7 @@ require (
 	github.com/go-echarts/go-echarts/v2 v2.6.7
 	github.com/schollz/progressbar/v3 v3.19.0
 	github.com/spf13/cobra v1.10.2
+	gonum.org/v1/gonum v0.17.0
 )
 
 require (

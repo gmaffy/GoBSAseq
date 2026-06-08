@@ -1,0 +1,212 @@
+package stats
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+
+	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/utils"
+)
+
+// Thresholds holds empirical p95/p99 thresholds derived from the smoothed
+// Z-score distributions.
+//
+// Two-bulk fields (DsiP*, GsP*, EdP*, LodP*, BbP*):
+//   - Dsi* — |ZDeltaSI| upper tail; DsiMp* are the corresponding negated values
+//     for convenient ±threshold plotting.
+//   - GsP*, EdP*, LodP*, BbP* — upper tails of |ZGstat|, |ZED|, |ZLOD|,
+//     |ZBBLogBF|.
+//
+// One-bulk / per-bulk SI fields (HighP*, LowP*):
+//   - HighP*/LowP* — upper tails of ZHighSI / ZLowSI;
+//     HighMp*/LowMp* are the negated counterparts for ±threshold plotting.
+//
+// All fields are zero-valued for statistics that are absent in the current
+// bsaType (e.g. two-bulk fields are zero for a one-bulk run).
+type Thresholds struct {
+	// Two-bulk: ΔSI Z-score thresholds (positive and mirrored negative)
+	DsiP99  float64
+	DsiP95  float64
+	DsiMp99 float64
+	DsiMp95 float64
+
+	// Two-bulk: other statistic Z-score upper-tail thresholds
+	GsP99  float64
+	GsP95  float64
+	EdP99  float64
+	EdP95  float64
+	LodP99 float64
+	LodP95 float64
+	BbP99  float64
+	BbP95  float64
+
+	// Per-bulk SI Z-score thresholds (high bulk)
+	HighP99  float64
+	HighP95  float64
+	HighMp99 float64
+	HighMp95 float64
+
+	// Per-bulk SI Z-score thresholds (low bulk)
+	LowP99  float64
+	LowP95  float64
+	LowMp99 float64
+	LowMp95 float64
+}
+
+// empQuantile returns the empirical quantile at q (0..1) using the "ceiling" method
+// i.e., the smallest value v such that at least q fraction of observations are <= v.
+func empQuantile(vals []float64, q float64) float64 {
+	n := len(vals)
+	if n == 0 {
+		return 0
+	}
+	sorted := make([]float64, n)
+	copy(sorted, vals)
+	sort.Float64s(sorted)
+	if q <= 0 {
+		return sorted[0]
+	}
+	if q >= 1 {
+		return sorted[n-1]
+	}
+	idx := int(math.Ceil(q*float64(n))) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return sorted[idx]
+}
+
+// ComputeThresholds computes empirical p95/p99 thresholds for all smoothed
+// Z-score distributions, writes a TSV file under cfg.OutputDir/stats, prints a
+// short summary, and returns a populated Thresholds struct.
+//
+// The TSV columns are:
+//
+//	Stat | Z_p95 | Z_p99 | Z_p95_neg | Z_p99_neg
+//
+// The _neg columns are only non-empty for statistics whose Z-scores are
+// naturally signed (DeltaSI, HighSI, LowSI); all other statistics use the
+// absolute-value upper tail and leave the _neg columns blank.
+func ComputeThresholds(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) (Thresholds, error) {
+	if len(sm) == 0 {
+		return Thresholds{}, fmt.Errorf("no smoothed stats supplied")
+	}
+
+	hasHigh, hasLow, hasBoth, hasOne := bulkFlags(bsaType)
+
+	// ── collect per-statistic Z-score slices ──────────────────────────────
+	var zDelta, zG, zE, zL, zB []float64 // two-bulk
+	var zHigh, zLow []float64            // per-bulk SI
+	var zAF []float64                    // one-bulk AF deviation
+
+	for i := range sm {
+		s := sm[i]
+		if hasBoth {
+			zDelta = append(zDelta, math.Abs(s.ZDeltaSI))
+			zG = append(zG, math.Abs(s.ZGstat))
+			zE = append(zE, math.Abs(s.ZED))
+			zL = append(zL, math.Abs(s.ZLOD))
+			zB = append(zB, math.Abs(s.ZBBLogBF))
+		}
+		if hasHigh {
+			zHigh = append(zHigh, math.Abs(s.ZHighSI))
+		}
+		if hasLow {
+			zLow = append(zLow, math.Abs(s.ZLowSI))
+		}
+		if hasOne {
+			zAF = append(zAF, math.Abs(s.ZAFDev))
+		}
+	}
+
+	const p95q = 0.95
+	const p99q = 0.99
+
+	// ── populate the return struct ────────────────────────────────────────
+	var t Thresholds
+
+	if hasBoth {
+		t.DsiP95 = empQuantile(zDelta, p95q)
+		t.DsiP99 = empQuantile(zDelta, p99q)
+		t.DsiMp95 = -t.DsiP95
+		t.DsiMp99 = -t.DsiP99
+
+		t.GsP95 = empQuantile(zG, p95q)
+		t.GsP99 = empQuantile(zG, p99q)
+		t.EdP95 = empQuantile(zE, p95q)
+		t.EdP99 = empQuantile(zE, p99q)
+		t.LodP95 = empQuantile(zL, p95q)
+		t.LodP99 = empQuantile(zL, p99q)
+		t.BbP95 = empQuantile(zB, p95q)
+		t.BbP99 = empQuantile(zB, p99q)
+	}
+	if hasHigh {
+		t.HighP95 = empQuantile(zHigh, p95q)
+		t.HighP99 = empQuantile(zHigh, p99q)
+		t.HighMp95 = -t.HighP95
+		t.HighMp99 = -t.HighP99
+	}
+	if hasLow {
+		t.LowP95 = empQuantile(zLow, p95q)
+		t.LowP99 = empQuantile(zLow, p99q)
+		t.LowMp95 = -t.LowP95
+		t.LowMp99 = -t.LowP99
+	}
+	// Note: one-bulk AFDev thresholds are not in the Thresholds struct (no
+	// dedicated field requested) but are still written to the TSV for reference.
+
+	// ── write TSV ─────────────────────────────────────────────────────────
+	outDir := filepath.Join(cfg.OutputDir, "stats")
+	if err := os.MkdirAll(outDir, 0775); err != nil {
+		return Thresholds{}, err
+	}
+	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType))
+	f, err := os.Create(outPath)
+	if err != nil {
+		return Thresholds{}, err
+	}
+	defer f.Close()
+
+	// header
+	fmt.Fprintln(f, "Stat\tZ_p95\tZ_p99\tZ_p95_neg\tZ_p99_neg")
+
+	// writeRow emits a row with optional negated columns.
+	// When signed=true the _neg columns carry the negated thresholds (for
+	// statistics whose Z-scores are naturally signed); otherwise they are empty.
+	writeRow := func(name string, p95, p99 float64, signed bool) {
+		if signed {
+			fmt.Fprintf(f, "%s\t%.6f\t%.6f\t%.6f\t%.6f\n",
+				name, p95, p99, -p95, -p99)
+		} else {
+			fmt.Fprintf(f, "%s\t%.6f\t%.6f\t\t\n", name, p95, p99)
+		}
+	}
+
+	if hasBoth {
+		writeRow("DeltaSI", t.DsiP95, t.DsiP99, true)
+		writeRow("Gstat", t.GsP95, t.GsP99, false)
+		writeRow("ED", t.EdP95, t.EdP99, false)
+		writeRow("LOD", t.LodP95, t.LodP99, false)
+		writeRow("BBLogBF", t.BbP95, t.BbP99, false)
+	}
+	if hasHigh {
+		writeRow("HighSI", t.HighP95, t.HighP99, true)
+	}
+	if hasLow {
+		writeRow("LowSI", t.LowP95, t.LowP99, true)
+	}
+	if hasOne {
+		afP95 := empQuantile(zAF, p95q)
+		afP99 := empQuantile(zAF, p99q)
+		writeRow("AFDev", afP95, afP99, false)
+	}
+
+	color.Green("Thresholds written to %s", outPath)
+	return t, nil
+}

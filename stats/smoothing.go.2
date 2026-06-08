@@ -85,23 +85,23 @@ type SmoothedStats struct {
 	SmLOD     float64
 	SmBBLogBF float64
 	// One-bulk
-	OneBulkP0        float64 // carries the per-site prior (not smoothed; taken from last contributor)
-	SmAFDev          float64
-	SmOneBulkG       float64
-	SmOneBulkLOD     float64
+	OneBulkP0      float64 // carries the per-site prior (not smoothed; taken from last contributor)
+	SmAFDev        float64
+	SmOneBulkG     float64
+	SmOneBulkLOD   float64
 	SmOneBulkBBLogBF float64
 
 	// ── robust Z-scores of smoothed values ──────────────────────────────
-	ZHighSI         float64
-	ZLowSI          float64
-	ZDeltaSI        float64
-	ZGstat          float64
-	ZED             float64
-	ZLOD            float64
-	ZBBLogBF        float64
-	ZAFDev          float64
-	ZOneBulkG       float64
-	ZOneBulkLOD     float64
+	ZHighSI  float64
+	ZLowSI   float64
+	ZDeltaSI float64
+	ZGstat   float64
+	ZED      float64
+	ZLOD     float64
+	ZBBLogBF float64
+	ZAFDev         float64
+	ZOneBulkG      float64
+	ZOneBulkLOD    float64
 	ZOneBulkBBLogBF float64
 
 	// ── consolidated scores ──────────────────────────────────────────────
@@ -110,7 +110,11 @@ type SmoothedStats struct {
 	// max|Z| across all valid statistics (unsigned)
 	MaxAbsZ float64
 
-	thresholds Thresholds
+	// ── empirical thresholds ─────────────────────────────────────────────
+	// Populated by SmoothAndNormalise after ComputeThresholds; the same
+	// Thresholds value is broadcast to every variant in the slice so callers
+	// can use any element to retrieve the run-level thresholds.
+	Thresholds Thresholds
 }
 
 // SmoothAndNormalise is the main entry point.  It takes the raw BSAstats
@@ -129,13 +133,13 @@ func SmoothAndNormalise(
 	cfg utils.AnalysisConfig,
 	bsaType string,
 	rawStats []BSAstats,
-) ([]SmoothedStats, error) {
+) ([]SmoothedStats, Thresholds, error) {
 
 	if len(rawStats) == 0 {
-		return nil, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
+		return nil, Thresholds{}, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
 	}
 	if cfg.WindowSize <= 0 {
-		return nil, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
+		return nil, Thresholds{}, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
 	}
 
 	bw := float64(cfg.WindowSize) / 2.0
@@ -148,7 +152,7 @@ func SmoothAndNormalise(
 	// ── 1. Gaussian kernel smoothing per chromosome ──────────────────────
 	smoothed, err := gaussianSmooth(rawStats, bw, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
 	if err != nil {
-		return nil, err
+		return nil, Thresholds{}, err
 	}
 
 	// ── 2. Robust Z-score normalisation (global, across all chroms) ───────
@@ -157,18 +161,27 @@ func SmoothAndNormalise(
 	// ── 3. Stouffer's Z consolidation ─────────────────────────────────────
 	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
 
-	// ── 4. Write TSV ───────────────────────────────────────────────────────
+	// ── 4. Write smoothed TSV ─────────────────────────────────────────────
 	outDir := filepath.Join(cfg.OutputDir, "stats")
 	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
+		return nil, Thresholds{}, err
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.smoothed_and_normalised.tsv", bsaType))
 	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk); err != nil {
-		return nil, err
+		return nil, Thresholds{}, err
+	}
+
+	// ── 5. Compute empirical thresholds and broadcast to every variant ────
+	thresholds, err := ComputeThresholds(cfg, bsaType, smoothed)
+	if err != nil {
+		return nil, Thresholds{}, err
+	}
+	for i := range smoothed {
+		smoothed[i].Thresholds = thresholds
 	}
 
 	color.Green("Smoothed & normalised stats written to %s (%d variants)\n", outPath, len(smoothed))
-	return smoothed, nil
+	return smoothed, thresholds, nil
 }
 
 // ─── smoothing ─────────────────────────────────────────────────────────────────

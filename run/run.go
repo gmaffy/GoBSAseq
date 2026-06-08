@@ -12,7 +12,6 @@ import (
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
-	"github.com/gmaffy/GoBSAseq/plots"
 	"github.com/gmaffy/GoBSAseq/stats"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
@@ -134,9 +133,9 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	fmt.Printf("Detected %d BRM blocks\n", len(brmBlocks))
 
 	// ------------------------------------------ Plots ------------------------------------------------------------- //
-	if err := plots.CreatePlots(*cfg, btype, smoothedStats, brmBlocks); err != nil {
-		return err
-	}
+	//if err := plots.CreatePlots(*cfg, btype, smoothedStats, brmBlocks); err != nil {
+	//	return err
+	//}
 
 	return nil
 }

@@ -1,0 +1,371 @@
+package stats
+
+import (
+	"fmt"
+	"math"
+	"math/rand"
+	"runtime"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/schollz/progressbar/v3"
+	"gonum.org/v1/gonum/stat"
+	"gonum.org/v1/gonum/stat/distuv"
+)
+
+type Thresholds struct {
+	// ── two-bulk ────────────────────────────────────────────────────────
+	HighSIP99  float64
+	HighSIP95  float64
+	HighSIMp99 float64
+	HighSIMp95 float64
+
+	LowSIP99  float64
+	LowSIP95  float64
+	LowSIMp99 float64
+	LowSIMp95 float64
+
+	DsiP99  float64
+	DsiP95  float64
+	DsiMp99 float64
+	DsiMp95 float64
+
+	GsP99 float64
+	GsP95 float64
+
+	EdP99 float64
+	EdP95 float64
+
+	LodP99 float64
+	LodP95 float64
+
+	BbP99 float64
+	BbP95 float64
+
+	// ── one-bulk ────────────────────────────────────────────────────────
+	AFDevP99 float64
+	AFDevP95 float64
+
+	ObGsP99 float64
+	ObGsP95 float64
+
+	ObLodP99 float64
+	ObLodP95 float64
+
+	ObBbP99 float64
+	ObBbP95 float64
+}
+
+// ─── permutation threshold simulation ──────────────────────────────────────────
+
+// thresholdCache memoises expensive permutation results keyed by the depth
+// (and prior) values that parameterise the simulation.
+var thresholdCache sync.Map
+
+// calcThresholdsTwoBulk runs `rep` binomial draws for a two-bulk design and
+// returns empirical p99 / p95 thresholds for every statistic.
+// highDP / lowDP are the kernel-weighted mean depths of each bulk.
+// highSMAF / lowSMAF are the smoothed allele frequencies used as priors.
+func calcThresholdsTwoBulk(highDP, lowDP int, highSMAF, lowSMAF float64, rep int) Thresholds {
+	if highDP <= 0 || lowDP <= 0 || rep <= 0 {
+		return Thresholds{}
+	}
+
+	src := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(src)
+	distHigh := distuv.Binomial{N: float64(highDP), P: clampAF(highSMAF), Src: rng}
+	distLow := distuv.Binomial{N: float64(lowDP), P: clampAF(lowSMAF), Src: rng}
+
+	highSIArr := make([]float64, rep)
+	lowSIArr := make([]float64, rep)
+	dsiArr := make([]float64, rep)
+	gsArr := make([]float64, rep)
+	edArr := make([]float64, rep)
+	lodArr := make([]float64, rep)
+	bbArr := make([]float64, rep)
+
+	for i := 0; i < rep; i++ {
+		hAlt := distHigh.Rand()
+		lAlt := distLow.Rand()
+		hRef := float64(highDP) - hAlt
+		lRef := float64(lowDP) - lAlt
+
+		hSI := hAlt / float64(highDP)
+		lSI := lAlt / float64(lowDP)
+
+		highSIArr[i] = hSI
+		lowSIArr[i] = lSI
+		dsiArr[i] = hSI - lSI
+		gsArr[i] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
+		edArr[i] = euclideanDistance4(hSI, lSI)
+		lodArr[i] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
+		bbArr[i] = betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))
+	}
+
+	sort.Float64s(highSIArr)
+	sort.Float64s(lowSIArr)
+	sort.Float64s(dsiArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(edArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return math.Round(stat.Quantile(p, stat.Empirical, arr, nil)*1e6) / 1e6
+	}
+
+	return Thresholds{
+		HighSIP99:  q(highSIArr, 0.995),
+		HighSIP95:  q(highSIArr, 0.95),
+		HighSIMp99: q(highSIArr, 0.005),
+		HighSIMp95: q(highSIArr, 0.05),
+
+		LowSIP99:  q(lowSIArr, 0.995),
+		LowSIP95:  q(lowSIArr, 0.95),
+		LowSIMp99: q(lowSIArr, 0.005),
+		LowSIMp95: q(lowSIArr, 0.05),
+
+		DsiP99:  q(dsiArr, 0.995),
+		DsiP95:  q(dsiArr, 0.95),
+		DsiMp99: q(dsiArr, 0.005),
+		DsiMp95: q(dsiArr, 0.05),
+
+		GsP99: q(gsArr, 0.995),
+		GsP95: q(gsArr, 0.95),
+
+		EdP99: q(edArr, 0.995),
+		EdP95: q(edArr, 0.95),
+
+		LodP99: q(lodArr, 0.995),
+		LodP95: q(lodArr, 0.95),
+
+		BbP99: q(bbArr, 0.995),
+		BbP95: q(bbArr, 0.95),
+	}
+}
+
+// calcThresholdsOneBulk runs `rep` binomial draws for a one-bulk design and
+// returns empirical p99 / p95 thresholds for AFDev, Gstat, LOD, and BBLogBF.
+// dp is the kernel-weighted mean depth of the single bulk.
+// p0 is the expected null allele frequency (prior from the site).
+func calcThresholdsOneBulk(dp int, p0 float64, rep int) Thresholds {
+	if dp <= 0 || rep <= 0 {
+		return Thresholds{}
+	}
+
+	src := rand.NewSource(time.Now().UnixNano())
+	rng := rand.New(src)
+	dist := distuv.Binomial{N: float64(dp), P: clampAF(p0), Src: rng}
+
+	afDevArr := make([]float64, rep)
+	gsArr := make([]float64, rep)
+	lodArr := make([]float64, rep)
+	bbArr := make([]float64, rep)
+
+	for i := 0; i < rep; i++ {
+		alt := dist.Rand()
+		ref := float64(dp) - alt
+		af := alt / float64(dp)
+
+		afDevArr[i] = math.Abs(af - p0)
+		gsArr[i] = oneBulkGStatistic(int(alt), int(ref), dp, p0)
+		lodArr[i] = oneBulkLOD(int(alt), dp, p0)
+		bbArr[i] = oneBulkBetaBinomialLogBF(int(alt), int(ref), p0)
+	}
+
+	sort.Float64s(afDevArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return math.Round(stat.Quantile(p, stat.Empirical, arr, nil)*1e6) / 1e6
+	}
+
+	return Thresholds{
+		AFDevP99: q(afDevArr, 0.995),
+		AFDevP95: q(afDevArr, 0.95),
+		ObGsP99:  q(gsArr, 0.995),
+		ObGsP95:  q(gsArr, 0.95),
+		ObLodP99: q(lodArr, 0.995),
+		ObLodP95: q(lodArr, 0.95),
+		ObBbP99:  q(bbArr, 0.995),
+		ObBbP95:  q(bbArr, 0.95),
+	}
+}
+
+// calcThresholdsCachedTwoBulk returns cached or freshly computed two-bulk thresholds.
+func calcThresholdsCachedTwoBulk(highDP, lowDP int, highSMAF, lowSMAF float64, rep int) Thresholds {
+	key := fmt.Sprintf("2b_%d_%d_%.6f_%.6f_%d", highDP, lowDP, highSMAF, lowSMAF, rep)
+	if v, ok := thresholdCache.Load(key); ok {
+		return v.(Thresholds)
+	}
+	t := calcThresholdsTwoBulk(highDP, lowDP, highSMAF, lowSMAF, rep)
+	actual, _ := thresholdCache.LoadOrStore(key, t)
+	return actual.(Thresholds)
+}
+
+// calcThresholdsCachedOneBulk returns cached or freshly computed one-bulk thresholds.
+func calcThresholdsCachedOneBulk(dp int, p0 float64, rep int) Thresholds {
+	key := fmt.Sprintf("1b_%d_%.6f_%d", dp, p0, rep)
+	if v, ok := thresholdCache.Load(key); ok {
+		return v.(Thresholds)
+	}
+	t := calcThresholdsOneBulk(dp, p0, rep)
+	actual, _ := thresholdCache.LoadOrStore(key, t)
+	return actual.(Thresholds)
+}
+
+// calcAllThresholds computes and attaches per-position permutation thresholds
+// for all unique depth (and prior) combinations found in smoothed, using a
+// parallel worker pool identical to the one in twoBulk.go.
+func calcAllThresholds(
+	smoothed []SmoothedStats,
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
+	rep int,
+) {
+	if hasBothBulks {
+		type depthKey struct{ h, l int }
+		type afKey struct{ h, l float64 }
+
+		seen := make(map[depthKey]afKey)
+		for _, s := range smoothed {
+			if s.MeanHighBulkDP > 0 && s.MeanLowBulkDP > 0 {
+				dk := depthKey{s.MeanHighBulkDP, s.MeanLowBulkDP}
+				// Use the per-window smoothed AFs as the null prior; only store once.
+				if _, ok := seen[dk]; !ok {
+					seen[dk] = afKey{s.SmHighSI, s.SmLowSI}
+				}
+			}
+		}
+
+		type work struct {
+			dk depthKey
+			af afKey
+		}
+		jobs := make([]work, 0, len(seen))
+		for dk, af := range seen {
+			jobs = append(jobs, work{dk, af})
+		}
+
+		bar := progressbar.NewOptions(len(jobs),
+			progressbar.OptionSetDescription("Two-bulk thresholds"),
+			progressbar.OptionSetWidth(40),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer: "=", SaucerHead: ">", SaucerPadding: " ",
+				BarStart: "[", BarEnd: "]",
+			}),
+		)
+
+		jobCh := make(chan work, len(jobs))
+		for _, j := range jobs {
+			jobCh <- j
+		}
+		close(jobCh)
+
+		var wg sync.WaitGroup
+		for w := 0; w < runtime.NumCPU(); w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range jobCh {
+					calcThresholdsCachedTwoBulk(j.dk.h, j.dk.l, j.af.h, j.af.l, rep)
+					_ = bar.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		fmt.Println()
+
+		// Attach thresholds to each smoothed position.
+		for i := range smoothed {
+			s := &smoothed[i]
+			s.Thresholds = calcThresholdsCachedTwoBulk(
+				s.MeanHighBulkDP, s.MeanLowBulkDP, s.SmHighSI, s.SmLowSI, rep)
+		}
+	}
+
+	if hasOneBulk {
+		type obKey struct {
+			dp int
+			p0 float64
+		}
+		seen := make(map[obKey]bool)
+		for _, s := range smoothed {
+			if s.MeanBulkDP > 0 {
+				seen[obKey{s.MeanBulkDP, math.Round(s.OneBulkP0*1e4) / 1e4}] = true
+			}
+		}
+
+		type work struct {
+			dp int
+			p0 float64
+		}
+		jobs := make([]work, 0, len(seen))
+		for k := range seen {
+			jobs = append(jobs, work{k.dp, k.p0})
+		}
+
+		bar := progressbar.NewOptions(len(jobs),
+			progressbar.OptionSetDescription("One-bulk thresholds"),
+			progressbar.OptionSetWidth(40),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer: "=", SaucerHead: ">", SaucerPadding: " ",
+				BarStart: "[", BarEnd: "]",
+			}),
+		)
+
+		jobCh := make(chan work, len(jobs))
+		for _, j := range jobs {
+			jobCh <- j
+		}
+		close(jobCh)
+
+		var wg sync.WaitGroup
+		for w := 0; w < runtime.NumCPU(); w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range jobCh {
+					calcThresholdsCachedOneBulk(j.dp, j.p0, rep)
+					_ = bar.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		fmt.Println()
+
+		// Attach thresholds to each smoothed position, merging with any
+		// two-bulk thresholds already set.
+		for i := range smoothed {
+			s := &smoothed[i]
+			ob := calcThresholdsCachedOneBulk(
+				s.MeanBulkDP, math.Round(s.OneBulkP0*1e4)/1e4, rep)
+			// Merge: preserve two-bulk fields if already populated.
+			s.Thresholds.AFDevP99 = ob.AFDevP99
+			s.Thresholds.AFDevP95 = ob.AFDevP95
+			s.Thresholds.ObGsP99 = ob.ObGsP99
+			s.Thresholds.ObGsP95 = ob.ObGsP95
+			s.Thresholds.ObLodP99 = ob.ObLodP99
+			s.Thresholds.ObLodP95 = ob.ObLodP95
+			s.Thresholds.ObBbP99 = ob.ObBbP99
+			s.Thresholds.ObBbP95 = ob.ObBbP95
+		}
+	}
+}
+
+// clampAF clamps an allele frequency to (0.001, 0.999) so that binomial
+// distributions do not degenerate to point masses.
+func clampAF(p float64) float64 {
+	const lo, hi = 0.001, 0.999
+	if p < lo {
+		return lo
+	}
+	if p > hi {
+		return hi
+	}
+	return p
+}
