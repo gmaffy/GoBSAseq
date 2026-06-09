@@ -19,7 +19,7 @@ import (
 	"gonum.org/v1/gonum/stat/distuv"
 )
 
-// Thresholds bundles all three families for one SmoothedStats window.
+
 type Thresholds struct {
 	TwoBulk TwoBulkThresholds
 	OneBulk OneBulkThresholds
@@ -54,9 +54,7 @@ var (
 	oneBulkCache sync.Map
 )
 
-// WriteThresholdsToTSV handles standard disk I/O serialization for reporting metrics.
-// WriteThresholdsToTSV handles standard disk I/O serialization for reporting metrics.
-// It maps out all simulation quantiles across both single and multi-bulk analysis frameworks.
+
 func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) error {
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
 		return err
@@ -155,21 +153,6 @@ func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, threshold
 // ---------------------------------------------------------------------------
 // Internal Calculations & Caching Infrastructure (Unchanged math)
 // ---------------------------------------------------------------------------
-
-func calcZThresholds(numStats int) ZThresholds {
-	const (
-		zSig  = 3.0
-		zSugg = 2.0
-	)
-	if numStats < 1 {
-		numStats = 1
-	}
-	return ZThresholds{
-		ZP99: zSig, ZP95: zSugg, ZN99: -zSig, ZN95: -zSugg,
-		CompositeZP99: zSig, CompositeZP95: zSugg, CompositeZN99: -zSig, CompositeZN95: -zSugg,
-		NumStats: numStats,
-	}
-}
 
 func numZStats(bsaType string) int {
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
@@ -395,7 +378,11 @@ func CalculateThresholds(cfg utils.AnalysisConfig, bsaType string, smoothed []Sm
 		if hasOneBulk && p0 > 0 && p0 < 1 {
 			t.OneBulk = calcOneBulkCached(sm.Depth, p0, rep)
 		}
-		t.Z = calcZThresholds(numStats)
+		t.Z = ZThresholds{
+			ZP99: 3.0, ZP95: 2.0, ZN99: -3.0, ZN95: -2.0,
+			CompositeZP99: 3.0, CompositeZP95: 2.0, CompositeZN99: -3.0, CompositeZN95: -2.0,
+			NumStats: numStats,
+		}
 
 		thresholdResults[i] = t
 	}

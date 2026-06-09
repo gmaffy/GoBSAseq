@@ -121,7 +121,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	fmt.Println(len(smoothedStats))
 
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
-	if err := stats.Thresholds(*cfg, btype, smoothedStats); err != nil {
+	if err := stats.CalculateThresholds(*cfg, btype, smoothedStats); err != nil {
 		return err
 	}
 

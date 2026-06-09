@@ -5,16 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c8fd8c0f-4d75-492d-a3fe-ad2db847de31" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/plots/plots.go" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/run/run.go" beforeDir="false" afterPath="$PROJECT_DIR$/run/run.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/brm.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/fisher.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/normalising.go" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/smoothing.go" beforeDir="false" afterPath="$PROJECT_DIR$/stats/smoothing.go" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/stats/thresholds.go" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/stats/thresholds.go" beforeDir="false" afterPath="$PROJECT_DIR$/stats/thresholds.go" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -27,7 +19,7 @@
     </persistenceIdMap>
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="36" />
+    <option name="cachedIndexableFilesCount" value="30" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
   <component name="FileTemplateManagerImpl">
@@ -109,6 +101,20 @@
   &quot;associatedIndex&quot;: 0
 }</component>
   <component name="ProjectId" id="3EiiUf39on6IwODULDa31ZPEDsO" />
+  <component name="ProjectSessionTemplates">
+    <option name="inlineTemplate">
+      <template>
+        <option name="modeId" value="InlineAgent" />
+        <option name="model">
+          <model>
+            <option name="modelType" value="builtin_family" />
+            <option name="modelValue" value="auto" />
+          </model>
+        </option>
+        <option name="targetType" value="LOCAL" />
+      </template>
+    </option>
+  </component>
   <component name="ProjectViewState">
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
@@ -136,6 +142,7 @@
     "node.js.detected.package.eslint": "true",
     "node.js.selected.package.eslint": "(autodetect)",
     "nodejs_package_manager_path": "npm",
+    "settings.editor.selected.configurable": "preferences.lookFeel",
     "to.speed.mode.migration.done": "true"
   }
 }]]></component>
