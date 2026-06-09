@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,6 +50,224 @@ type BSAstats struct {
 	Depth int
 }
 
+//
+//func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []*vcfgo.Variant) ([]BSAstats, error) {
+//	if len(idxs) == 0 {
+//		return nil, fmt.Errorf("no sample indices supplied for %s raw stats", bsaType)
+//	}
+//
+//	highParentIdx, lowParentIdx, highBulkIdx, lowBulkIdx := -1, -1, -1, -1
+//	switch bsaType {
+//	case "2p2b":
+//		highParentIdx, lowParentIdx, highBulkIdx, lowBulkIdx = 0, 1, 2, 3
+//	case "2phb":
+//		highParentIdx, lowParentIdx, highBulkIdx = 0, 1, 2
+//	case "2plb":
+//		highParentIdx, lowParentIdx, lowBulkIdx = 0, 1, 2
+//	case "hp2b":
+//		highParentIdx, highBulkIdx, lowBulkIdx = 0, 1, 2
+//	case "lp2b":
+//		lowParentIdx, highBulkIdx, lowBulkIdx = 0, 1, 2
+//	case "hphb":
+//		highParentIdx, highBulkIdx = 0, 1
+//	case "hplb":
+//		highParentIdx, lowBulkIdx = 0, 1
+//	case "lphb":
+//		lowParentIdx, highBulkIdx = 0, 1
+//	case "lplb":
+//		lowParentIdx, lowBulkIdx = 0, 1
+//	case "2b":
+//		highBulkIdx, lowBulkIdx = 0, 1
+//	default:
+//		return nil, fmt.Errorf("unsupported bsaseq type %q", bsaType)
+//	}
+//
+//	hasOneBulk := (highBulkIdx >= 0) != (lowBulkIdx >= 0)
+//	oneBulkP0 := 0.0
+//	if hasOneBulk {
+//		p0, err := ExpectedAF(cfg.Population)
+//		if err != nil {
+//			return nil, err
+//		}
+//		oneBulkP0 = p0
+//	}
+//
+//	outDir := filepath.Join(cfg.OutputDir, "stats")
+//	if err := os.MkdirAll(outDir, 0775); err != nil {
+//		return nil, err
+//	}
+//
+//	color.Cyan("============================ Calculating Raw Statistics (%s) ============================\n\n", bsaType)
+//
+//	results := make([]BSAstats, len(passedVariants))
+//	keep := make([]bool, len(passedVariants))
+//	bar := progressbar.Default(int64(len(passedVariants)), "Processing variants")
+//
+//	var next atomic.Int64
+//	var wg sync.WaitGroup
+//	workers := runtime.GOMAXPROCS(0)
+//	if workers < 1 {
+//		workers = 1
+//	}
+//
+//	wg.Add(workers)
+//	for range workers {
+//		go func() {
+//			defer wg.Done()
+//			for {
+//				i := int(next.Add(1)) - 1
+//				if i >= len(passedVariants) {
+//					return
+//				}
+//
+//				v := passedVariants[i]
+//				realAltIdx := -1
+//				realAltCount := 0
+//				for altIdx, alt := range v.Alt() {
+//					if alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<') {
+//						continue
+//					}
+//					realAltIdx = altIdx
+//					realAltCount++
+//				}
+//				if realAltCount != 1 {
+//					_ = bar.Add(1)
+//					continue
+//				}
+//
+//				s := BSAstats{
+//					CHROM: v.Chromosome,
+//					POS:   int64(v.Pos),
+//					REF:   v.Reference,
+//					ALT:   v.Alt()[realAltIdx],
+//				}
+//
+//				if highParentIdx >= 0 && highParentIdx < len(v.Samples) && v.Samples[highParentIdx] != nil {
+//					s.HighParGT = v.Samples[highParentIdx].GT
+//				}
+//				if lowParentIdx >= 0 && lowParentIdx < len(v.Samples) && v.Samples[lowParentIdx] != nil {
+//					s.LowParGT = v.Samples[lowParentIdx].GT
+//				}
+//				if highBulkIdx >= 0 && highBulkIdx < len(v.Samples) && v.Samples[highBulkIdx] != nil {
+//					s.HighBulkGT = v.Samples[highBulkIdx].GT
+//				}
+//				if lowBulkIdx >= 0 && lowBulkIdx < len(v.Samples) && v.Samples[lowBulkIdx] != nil {
+//					s.LowBulkGT = v.Samples[lowBulkIdx].GT
+//				}
+//
+//				highAllele := 0
+//				switch {
+//				case len(s.HighParGT) > 0 && s.HighParGT[0] >= 0:
+//					highAllele = s.HighParGT[0]
+//				case len(s.LowParGT) > 0 && s.LowParGT[0] > 0:
+//					highAllele = 0
+//				case len(s.LowParGT) > 0 && s.LowParGT[0] == 0:
+//					highAllele = realAltIdx + 1
+//				}
+//
+//				var highTotal, lowTotal int
+//				if highBulkIdx >= 0 && highBulkIdx < len(v.Samples) && v.Samples[highBulkIdx] != nil {
+//					refDepth, _ := v.Samples[highBulkIdx].RefDepth()
+//					altDepths, _ := v.Samples[highBulkIdx].AltDepths()
+//					if len(altDepths) <= realAltIdx {
+//						_ = bar.Add(1)
+//						continue
+//					}
+//					altDepth := altDepths[realAltIdx]
+//					if highAllele == 0 {
+//						s.HighBulkH, s.HighBulkL = refDepth, altDepth
+//					} else {
+//						s.HighBulkH, s.HighBulkL = altDepth, refDepth
+//					}
+//					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
+//					highTotal = s.HighBulkH + s.HighBulkL
+//					if highTotal > 0 {
+//						s.HighSI = math.Round((float64(s.HighBulkH)/float64(highTotal))*1e6) / 1e6
+//					}
+//				}
+//
+//				if lowBulkIdx >= 0 && lowBulkIdx < len(v.Samples) && v.Samples[lowBulkIdx] != nil {
+//					refDepth, _ := v.Samples[lowBulkIdx].RefDepth()
+//					altDepths, _ := v.Samples[lowBulkIdx].AltDepths()
+//					if len(altDepths) <= realAltIdx {
+//						_ = bar.Add(1)
+//						continue
+//					}
+//					altDepth := altDepths[realAltIdx]
+//					if highAllele == 0 {
+//						s.LowBulkH, s.LowBulkL = refDepth, altDepth
+//					} else {
+//						s.LowBulkH, s.LowBulkL = altDepth, refDepth
+//					}
+//					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
+//					lowTotal = s.LowBulkH + s.LowBulkL
+//					if lowTotal > 0 {
+//						s.LowSI = math.Round((float64(s.LowBulkH)/float64(lowTotal))*1e6) / 1e6
+//					}
+//				}
+//
+//				if highTotal == 0 && lowTotal == 0 {
+//					_ = bar.Add(1)
+//					continue
+//				}
+//
+//				switch {
+//				case highTotal > 0 && (lowTotal == 0 || highTotal < lowTotal):
+//					s.Depth = highTotal
+//				case lowTotal > 0:
+//					s.Depth = lowTotal
+//				}
+//
+//				if highTotal > 0 && lowTotal > 0 {
+//					s.DeltaSI = math.Round((s.HighSI-s.LowSI)*1e6) / 1e6
+//					s.Gstat = math.Round(GStatistic(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
+//					s.ED = math.Round(euclideanDistance4(s.HighSI, s.LowSI)*1e6) / 1e6
+//					s.LOD = math.Round(lod(s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH)*1e6) / 1e6
+//					s.BBLogBF = math.Round(betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
+//				}
+//				if hasOneBulk {
+//					s.OneBulkP0 = oneBulkP0
+//					switch {
+//					case highTotal > 0:
+//						s.OneBulkAFDev = math.Round((s.HighSI-oneBulkP0)*1e6) / 1e6
+//						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+//						s.OneBulkLOD = math.Round(oneBulkLOD(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+//						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
+//					case lowTotal > 0:
+//						s.OneBulkAFDev = math.Round((s.LowSI-oneBulkP0)*1e6) / 1e6
+//						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+//						s.OneBulkLOD = math.Round(oneBulkLOD(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+//						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
+//					}
+//				}
+//
+//				if s.Depth > 0 {
+//					results[i] = s
+//					keep[i] = true
+//				}
+//				_ = bar.Add(1)
+//			}
+//		}()
+//	}
+//	wg.Wait()
+//	_ = bar.Finish()
+//
+//	stats := make([]BSAstats, 0, len(results))
+//	for i, s := range results {
+//		if keep[i] {
+//			stats = append(stats, s)
+//		}
+//	}
+//
+//	rawPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.raw.tsv", bsaType))
+//	if err := writeRawTSV(rawPath, stats, bsaType); err != nil {
+//		return nil, err
+//	}
+//
+//	color.Green("Raw stats written to %s (%d variants)", rawPath, len(stats))
+//	return stats, nil
+//}
+
 func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []*vcfgo.Variant) ([]BSAstats, error) {
 	if len(idxs) == 0 {
 		return nil, fmt.Errorf("no sample indices supplied for %s raw stats", bsaType)
@@ -85,7 +302,7 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 	hasOneBulk := (highBulkIdx >= 0) != (lowBulkIdx >= 0)
 	oneBulkP0 := 0.0
 	if hasOneBulk {
-		p0, err := expectedHighAlleleP0(cfg.Population)
+		p0, err := ExpectedAF(cfg.Population)
 		if err != nil {
 			return nil, err
 		}
@@ -121,130 +338,107 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 				}
 
 				v := passedVariants[i]
-				realAltIdx := -1
-				realAltCount := 0
-				for altIdx, alt := range v.Alt() {
-					if alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<') {
-						continue
+
+				// Find the single real alt index (0-based). Variants reaching here
+				// have already passed HardFilterVcf, but we still need the index to
+				// look up allele depths and to record the ALT allele string.
+				altIdx := -1
+				for j, alt := range v.Alt() {
+					if alt != "." && alt != "*" && !(len(alt) > 0 && alt[0] == '<') {
+						altIdx = j
+						break
 					}
-					realAltIdx = altIdx
-					realAltCount++
-				}
-				if realAltCount != 1 {
-					_ = bar.Add(1)
-					continue
 				}
 
 				s := BSAstats{
 					CHROM: v.Chromosome,
 					POS:   int64(v.Pos),
 					REF:   v.Reference,
-					ALT:   v.Alt()[realAltIdx],
+					ALT:   v.Alt()[altIdx],
 				}
 
-				if highParentIdx >= 0 && highParentIdx < len(v.Samples) && v.Samples[highParentIdx] != nil {
-					s.HighParGT = v.Samples[highParentIdx].GT
-				}
-				if lowParentIdx >= 0 && lowParentIdx < len(v.Samples) && v.Samples[lowParentIdx] != nil {
-					s.LowParGT = v.Samples[lowParentIdx].GT
-				}
-				if highBulkIdx >= 0 && highBulkIdx < len(v.Samples) && v.Samples[highBulkIdx] != nil {
-					s.HighBulkGT = v.Samples[highBulkIdx].GT
-				}
-				if lowBulkIdx >= 0 && lowBulkIdx < len(v.Samples) && v.Samples[lowBulkIdx] != nil {
-					s.LowBulkGT = v.Samples[lowBulkIdx].GT
-				}
-
+				// Determine which allele index (0=ref, 1=alt) corresponds to the
+				// high-parent phenotype. Defaults to ref (0) when no parent is present.
 				highAllele := 0
 				switch {
-				case len(s.HighParGT) > 0 && s.HighParGT[0] >= 0:
-					highAllele = s.HighParGT[0]
-				case len(s.LowParGT) > 0 && s.LowParGT[0] > 0:
-					highAllele = 0
-				case len(s.LowParGT) > 0 && s.LowParGT[0] == 0:
-					highAllele = realAltIdx + 1
+				case highParentIdx >= 0:
+					highAllele = v.Samples[highParentIdx].GT[0]
+				case lowParentIdx >= 0 && v.Samples[lowParentIdx].GT[0] == 0:
+					highAllele = altIdx + 1
 				}
 
-				var highTotal, lowTotal int
-				if highBulkIdx >= 0 && highBulkIdx < len(v.Samples) && v.Samples[highBulkIdx] != nil {
+				if highParentIdx >= 0 {
+					s.HighParGT = v.Samples[highParentIdx].GT
+				}
+				if lowParentIdx >= 0 {
+					s.LowParGT = v.Samples[lowParentIdx].GT
+				}
+
+				if highBulkIdx >= 0 {
 					refDepth, _ := v.Samples[highBulkIdx].RefDepth()
 					altDepths, _ := v.Samples[highBulkIdx].AltDepths()
-					if len(altDepths) <= realAltIdx {
-						_ = bar.Add(1)
-						continue
-					}
-					altDepth := altDepths[realAltIdx]
+					altDepth := altDepths[altIdx]
+					s.HighBulkGT = v.Samples[highBulkIdx].GT
+					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
 						s.HighBulkH, s.HighBulkL = refDepth, altDepth
 					} else {
 						s.HighBulkH, s.HighBulkL = altDepth, refDepth
 					}
-					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
-					highTotal = s.HighBulkH + s.HighBulkL
+					highTotal := s.HighBulkH + s.HighBulkL
 					if highTotal > 0 {
 						s.HighSI = math.Round((float64(s.HighBulkH)/float64(highTotal))*1e6) / 1e6
 					}
+					s.Depth = highTotal
 				}
 
-				if lowBulkIdx >= 0 && lowBulkIdx < len(v.Samples) && v.Samples[lowBulkIdx] != nil {
+				if lowBulkIdx >= 0 {
 					refDepth, _ := v.Samples[lowBulkIdx].RefDepth()
 					altDepths, _ := v.Samples[lowBulkIdx].AltDepths()
-					if len(altDepths) <= realAltIdx {
-						_ = bar.Add(1)
-						continue
-					}
-					altDepth := altDepths[realAltIdx]
+					altDepth := altDepths[altIdx]
+					s.LowBulkGT = v.Samples[lowBulkIdx].GT
+					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
 						s.LowBulkH, s.LowBulkL = refDepth, altDepth
 					} else {
 						s.LowBulkH, s.LowBulkL = altDepth, refDepth
 					}
-					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
-					lowTotal = s.LowBulkH + s.LowBulkL
+					lowTotal := s.LowBulkH + s.LowBulkL
 					if lowTotal > 0 {
 						s.LowSI = math.Round((float64(s.LowBulkH)/float64(lowTotal))*1e6) / 1e6
 					}
+					if s.Depth == 0 || lowTotal < s.Depth {
+						s.Depth = lowTotal
+					}
 				}
 
-				if highTotal == 0 && lowTotal == 0 {
-					_ = bar.Add(1)
-					continue
-				}
-
-				switch {
-				case highTotal > 0 && (lowTotal == 0 || highTotal < lowTotal):
-					s.Depth = highTotal
-				case lowTotal > 0:
-					s.Depth = lowTotal
-				}
-
-				if highTotal > 0 && lowTotal > 0 {
+				if highBulkIdx >= 0 && lowBulkIdx >= 0 {
+					highTotal := s.HighBulkH + s.HighBulkL
+					lowTotal := s.LowBulkH + s.LowBulkL
 					s.DeltaSI = math.Round((s.HighSI-s.LowSI)*1e6) / 1e6
 					s.Gstat = math.Round(GStatistic(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
 					s.ED = math.Round(euclideanDistance4(s.HighSI, s.LowSI)*1e6) / 1e6
 					s.LOD = math.Round(lod(s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH)*1e6) / 1e6
 					s.BBLogBF = math.Round(betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
-				}
-				if hasOneBulk {
-					s.OneBulkP0 = oneBulkP0
-					switch {
-					case highTotal > 0:
-						s.OneBulkAFDev = math.Round((s.HighSI-oneBulkP0)*1e6) / 1e6
-						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
-						s.OneBulkLOD = math.Round(oneBulkLOD(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
-						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.HighBulkH, s.HighBulkL, oneBulkP0)*1e6) / 1e6
-					case lowTotal > 0:
-						s.OneBulkAFDev = math.Round((s.LowSI-oneBulkP0)*1e6) / 1e6
-						s.OneBulkGstat = math.Round(oneBulkGStatistic(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
-						s.OneBulkLOD = math.Round(oneBulkLOD(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
-						s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(s.LowBulkH, s.LowBulkL, oneBulkP0)*1e6) / 1e6
-					}
+					_ = highTotal
+					_ = lowTotal
 				}
 
-				if s.Depth > 0 {
-					results[i] = s
-					keep[i] = true
+				if hasOneBulk {
+					s.OneBulkP0 = oneBulkP0
+					h, l := s.HighBulkH, s.HighBulkL
+					si := s.HighSI
+					if lowBulkIdx >= 0 {
+						h, l, si = s.LowBulkH, s.LowBulkL, s.LowSI
+					}
+					s.OneBulkAFDev = math.Round((si-oneBulkP0)*1e6) / 1e6
+					s.OneBulkGstat = math.Round(oneBulkGStatistic(h, l, oneBulkP0)*1e6) / 1e6
+					s.OneBulkLOD = math.Round(oneBulkLOD(h, l, oneBulkP0)*1e6) / 1e6
+					s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(h, l, oneBulkP0)*1e6) / 1e6
 				}
+
+				results[i] = s
+				keep[i] = true
 				_ = bar.Add(1)
 			}
 		}()
@@ -378,54 +572,28 @@ func euclideanDistance4(hSI, lSI float64) float64 {
 	return d * d * d * d
 }
 
-func expectedHighAlleleP0(population string) (float64, error) {
-	pop := strings.ToUpper(strings.TrimSpace(population))
-	pop = strings.NewReplacer("-", "", "_", "", " ", "").Replace(pop)
-
-	switch pop {
-	case "", "F2", "F3", "RIL", "RILS":
+func ExpectedAF(popStruc string) (float64, error) {
+	// Standard structures return 0.5 immediately
+	switch popStruc {
+	case "F2", "F3", "RIL":
 		return 0.5, nil
-	case "BC":
-		return 0, fmt.Errorf("population %q is ambiguous for one-bulk stats; use BC1H/BC1L, BC2H/BC2L, etc.", population)
 	}
 
-	if !strings.HasPrefix(pop, "BC") {
-		return 0, fmt.Errorf("unsupported population %q for one-bulk stats", population)
-	}
-
-	rest := strings.TrimPrefix(pop, "BC")
-	recurrent := ""
-	switch {
-	case strings.HasSuffix(rest, "HIGH"):
-		recurrent = "H"
-		rest = strings.TrimSuffix(rest, "HIGH")
-	case strings.HasSuffix(rest, "LOW"):
-		recurrent = "L"
-		rest = strings.TrimSuffix(rest, "LOW")
-	case strings.HasSuffix(rest, "H"):
-		recurrent = "H"
-		rest = strings.TrimSuffix(rest, "H")
-	case strings.HasSuffix(rest, "L"):
-		recurrent = "L"
-		rest = strings.TrimSuffix(rest, "L")
+	// Backcross structures calculated via formula:
+	// Recurrent High parent (H): 1 - (0.5^(gen+1))
+	// Recurrent Low parent (L): 0.5^(gen+1)
+	switch popStruc {
+	case "BC1H":
+		return 1.0 - math.Pow(0.5, 2), nil
+	case "BC1L":
+		return math.Pow(0.5, 2), nil
+	case "BC2H":
+		return 1.0 - math.Pow(0.5, 3), nil
+	case "BC2L":
+		return math.Pow(0.5, 3), nil
 	default:
-		return 0, fmt.Errorf("backcross population %q must specify recurrent parent as H/high or L/low", population)
+		return 0, fmt.Errorf("unknown population structure: %s", popStruc)
 	}
-
-	generation := 1
-	if rest != "" {
-		n, err := strconv.Atoi(rest)
-		if err != nil || n < 1 {
-			return 0, fmt.Errorf("invalid backcross generation in population %q", population)
-		}
-		generation = n
-	}
-
-	residualF1 := 1 / math.Pow(2, float64(generation+1))
-	if recurrent == "H" {
-		return 1 - residualF1, nil
-	}
-	return residualF1, nil
 }
 
 func oneBulkGStatistic(success, fail int, p0 float64) float64 {

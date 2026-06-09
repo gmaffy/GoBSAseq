@@ -1,44 +1,5 @@
 package stats
 
-// smoothing.go — post-processing pipeline for GoBSAseq raw statistics
-//
-// Pipeline:
-//
-//  1. SMOOTHING  — depth-weighted Gaussian kernel smoothing per chromosome.
-//     Each smoothed value is the depth-weighted mean of neighbouring raw
-//     values, with weights = depth × Gaussian(Δpos, σ).
-//     σ (bandwidth) is derived directly from cfg.WindowSize:
-//       σ = WindowSize / 2
-//     A Gaussian with this σ places ~95% of its kernel weight within one
-//     WindowSize, matching the intuition of the existing sliding-window
-//     analysis while avoiding the hard edge artefacts of a rectangular window.
-//     cfg.StepSize is not used here: the kernel evaluates at every variant
-//     position rather than at fixed grid steps.
-//     Depth weighting follows Magwene et al. 2011 and is essential because
-//     BSA coverage is heterogeneous; low-depth sites would otherwise inflate
-//     variance at QTL boundaries.
-//     A 3σ bandwidth cutoff is applied to limit each kernel's influence to
-//     variants within 3 × σ bp, reducing the per-chromosome O(n²) cost to
-//     O(n × m) where m is the average number of variants within 3σ.
-//     Windows with fewer than minVariantsInKernel contributing variants are
-//     skipped (guard against sparse regions, mirrors the original
-//     minSNPsPerWindow = 5 guard in the sliding-window code).
-//
-//  2. NORMALISATION — per-statistic robust Z-score across ALL chromosomes:
-//       Z = (x − median) / (1.4826 × MAD)
-//     MAD = median(|x − median(x)|); the 1.4826 factor makes MAD a consistent
-//     estimator of σ under normality (Rousseeuw & Croux 1993).
-//     When MAD = 0 (constant-valued statistics), the function falls back to
-//     classical Z = (x − mean) / SD, and if SD is also 0 it returns zeros.
-//
-//  3. CONSOLIDATION — Stouffer's Z combination across all valid statistics:
-//       composite_Z = Σ Z_i / √k
-//     This is strictly more powerful than max|Z| when statistics agree
-//     (which they do at genuine QTLs), preserves signal direction from
-//     DeltaSI / OneBulkAFDev, and is the approach recommended by
-//     Magwene et al. 2011 for multi-statistic BSA-seq.
-//     The composite is written alongside max|Z| so users can compare.
-
 import (
 	"bufio"
 	"fmt"
@@ -52,22 +13,10 @@ import (
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
-// minVariantsInKernel is the minimum number of variants that must contribute
-// non-zero kernel weight to a smoothed position.  Mirrors the original
-// minSNPsPerWindow = 5 guard in the sliding-window implementation.
 const minVariantsInKernel = 5
 
-// kernelCutoffSigmas is the Gaussian truncation radius in units of σ.
-// Variants further than this from the query position receive zero weight.
-// 3σ retains 99.7 % of a Gaussian's area while giving ~O(n × m) complexity
-// instead of the O(n²) incurred by an untruncated kernel.
 const kernelCutoffSigmas = 3.0
 
-// SmoothedStats holds the smoothed, normalised, and consolidated results for
-// one variant position.  All "Sm" fields are smoothed raw values; "Z" fields
-// are robust Z-scores of the smoothed values; CompositeZ is Stouffer's Z;
-// MaxAbsZ is the max|Z| across statistics (retained for comparison with
-// older pipelines).
 type SmoothedStats struct {
 	CHROM string
 	POS   int64
@@ -113,23 +62,7 @@ type SmoothedStats struct {
 	thresholds Thresholds
 }
 
-// SmoothAndNormalise is the main entry point.  It takes the raw BSAstats
-// slice, applies the full pipeline, writes the output TSV, and returns the
-// SmoothedStats slice.
-//
-// Gaussian kernel σ (bandwidth) is derived from cfg.WindowSize:
-//
-//	σ = WindowSize / 2
-//
-// This places ~95% of each kernel's weight within one WindowSize, matching
-// the intuition of the existing sliding-window analysis while avoiding hard
-// edge artefacts.  cfg.StepSize is not consumed here: the kernel evaluates
-// at every variant position rather than on a fixed grid.
-func SmoothAndNormalise(
-	cfg utils.AnalysisConfig,
-	bsaType string,
-	rawStats []BSAstats,
-) ([]SmoothedStats, error) {
+func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
 
 	if len(rawStats) == 0 {
 		return nil, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
@@ -143,7 +76,7 @@ func SmoothAndNormalise(
 	color.Cyan("\n============================ Smoothing & Normalising (%s) ============================\n\n", bsaType)
 	color.Cyan("Gaussian kernel σ = %.0f bp  (WindowSize=%d / 2)\n\n", bw, cfg.WindowSize)
 
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
 	// ── 1. Gaussian kernel smoothing per chromosome ──────────────────────
 	smoothed, err := gaussianSmooth(rawStats, bw, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
@@ -178,11 +111,8 @@ func SmoothAndNormalise(
 // bw is the Gaussian σ in base-pairs (= cfg.WindowSize / 2).
 // Variants further than kernelCutoffSigmas × bw bp from the query position
 // are excluded, reducing per-chromosome complexity from O(n²) to O(n × m).
-func gaussianSmooth(
-	raw []BSAstats,
-	bw float64,
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
-) ([]SmoothedStats, error) {
+
+func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) ([]SmoothedStats, error) {
 
 	cutoff := kernelCutoffSigmas * bw // hard distance cutoff in bp
 
@@ -519,11 +449,7 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 
 // ─── TSV output ────────────────────────────────────────────────────────────────
 
-func writeSmoothedTSV(
-	filename string,
-	sm []SmoothedStats,
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
-) error {
+func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -604,10 +530,7 @@ func writeSmoothedTSV(
 
 // ─── helpers ───────────────────────────────────────────────────────────────────
 
-// bulkFlags returns (hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk) for
-// a given bsaType string.  All four flags are derived from the same string so
-// callers do not need to repeat the logic.
-func bulkFlags(bsaType string) (hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+func BulkFlags(bsaType string) (hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
 	hasHighBulk = strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
 	hasLowBulk = strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
 	hasBothBulks = hasHighBulk && hasLowBulk

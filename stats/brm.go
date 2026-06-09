@@ -233,11 +233,13 @@ func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize, po
 
 // RunBRM runs BRM block detection across chromosomes and writes a TSV of blocks.
 func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRMBlock, error) {
+
+	color.Cyan("===================================== Running BRM block detection =========================================")
 	if len(sm) == 0 {
 		return nil, nil
 	}
 
-	_, _, hasBoth, hasOne := bulkFlags(bsaType)
+	_, _, hasBoth, hasOne := BulkFlags(bsaType)
 	popLevel := popLevelFromPopulation(cfg.Population)
 	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
 
@@ -255,7 +257,7 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 			blocks = calculateBRMBlocksTwoBulk(chrom, stats, cfg.HighBulkSize, cfg.LowBulkSize, popLevel, uAlpha)
 		} else if hasOne {
 			// expectedSI: use expectedHighAlleleP0 if available, else 0.5
-			expectedSI, _ := expectedHighAlleleP0(cfg.Population)
+			expectedSI, _ := ExpectedAF(cfg.Population)
 			if expectedSI == 0 {
 				expectedSI = 0.5
 			}

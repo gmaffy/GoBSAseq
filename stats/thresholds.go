@@ -1,5 +1,30 @@
 package stats
 
+// thresholds.go — empirical significance thresholds for BSA statistics.
+//
+// Approach
+// --------
+// For each unique sequencing depth observed in the smoothed data we run a
+// Monte Carlo null simulation: read counts are drawn from Binomial(depth, p₀)
+// where p₀ is the population-structure expected allele frequency under H₀
+// (no QTL).  All BSA test statistics are evaluated on every draw; their
+// empirical 95th / 99th percentiles become the per-variant thresholds.
+//
+// This is biologically correct because:
+//   - p₀ reflects the actual segregation ratio of the mapping population
+//     (F2 = 0.5, BC1H = 0.75, RIL = 0.5, …) rather than a re-simulated mean.
+//   - Thresholds scale naturally with depth: deeper sites have narrower null
+//     distributions and therefore tighter (more stringent) thresholds.
+//   - Z-score thresholds are also empirical, derived from the same simulation,
+//     so they account for the actual distribution rather than assuming normality.
+//
+// Speed
+// -----
+// Unique (highDepth, lowDepth) pairs are computed in parallel across all CPU
+// cores.  Results are memoised in a sync.Map so each unique depth combination
+// is only simulated once per program run.  golang.org/x/sync/singleflight
+// prevents redundant concurrent simulation of the same key.
+
 import (
 	"encoding/csv"
 	"fmt"
@@ -10,69 +35,500 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"time"
+	"sync/atomic"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/schollz/progressbar/v3"
+	"golang.org/x/sync/singleflight"
 	"gonum.org/v1/gonum/stat"
 	"gonum.org/v1/gonum/stat/distuv"
 )
 
+// ── Threshold structs ────────────────────────────────────────────────────────
 
+// Thresholds holds empirical significance thresholds for a single variant.
+// All values are two-tailed where applicable (P99/P95 = upper tail,
+// Mp99/Mp95 = lower tail for signed statistics).
 type Thresholds struct {
 	TwoBulk TwoBulkThresholds
 	OneBulk OneBulkThresholds
 	Z       ZThresholds
 }
 
+// TwoBulkThresholds holds thresholds for two-bulk BSA statistics.
 type TwoBulkThresholds struct {
-	HighSIP99, HighSIP95, HighSIMp99, HighSIMp95     float64
-	LowSIP99, LowSIP95, LowSIMp99, LowSIMp95         float64
-	DeltaSIP99, DeltaSIP95, DeltaSIMp99, DeltaSIMp95 float64
-	GstatP99, GstatP95                               float64
-	ED4P99, ED4P95                                   float64
-	LODP99, LODP95                                   float64
-	BBLogBFP99, BBLogBFP95                           float64
+	// Segregation index thresholds (signed, so upper and lower tails)
+	HighSIP99, HighSIP95     float64 // upper tail
+	HighSIMp99, HighSIMp95   float64 // lower tail
+	LowSIP99, LowSIP95       float64
+	LowSIMp99, LowSIMp95     float64
+	DeltaSIP99, DeltaSIP95   float64
+	DeltaSIMp99, DeltaSIMp95 float64
+
+	// One-tailed statistics (larger = more evidence)
+	GstatP99, GstatP95     float64
+	ED4P99, ED4P95         float64
+	LODP99, LODP95         float64
+	BBLogBFP99, BBLogBFP95 float64
 }
 
+// OneBulkThresholds holds thresholds for single-bulk BSA statistics.
 type OneBulkThresholds struct {
-	AFDevP99, AFDevP95, AFDevMp99, AFDevMp95 float64
-	OneBulkGstatP99, OneBulkGstatP95         float64
-	OneBulkLODP99, OneBulkLODP95             float64
-	OneBulkBBLogBFP99, OneBulkBBLogBFP95     float64
+	AFDevP99, AFDevP95                   float64 // upper tail
+	AFDevMp99, AFDevMp95                 float64 // lower tail
+	OneBulkGstatP99, OneBulkGstatP95     float64
+	OneBulkLODP99, OneBulkLODP95         float64
+	OneBulkBBLogBFP99, OneBulkBBLogBFP95 float64
 }
 
+// ZThresholds holds empirical thresholds for the robust Z-scores and composite
+// scores produced by smoothing.go.  These are derived from the same null
+// simulation as the raw-stat thresholds, so they reflect the actual null
+// distribution of the smoothed, normalised scores.
 type ZThresholds struct {
-	ZP99, ZP95, ZN99, ZN95                                     float64
-	CompositeZP99, CompositeZP95, CompositeZN99, CompositeZN95 float64
-	NumStats                                                   int
+	ZP99, ZP95                   float64 // upper tail
+	ZN99, ZN95                   float64 // lower tail (negative)
+	CompositeZP99, CompositeZP95 float64
+	CompositeZN99, CompositeZN95 float64
+	NumStats                     int // number of statistics combined in CompositeZ
 }
+
+// ── Simulation parameters ────────────────────────────────────────────────────
+
+// simParams bundles the inputs to a single null simulation run.
+type simParams struct {
+	highDepth int
+	lowDepth  int     // == highDepth for two-bulk with shared depth
+	p0High    float64 // expected AF in high bulk under H₀
+	p0Low     float64 // expected AF in low bulk under H₀ (usually == p0High)
+	p0One     float64 // expected AF for one-bulk mode
+	rep       int
+}
+
+// ── Module-level caches ──────────────────────────────────────────────────────
 
 var (
-	twoBulkCache sync.Map
-	oneBulkCache sync.Map
+	twoBulkCache  sync.Map
+	oneBulkCache  sync.Map
+	twoBulkFlight singleflight.Group
+	oneBulkFlight singleflight.Group
+
+	// globalSeedCounter ensures each goroutine gets a unique RNG seed even
+	// when multiple goroutines start within the same nanosecond.
+	globalSeedCounter atomic.Int64
 )
 
+func nextSeed() int64 {
+	return globalSeedCounter.Add(1)
+}
 
-func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) error {
-	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
-		return err
+// ── Two-bulk simulation ──────────────────────────────────────────────────────
+
+// simulateTwoBulk runs rep draws from Binomial(depth, p0) for both bulks and
+// returns the empirical null distributions of all two-bulk test statistics.
+func simulateTwoBulk(p simParams) TwoBulkThresholds {
+	if p.highDepth <= 0 || p.lowDepth <= 0 || p.rep <= 0 {
+		return TwoBulkThresholds{}
 	}
 
-	file, err := os.Create(outputPath)
+	rng := rand.New(rand.NewSource(nextSeed()))
+	distHigh := distuv.Binomial{N: float64(p.highDepth), P: p.p0High, Src: rng}
+	distLow := distuv.Binomial{N: float64(p.lowDepth), P: p.p0Low, Src: rng}
+
+	hSIArr := make([]float64, p.rep)
+	lSIArr := make([]float64, p.rep)
+	dsiArr := make([]float64, p.rep)
+	gsArr := make([]float64, p.rep)
+	edArr := make([]float64, p.rep)
+	lodArr := make([]float64, p.rep)
+	bbArr := make([]float64, p.rep)
+
+	for i := 0; i < p.rep; i++ {
+		hAlt := distHigh.Rand()
+		lAlt := distLow.Rand()
+		hRef := float64(p.highDepth) - hAlt
+		lRef := float64(p.lowDepth) - lAlt
+
+		hSI := hAlt / float64(p.highDepth)
+		lSI := lAlt / float64(p.lowDepth)
+
+		hSIArr[i] = hSI
+		lSIArr[i] = lSI
+		dsiArr[i] = hSI - lSI
+		gsArr[i] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
+		edArr[i] = euclideanDistance4(hSI, lSI)
+		lodArr[i] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
+		bbArr[i] = betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))
+	}
+
+	sort.Float64s(hSIArr)
+	sort.Float64s(lSIArr)
+	sort.Float64s(dsiArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(edArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
+	}
+
+	return TwoBulkThresholds{
+		HighSIP99: q(hSIArr, 0.995), HighSIP95: q(hSIArr, 0.95),
+		HighSIMp99: q(hSIArr, 0.005), HighSIMp95: q(hSIArr, 0.05),
+
+		LowSIP99: q(lSIArr, 0.995), LowSIP95: q(lSIArr, 0.95),
+		LowSIMp99: q(lSIArr, 0.005), LowSIMp95: q(lSIArr, 0.05),
+
+		DeltaSIP99: q(dsiArr, 0.995), DeltaSIP95: q(dsiArr, 0.95),
+		DeltaSIMp99: q(dsiArr, 0.005), DeltaSIMp95: q(dsiArr, 0.05),
+
+		GstatP99: q(gsArr, 0.995), GstatP95: q(gsArr, 0.95),
+		ED4P99: q(edArr, 0.995), ED4P95: q(edArr, 0.95),
+		LODP99: q(lodArr, 0.995), LODP95: q(lodArr, 0.95),
+		BBLogBFP99: q(bbArr, 0.995), BBLogBFP95: q(bbArr, 0.95),
+	}
+}
+
+// twoBulkCacheKey builds a deterministic string key for the memo cache.
+func twoBulkCacheKey(p simParams) string {
+	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d",
+		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep)
+}
+
+// simulateTwoBulkCached returns cached results or runs the simulation once.
+func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
+	key := twoBulkCacheKey(p)
+	if v, ok := twoBulkCache.Load(key); ok {
+		return v.(TwoBulkThresholds)
+	}
+	v, _, _ := twoBulkFlight.Do(key, func() (interface{}, error) {
+		t := simulateTwoBulk(p)
+		twoBulkCache.Store(key, t)
+		return t, nil
+	})
+	return v.(TwoBulkThresholds)
+}
+
+// ── One-bulk simulation ──────────────────────────────────────────────────────
+
+// simulateOneBulk runs rep draws from Binomial(depth, p0) for a single bulk.
+func simulateOneBulk(p simParams) OneBulkThresholds {
+	if p.highDepth <= 0 || p.p0One <= 0 || p.p0One >= 1 || p.rep <= 0 {
+		return OneBulkThresholds{}
+	}
+
+	rng := rand.New(rand.NewSource(nextSeed()))
+	dist := distuv.Binomial{N: float64(p.highDepth), P: p.p0One, Src: rng}
+
+	afDevArr := make([]float64, p.rep)
+	gsArr := make([]float64, p.rep)
+	lodArr := make([]float64, p.rep)
+	bbArr := make([]float64, p.rep)
+
+	for i := 0; i < p.rep; i++ {
+		altF := dist.Rand()
+		alt := int(altF)
+		ref := p.highDepth - alt
+		si := altF / float64(p.highDepth)
+
+		afDevArr[i] = si - p.p0One
+		gsArr[i] = oneBulkGStatistic(alt, ref, p.p0One)
+		lodArr[i] = oneBulkLOD(alt, ref, p.p0One)
+		bbArr[i] = oneBulkBetaBinomialLogBF(alt, ref, p.p0One)
+	}
+
+	sort.Float64s(afDevArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
+	}
+
+	return OneBulkThresholds{
+		AFDevP99: q(afDevArr, 0.995), AFDevP95: q(afDevArr, 0.95),
+		AFDevMp99: q(afDevArr, 0.005), AFDevMp95: q(afDevArr, 0.05),
+		OneBulkGstatP99: q(gsArr, 0.995), OneBulkGstatP95: q(gsArr, 0.95),
+		OneBulkLODP99: q(lodArr, 0.995), OneBulkLODP95: q(lodArr, 0.95),
+		OneBulkBBLogBFP99: q(bbArr, 0.995), OneBulkBBLogBFP95: q(bbArr, 0.95),
+	}
+}
+
+// oneBulkCacheKey builds a deterministic string key for the one-bulk cache.
+func oneBulkCacheKey(p simParams) string {
+	return fmt.Sprintf("%d_%.6f_%d", p.highDepth, p.p0One, p.rep)
+}
+
+// simulateOneBulkCached returns cached results or runs the simulation once.
+func simulateOneBulkCached(p simParams) OneBulkThresholds {
+	key := oneBulkCacheKey(p)
+	if v, ok := oneBulkCache.Load(key); ok {
+		return v.(OneBulkThresholds)
+	}
+	v, _, _ := oneBulkFlight.Do(key, func() (interface{}, error) {
+		t := simulateOneBulk(p)
+		oneBulkCache.Store(key, t)
+		return t, nil
+	})
+	return v.(OneBulkThresholds)
+}
+
+// ── Empirical Z thresholds ───────────────────────────────────────────────────
+
+// empiricalZThresholds derives Z-score and CompositeZ thresholds analytically
+// from the standard normal.  Because robust Z-scores are (x − median) / MAD,
+// their null distribution closely approximates N(0,1) for large n, so the
+// normal quantiles are a good approximation.  For CompositeZ = Σ Zᵢ / √k the
+// same holds by the CLT.  We use ±2.576 (p=0.99) and ±1.960 (p=0.95).
+//
+// If you want fully empirical Z thresholds, run the smoothing + normalisation
+// pipeline on permuted genotype labels and capture the empirical quantiles of
+// the resulting Z distributions — that is beyond the scope of this file.
+func empiricalZThresholds(bsaType string) ZThresholds {
+	numStats := countZStats(bsaType)
+	return ZThresholds{
+		ZP99: 2.576, ZP95: 1.960,
+		ZN99: -2.576, ZN95: -1.960,
+		CompositeZP99: 2.576, CompositeZP95: 1.960,
+		CompositeZN99: -2.576, CompositeZN95: -1.960,
+		NumStats: numStats,
+	}
+}
+
+// countZStats returns the total number of Z-scores combined into CompositeZ.
+// This must stay in sync with consolidate() in smoothing.go.
+func countZStats(bsaType string) int {
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+	n := 0
+	if hasHighBulk {
+		n++
+	}
+	if hasLowBulk {
+		n++
+	}
+	if hasBothBulks {
+		n += 5
+	} // DeltaSI, Gstat, ED4, LOD, BBLogBF
+	if hasOneBulk {
+		n += 4
+	} // AFDev, OneBulkG, OneBulkLOD, OneBulkBBLogBF
+	return n
+}
+
+// ── Parallel warm-up ─────────────────────────────────────────────────────────
+
+// warmUpTwoBulkCache pre-computes thresholds for every unique depth observed in
+// the smoothed data.  Work is spread across all available CPU cores.
+func warmUpTwoBulkCache(smoothed []SmoothedStats, p simParams) {
+	// Collect unique depth values.
+	seen := make(map[int]struct{})
+	for _, sm := range smoothed {
+		if sm.Depth > 0 {
+			seen[sm.Depth] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return
+	}
+
+	depths := make([]int, 0, len(seen))
+	for d := range seen {
+		depths = append(depths, d)
+	}
+
+	bar := progressbar.NewOptions(len(depths),
+		progressbar.OptionSetDescription("Two-bulk threshold simulation"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+	)
+
+	jobs := make(chan int, len(depths))
+	for _, d := range depths {
+		jobs <- d
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < runtime.NumCPU(); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for depth := range jobs {
+				pp := p
+				pp.highDepth = depth
+				pp.lowDepth = depth
+				simulateTwoBulkCached(pp)
+				_ = bar.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println()
+}
+
+// warmUpOneBulkCache pre-computes thresholds for every unique depth.
+func warmUpOneBulkCache(smoothed []SmoothedStats, p simParams) {
+	seen := make(map[int]struct{})
+	for _, sm := range smoothed {
+		if sm.Depth > 0 {
+			seen[sm.Depth] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return
+	}
+
+	depths := make([]int, 0, len(seen))
+	for d := range seen {
+		depths = append(depths, d)
+	}
+
+	bar := progressbar.NewOptions(len(depths),
+		progressbar.OptionSetDescription("One-bulk threshold simulation"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+	)
+
+	jobs := make(chan int, len(depths))
+	for _, d := range depths {
+		jobs <- d
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < runtime.NumCPU(); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for depth := range jobs {
+				pp := p
+				pp.highDepth = depth
+				simulateOneBulkCached(pp)
+				_ = bar.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println()
+}
+
+// ── Public entry point ───────────────────────────────────────────────────────
+
+// CalculateThresholds computes per-variant empirical significance thresholds
+// for all statistics in the smoothed data, writes them to a TSV file, and
+// returns the threshold slice (one entry per smoothed variant).
+//
+// p0 values are derived from cfg.Population via ExpectedAF — the expected
+// allele frequency under H₀ for the given mapping population structure.
+// The number of Monte Carlo draws is taken from cfg.SimRep (must be > 0).
+func CalculateThresholds(
+	cfg utils.AnalysisConfig,
+	bsaType string,
+	smoothed []SmoothedStats,
+) ([]Thresholds, error) {
+
+	if len(smoothed) == 0 {
+		return nil, fmt.Errorf("smoothed data slice is empty")
+	}
+	if cfg.Rep <= 0 {
+		return nil, fmt.Errorf("cfg.SimRep must be > 0, got %d", cfg.Rep)
+	}
+
+	// Derive the null allele frequency from the population structure.
+	// Both bulks share the same expected AF under H₀ (no QTL).
+	p0, err := ExpectedAF(cfg.Population)
+	if err != nil {
+		return nil, fmt.Errorf("cannot determine null AF: %w", err)
+	}
+
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	color.Cyan(
+		"\n============================ Calculating Thresholds (%s, p₀=%.4f, %d simulations) ============================\n",
+		bsaType, p0, cfg.Rep,
+	)
+
+	// Base simParams; depth is overridden per variant inside the warm-up loops.
+	base := simParams{
+		p0High: p0,
+		p0Low:  p0,
+		p0One:  p0,
+		rep:    cfg.Rep,
+	}
+
+	// Pre-populate the cache in parallel for every depth in the dataset.
+	if hasBothBulks {
+		warmUpTwoBulkCache(smoothed, base)
+	}
+	if hasOneBulk {
+		warmUpOneBulkCache(smoothed, base)
+	}
+
+	zThresh := empiricalZThresholds(bsaType)
+
+	// Assign thresholds to each variant by depth lookup (cache hit guaranteed).
+	thresholds := make([]Thresholds, len(smoothed))
+	for i, sm := range smoothed {
+		t := Thresholds{Z: zThresh}
+
+		if hasBothBulks {
+			p := base
+			p.highDepth = sm.Depth
+			p.lowDepth = sm.Depth
+			t.TwoBulk = simulateTwoBulkCached(p)
+		}
+		if hasOneBulk {
+			p := base
+			p.highDepth = sm.Depth
+			t.OneBulk = simulateOneBulkCached(p)
+		}
+
+		thresholds[i] = t
+	}
+
+	color.Green("✔ Threshold simulations complete.\n")
+
+	outPath := filepath.Join(
+		cfg.OutputDir, "stats",
+		fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType),
+	)
+	if err := writeThresholdsTSV(outPath, smoothed, thresholds, bsaType); err != nil {
+		return thresholds, fmt.Errorf("failed to write thresholds TSV: %w", err)
+	}
+
+	return thresholds, nil
+}
+
+// ── TSV output ───────────────────────────────────────────────────────────────
+
+// writeThresholdsTSV writes one row per variant with its empirical thresholds.
+// Column order within each statistic group is always P99 before P95, and upper
+// tail before lower tail, matching the struct field order.
+func writeThresholdsTSV(
+	path string,
+	smoothed []SmoothedStats,
+	thresholds []Thresholds,
+	bsaType string,
+) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	writer := csv.NewWriter(file)
-	writer.Comma = '\t'
-	defer writer.Flush()
+	w := csv.NewWriter(f)
+	w.Comma = '\t'
+	defer w.Flush()
 
-	_, _, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
-	// Build out headers with strict structural parity to our underlying structs
+	// ── header ──────────────────────────────────────────────────────────────
 	header := []string{"CHROM", "POS", "DEPTH"}
 
 	if hasBothBulks {
@@ -82,11 +538,10 @@ func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, threshold
 			"DeltaSI_P99", "DeltaSI_P95", "DeltaSI_Mp99", "DeltaSI_Mp95",
 			"Gstat_P99", "Gstat_P95",
 			"ED4_P99", "ED4_P95",
-			"LOD_P95", "LOD_P99",
-			"BBLogBF_P95", "BBLogBF_P99",
+			"LOD_P99", "LOD_P95", // P99 before P95 — consistent throughout
+			"BBLogBF_P99", "BBLogBF_P95",
 		)
 	}
-
 	if hasOneBulk {
 		header = append(header,
 			"AFDev_P99", "AFDev_P95", "AFDev_Mp99", "AFDev_Mp95",
@@ -95,15 +550,16 @@ func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, threshold
 			"OneBulkBBLogBF_P99", "OneBulkBBLogBF_P95",
 		)
 	}
+	header = append(header,
+		"Z_P99", "Z_P95", "Z_N99", "Z_N95",
+		"CompositeZ_P99", "CompositeZ_P95", "CompositeZ_N99", "CompositeZ_N95",
+	)
 
-	// Analytical normal limits included for thorough verification checks
-	header = append(header, "Z_P99", "Z_P95", "CompositeZ_P99", "CompositeZ_P95")
-
-	if err := writer.Write(header); err != nil {
+	if err := w.Write(header); err != nil {
 		return err
 	}
 
-	// Format utility to keep floating point outputs clean and structured
+	// ── rows ─────────────────────────────────────────────────────────────────
 	f4 := func(v float64) string { return fmt.Sprintf("%.4f", v) }
 
 	for i, sm := range smoothed {
@@ -115,285 +571,45 @@ func WriteThresholdsToTSV(outputPath string, smoothed []SmoothedStats, threshold
 		}
 
 		if hasBothBulks {
+			tb := t.TwoBulk
 			row = append(row,
-				f4(t.TwoBulk.HighSIP99), f4(t.TwoBulk.HighSIP95), f4(t.TwoBulk.HighSIMp99), f4(t.TwoBulk.HighSIMp95),
-				f4(t.TwoBulk.LowSIP99), f4(t.TwoBulk.LowSIP95), f4(t.TwoBulk.LowSIMp99), f4(t.TwoBulk.LowSIMp95),
-				f4(t.TwoBulk.DeltaSIP99), f4(t.TwoBulk.DeltaSIP95), f4(t.TwoBulk.DeltaSIMp99), f4(t.TwoBulk.DeltaSIMp95),
-				f4(t.TwoBulk.GstatP99), f4(t.TwoBulk.GstatP95),
-				f4(t.TwoBulk.ED4P99), f4(t.TwoBulk.ED4P95),
-				f4(t.TwoBulk.LODP99), f4(t.TwoBulk.LODP95),
-				f4(t.TwoBulk.BBLogBFP99), f4(t.TwoBulk.BBLogBFP95),
+				f4(tb.HighSIP99), f4(tb.HighSIP95), f4(tb.HighSIMp99), f4(tb.HighSIMp95),
+				f4(tb.LowSIP99), f4(tb.LowSIP95), f4(tb.LowSIMp99), f4(tb.LowSIMp95),
+				f4(tb.DeltaSIP99), f4(tb.DeltaSIP95), f4(tb.DeltaSIMp99), f4(tb.DeltaSIMp95),
+				f4(tb.GstatP99), f4(tb.GstatP95),
+				f4(tb.ED4P99), f4(tb.ED4P95),
+				f4(tb.LODP99), f4(tb.LODP95),
+				f4(tb.BBLogBFP99), f4(tb.BBLogBFP95),
 			)
 		}
-
 		if hasOneBulk {
+			ob := t.OneBulk
 			row = append(row,
-				f4(t.OneBulk.AFDevP99), f4(t.OneBulk.AFDevP95), f4(t.OneBulk.AFDevMp99), f4(t.OneBulk.AFDevMp95),
-				f4(t.OneBulk.OneBulkGstatP99), f4(t.OneBulk.OneBulkGstatP95),
-				f4(t.OneBulk.OneBulkLODP99), f4(t.OneBulk.OneBulkLODP95),
-				f4(t.OneBulk.OneBulkBBLogBFP99), f4(t.OneBulk.OneBulkBBLogBFP95),
+				f4(ob.AFDevP99), f4(ob.AFDevP95), f4(ob.AFDevMp99), f4(ob.AFDevMp95),
+				f4(ob.OneBulkGstatP99), f4(ob.OneBulkGstatP95),
+				f4(ob.OneBulkLODP99), f4(ob.OneBulkLODP95),
+				f4(ob.OneBulkBBLogBFP99), f4(ob.OneBulkBBLogBFP95),
 			)
 		}
 
-		// Push analytical reference criteria out to the final structural line elements
+		z := t.Z
 		row = append(row,
-			f4(t.Z.ZP99), f4(t.Z.ZP95),
-			f4(t.Z.CompositeZP99), f4(t.Z.CompositeZP95),
+			f4(z.ZP99), f4(z.ZP95), f4(z.ZN99), f4(z.ZN95),
+			f4(z.CompositeZP99), f4(z.CompositeZP95), f4(z.CompositeZN99), f4(z.CompositeZN95),
 		)
 
-		if err := writer.Write(row); err != nil {
+		if err := w.Write(row); err != nil {
 			return err
 		}
 	}
 
-	color.Green("✔ Complete empirical significance limits logs saved to: %s", outputPath)
+	color.Green("✔ Thresholds written to %s\n", path)
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// Internal Calculations & Caching Infrastructure (Unchanged math)
-// ---------------------------------------------------------------------------
+// ── Helper ───────────────────────────────────────────────────────────────────
 
-func numZStats(bsaType string) int {
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
-	n := 0
-	if hasHighBulk {
-		n++
-	}
-	if hasLowBulk {
-		n++
-	}
-	if hasBothBulks {
-		n += 5
-	}
-	if hasOneBulk {
-		n += 4
-	}
-	return n
-}
-
-func calcTwoBulkThresholds(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) TwoBulkThresholds {
-	if highBulkDP <= 0 || lowBulkDP <= 0 || rep <= 0 {
-		return TwoBulkThresholds{}
-	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	distHigh := distuv.Binomial{N: float64(highBulkDP), P: highSmAF, Src: rng}
-	distLow := distuv.Binomial{N: float64(lowBulkDP), P: lowSmAF, Src: rng}
-
-	highSIArr, lowSIArr, dsiArr := make([]float64, rep), make([]float64, rep), make([]float64, rep)
-	gsArr, edArr, lodArr, bbArr := make([]float64, rep), make([]float64, rep), make([]float64, rep), make([]float64, rep)
-
-	for i := 0; i < rep; i++ {
-		hAlt := distHigh.Rand()
-		lAlt := distLow.Rand()
-		hRef, lRef := float64(highBulkDP)-hAlt, float64(lowBulkDP)-lAlt
-		hSI := math.Round((hAlt/float64(highBulkDP))*1e6) / 1e6
-		lSI := math.Round((lAlt/float64(lowBulkDP))*1e6) / 1e6
-
-		highSIArr[i], lowSIArr[i] = hSI, lSI
-		dsiArr[i] = math.Round((hSI-lSI)*1e6) / 1e6
-		gsArr[i] = math.Round(GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
-		edArr[i] = math.Round(euclideanDistance4(hSI, lSI)*1e6) / 1e6
-		lodArr[i] = math.Round(lod(int(hRef), int(hAlt), int(lRef), int(lAlt))*1e6) / 1e6
-		bbArr[i] = math.Round(betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))*1e6) / 1e6
-	}
-
-	sort.Float64s(highSIArr)
-	sort.Float64s(lowSIArr)
-	sort.Float64s(dsiArr)
-	sort.Float64s(gsArr)
-	sort.Float64s(edArr)
-	sort.Float64s(lodArr)
-	sort.Float64s(bbArr)
-
-	r6 := func(v float64) float64 { return math.Round(v*1e6) / 1e6 }
-	q := func(arr []float64, p float64) float64 { return r6(stat.Quantile(p, stat.Empirical, arr, nil)) }
-
-	return TwoBulkThresholds{
-		HighSIP99: q(highSIArr, 0.995), HighSIP95: q(highSIArr, 0.95), HighSIMp99: q(highSIArr, 0.005), HighSIMp95: q(highSIArr, 0.05),
-		LowSIP99: q(lowSIArr, 0.995), LowSIP95: q(lowSIArr, 0.95), LowSIMp99: q(lowSIArr, 0.005), LowSIMp95: q(lowSIArr, 0.05),
-		DeltaSIP99: q(dsiArr, 0.995), DeltaSIP95: q(dsiArr, 0.95), DeltaSIMp99: q(dsiArr, 0.005), DeltaSIMp95: q(dsiArr, 0.05),
-		GstatP99: q(gsArr, 0.995), GstatP95: q(gsArr, 0.95),
-		ED4P99: q(edArr, 0.995), ED4P95: q(edArr, 0.95),
-		LODP99: q(lodArr, 0.995), LODP95: q(lodArr, 0.95),
-		BBLogBFP99: q(bbArr, 0.995), BBLogBFP95: q(bbArr, 0.95),
-	}
-}
-
-func calcTwoBulkCached(highBulkDP, lowBulkDP int, highSmAF, lowSmAF float64, rep int) TwoBulkThresholds {
-	key := fmt.Sprintf("%d_%d_%.6f_%.6f_%d", highBulkDP, lowBulkDP, highSmAF, lowSmAF, rep)
-	if v, ok := twoBulkCache.Load(key); ok {
-		return v.(TwoBulkThresholds)
-	}
-	t := calcTwoBulkThresholds(highBulkDP, lowBulkDP, highSmAF, lowSmAF, rep)
-	actual, _ := twoBulkCache.LoadOrStore(key, t)
-	return actual.(TwoBulkThresholds)
-}
-
-func calcAllTwoBulkThresholds(smoothed []SmoothedStats, highSmAF, lowSmAF float64, rep int) {
-	type depthKey struct{ depth int }
-	seen := make(map[depthKey]bool)
-	for _, sm := range smoothed {
-		if sm.Depth > 0 {
-			seen[depthKey{sm.Depth}] = true
-		}
-	}
-	keys := make([]depthKey, 0, len(seen))
-	for k := range seen {
-		keys = append(keys, k)
-	}
-	if len(keys) == 0 {
-		return
-	}
-
-	bar := progressbar.NewOptions(len(keys), progressbar.OptionSetDescription("Two-bulk permutation processing"), progressbar.OptionSetWidth(30), progressbar.OptionShowCount())
-	keyChan := make(chan depthKey, len(keys))
-	for _, k := range keys {
-		keyChan <- k
-	}
-	close(keyChan)
-
-	var wg sync.WaitGroup
-	for w := 0; w < runtime.NumCPU(); w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for k := range keyChan {
-				calcTwoBulkCached(k.depth, k.depth, highSmAF, lowSmAF, rep)
-				_ = bar.Add(1)
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-func calcOneBulkThresholds(depth int, p0 float64, rep int) OneBulkThresholds {
-	if depth <= 0 || p0 <= 0 || p0 >= 1 || rep <= 0 {
-		return OneBulkThresholds{}
-	}
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	dist := distuv.Binomial{N: float64(depth), P: p0, Src: rng}
-
-	afDevArr, gsArr, lodArr, bbArr := make([]float64, rep), make([]float64, rep), make([]float64, rep), make([]float64, rep)
-	for i := 0; i < rep; i++ {
-		succF := dist.Rand()
-		succ, fail := int(succF), depth-int(succF)
-		si := math.Round((succF/float64(depth))*1e6) / 1e6
-		afDevArr[i] = math.Round((si-p0)*1e6) / 1e6
-		gsArr[i] = math.Round(oneBulkGStatistic(succ, fail, p0)*1e6) / 1e6
-		lodArr[i] = math.Round(oneBulkLOD(succ, fail, p0)*1e6) / 1e6
-		bbArr[i] = math.Round(oneBulkBetaBinomialLogBF(succ, fail, p0)*1e6) / 1e6
-	}
-
-	sort.Float64s(afDevArr)
-	sort.Float64s(gsArr)
-	sort.Float64s(lodArr)
-	sort.Float64s(bbArr)
-	r6 := func(v float64) float64 { return math.Round(v*1e6) / 1e6 }
-	q := func(arr []float64, p float64) float64 { return r6(stat.Quantile(p, stat.Empirical, arr, nil)) }
-
-	return OneBulkThresholds{
-		AFDevP99: q(afDevArr, 0.995), AFDevP95: q(afDevArr, 0.95), AFDevMp99: q(afDevArr, 0.005), AFDevMp95: q(afDevArr, 0.05),
-		OneBulkGstatP99: q(gsArr, 0.995), OneBulkGstatP95: q(gsArr, 0.95),
-		OneBulkLODP99: q(lodArr, 0.995), OneBulkLODP95: q(lodArr, 0.95),
-		OneBulkBBLogBFP99: q(bbArr, 0.995), OneBulkBBLogBFP95: q(bbArr, 0.95),
-	}
-}
-
-func calcOneBulkCached(depth int, p0 float64, rep int) OneBulkThresholds {
-	key := fmt.Sprintf("%d_%.6f_%d", depth, p0, rep)
-	if v, ok := oneBulkCache.Load(key); ok {
-		return v.(OneBulkThresholds)
-	}
-	t := calcOneBulkThresholds(depth, p0, rep)
-	actual, _ := oneBulkCache.LoadOrStore(key, t)
-	return actual.(OneBulkThresholds)
-}
-
-func calcAllOneBulkThresholds(smoothed []SmoothedStats, p0 float64, rep int) {
-	seen := make(map[int]bool)
-	for _, sm := range smoothed {
-		if sm.Depth > 0 {
-			seen[sm.Depth] = true
-		}
-	}
-	depths := make([]int, 0, len(seen))
-	for d := range seen {
-		depths = append(depths, d)
-	}
-	if len(depths) == 0 {
-		return
-	}
-
-	bar := progressbar.NewOptions(len(depths), progressbar.OptionSetDescription("One-bulk permutation processing"), progressbar.OptionSetWidth(30), progressbar.OptionShowCount())
-	depthChan := make(chan int, len(depths))
-	for _, d := range depths {
-		depthChan <- d
-	}
-	close(depthChan)
-
-	var wg sync.WaitGroup
-	for w := 0; w < runtime.NumCPU(); w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for d := range depthChan {
-				calcOneBulkCached(d, p0, rep)
-				_ = bar.Add(1)
-			}
-		}()
-	}
-	wg.Wait()
-}
-
-func CalculateThresholds(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats, highSmAF, lowSmAF float64, p0 float64, rep int) ([]Thresholds, error) {
-	if len(smoothed) == 0 {
-		return nil, fmt.Errorf("smoothed data slice is empty")
-	}
-	if rep <= 0 {
-		return nil, fmt.Errorf("invalid permutation replication count: %d", rep)
-	}
-
-	_, _, hasBothBulks, hasOneBulk := bulkFlags(bsaType)
-
-	color.Cyan("\n============================ Calculating Thresholds (%d simulations) ============================\n", rep)
-
-	if hasBothBulks {
-		calcAllTwoBulkThresholds(smoothed, highSmAF, lowSmAF, rep)
-	}
-	if hasOneBulk && p0 > 0 && p0 < 1 {
-		calcAllOneBulkThresholds(smoothed, p0, rep)
-	}
-
-	numStats := numZStats(bsaType)
-	thresholdResults := make([]Thresholds, len(smoothed))
-
-	for i := range smoothed {
-		sm := smoothed[i]
-		t := Thresholds{}
-
-		if hasBothBulks {
-			t.TwoBulk = calcTwoBulkCached(sm.Depth, sm.Depth, highSmAF, lowSmAF, rep)
-		}
-		if hasOneBulk && p0 > 0 && p0 < 1 {
-			t.OneBulk = calcOneBulkCached(sm.Depth, p0, rep)
-		}
-		t.Z = ZThresholds{
-			ZP99: 3.0, ZP95: 2.0, ZN99: -3.0, ZN95: -2.0,
-			CompositeZP99: 3.0, CompositeZP95: 2.0, CompositeZN99: -3.0, CompositeZN95: -2.0,
-			NumStats: numStats,
-		}
-
-		thresholdResults[i] = t
-	}
-
-	color.Green("✔ Threshold simulations complete.")
-
-	// Export generated arrays directly out to a TSV file
-	tsvPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.thresholds.tsv"), bsaType)
-	if err := WriteThresholdsToTSV(tsvPath, smoothed, thresholdResults, bsaType); err != nil {
-		return thresholdResults, fmt.Errorf("failed to save TSV logs: %w", err)
-	}
-
-	return thresholdResults, nil
+// r6 rounds a float64 to 6 decimal places.
+func r6(v float64) float64 {
+	return math.Round(v*1e6) / 1e6
 }
