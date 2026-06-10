@@ -21,7 +21,7 @@ type AnalysisConfig struct {
 	VCF string
 	Rdr *vcfgo.Reader
 
-	HigParFwdReads   string
+	HighParFwdReads   string
 	HighParRevReads  string
 	LowParFwdReads   string
 	LowParRevReads   string

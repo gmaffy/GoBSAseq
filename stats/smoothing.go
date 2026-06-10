@@ -156,7 +156,7 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 		smooth1 := func(vals []float64) ([]float64, []int) {
 			smVals := make([]float64, n)
 			nContrib := make([]int, n) // number of variants with w > 0
-			for k := range n {
+			for k := 0; k < n; k++ {
 				pK := pos[k]
 				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
 				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })

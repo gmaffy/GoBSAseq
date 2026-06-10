@@ -1,5 +1,5 @@
 /*
-Copyright © 2026 NAME HERE <EMAIL ADDRESS>
+Copyright © 2026 Godwin Mafireyi <mafireyi@gmail.com>
 */
 package cmd
 
@@ -23,10 +23,17 @@ var rootCmd = &cobra.Command{
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	Run: func(cmd *cobra.Command, args []string) {
-		variant, _ := cmd.Flags().GetString("variant")
 
+		variant, _ := cmd.Flags().GetString("variant")
 		parents, _ := cmd.Flags().GetString("parents")
 		bulks, _ := cmd.Flags().GetString("bulks")
+		parentsBams, _ := cmd.Flags().GetString("parents-bams")
+		bulksBams, _ := cmd.Flags().GetString("bulks-bams")
+		hpReads, _ := cmd.Flags().GetString("hp-reads")
+		lpReads, _ := cmd.Flags().GetString("lp-reads")
+		hbReads, _ := cmd.Flags().GetString("hb-reads")
+		lbReads, _ := cmd.Flags().GetString("lb-reads")
+
 		parentsDepth, _ := cmd.Flags().GetString("parents-depth")
 		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
@@ -61,20 +68,39 @@ var rootCmd = &cobra.Command{
 		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
 		prg, _ := cmd.Flags().GetString("prg")
 
-		//splitArg := func(s string) []string {
-		//	if strings.TrimSpace(s) == "" {
-		//		return []string{}
-		//	}
-		//	return strings.Split(s, ",")
-		//}
 		parentNamesLst := strings.Split(parents, ",")
 		bulkNamesLst := strings.Split(bulks, ",")           //splitArg(bulks)
 		bulksDepthLst := strings.Split(bulksDepth, ",")     //splitArg(bulksDepth)
 		bulkSizesLst := strings.Split(bulkSizes, ",")       //splitArg(bulkSizes)
 		parentsDepthLst := strings.Split(parentsDepth, ",") //splitArg(parentsDepth)
 
+		parentBamsLst := strings.Split(parentsBams, ",")
+		bulkBamsLst := strings.Split(bulksBams, ",")
+		hpReadsLst := strings.Split(hpReads, ",")
+		lpReadsLst := strings.Split(lpReads, ",")
+		hbReadsLst := strings.Split(hbReads, ",")
+		lbReadsLst := strings.Split(lbReads, ",")
+
+
 		highParentName := ""
 		lowParentName := ""
+
+		hpBam := ""
+		lpBam := ""
+		hbBam := ""
+		lbBam := ""
+
+		hpFwdReads := ""
+		hpRevReads := ""
+		lpFwdReads := ""
+		lpRevReads := ""
+		hbFwdReads := ""
+		hbRevReads := ""
+		lbFwdReads := ""
+		lbRevReads := ""
+
+
+
 
 		highBulkName := ""
 		lowBulkName := ""
@@ -93,6 +119,8 @@ var rootCmd = &cobra.Command{
 		var err error
 
 		// ========================================== Get parents =================================================== //
+
+		//------------------------------------------- Parent Names -------------------------------------------------- //
 		if len(parentNamesLst) > 0 {
 			if len(parentNamesLst) != 2 {
 				color.Red("parents is supposed to be in the form a,b (where a and b are parent names)")
@@ -104,6 +132,37 @@ var rootCmd = &cobra.Command{
 
 		}
 
+		// ---------------------------------------- Parent Bams ----------------------------------------------------- //
+		if len(parentBamsLst) > 0 {
+			if len(parentBamsLst) != 2 {
+				color.Red("parentsBams is supposed to be in the form a,b (where a and b are parent bam files)")
+				return
+			}
+			hpBam = parentBamsLst[0]
+			lpBam = parentBamsLst[1]
+
+		}
+
+		// --------------------------------------- Parent Reads ----------------------------------------------------- //
+		if len(hpReadsLst) > 0 {
+			if len(hpReadsLst) != 2 {
+				color.Red("hpReads is supposed to be in the form a,b (where a and b are parent reads)")
+				return
+			}
+			hpFwdReads = hpReadsLst[0]
+			hpRevReads = hpReadsLst[1]
+		}
+
+		if len(lpReadsLst) > 0 {
+			if len(lpReadsLst) != 2 {
+				color.Red("lpReads is supposed to be in the form a,b (where a and b are parent reads)")
+				return
+			}
+			lpFwdReads = lpReadsLst[0]
+			lpRevReads = lpReadsLst[1]
+		}
+
+
 		// ========================================== Get Bulk Names =============================================== //
 		if len(bulkNamesLst) > 0 {
 			if len(bulkNamesLst) != 2 {
@@ -113,6 +172,35 @@ var rootCmd = &cobra.Command{
 			highBulkName = bulkNamesLst[0]
 			lowBulkName = bulkNamesLst[1]
 
+		}
+
+		// ---------------------------------------- Bulk Bams ----------------------------------------------------- //
+		if len(bulkBamsLst) > 0 {
+			if len(bulkBamsLst) != 2 {
+				color.Red("bulkBams is supposed to be in the form a,b (where a and b are bam files)")
+				return
+			}
+			hbBam = bulkBamsLst[0]
+			lbBam = bulkBamsLst[1]
+		}
+
+		// ---------------------------------------- Bulk Reads ----------------------------------------------------- //
+		if len(hbReadsLst) > 0 {
+			if len(hbReadsLst) != 2 {
+				color.Red("hbReads is supposed to be in the form fwdReads,revReads")
+				return
+			}
+			hbFwdReads = hbReadsLst[0]
+			hbRevReads = hbReadsLst[1]
+		}
+
+		if len(lbReadsLst) > 0 {
+			if len(lbReadsLst) != 2 {
+				color.Red("lbReads is supposed to be in the form fwdReads,revReads")
+				return
+			}
+			lbFwdReads = lbReadsLst[0]
+			lbRevReads = lbReadsLst[1]
 		}
 
 		// ========================================== Get bulk depths =============================================== //
@@ -150,6 +238,7 @@ var rootCmd = &cobra.Command{
 			lowParentDepth, err = strconv.Atoi(parentsDepthLst[1])
 			if err != nil {
 				color.Red("parentsDepth is supposed to be in the form a,b (where a and b are integers)")
+				return
 			}
 
 		}
@@ -216,6 +305,23 @@ var rootCmd = &cobra.Command{
 
 		a_config := utils.AnalysisConfig{
 			VCF:           variant,
+
+			HighParFwdReads:   hpFwdReads,
+			HighParRevReads:  hpRevReads,
+			LowParFwdReads:   lpFwdReads,
+			LowParRevReads:   lpRevReads,
+
+			HighBulkFwdReads: hbFwdReads,
+			HighBulkRevReads: hbRevReads,
+			LowBulkFwdReads:  lbFwdReads,
+			LowBulkRevReads:  lbRevReads,
+
+			HighParBam:  hpBam,
+			LowParBam:   lpBam,
+			HighBulkBam: hbBam,
+			LowBulkBam:  lbBam,
+
+
 			Population:    population,
 			WindowSize:    winSize,
 			StepSize:      step,
@@ -256,8 +362,6 @@ var rootCmd = &cobra.Command{
 	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute() {
 	err := rootCmd.Execute()
 	if err != nil {
@@ -268,10 +372,15 @@ func Execute() {
 func init() {
 	// ---------------------------------------- Input files ----------------------------------------------------- //
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
-	rootCmd.Flags().StringP("parents", "P", ",", "parent names (comma separated)")
-	rootCmd.Flags().StringP("bulks", "B", ",", "bulk names (comma seperated)")
-	rootCmd.Flags().String("parents-bams", ",", "parent bam files (comma separated)")
-	rootCmd.Flags().String("bulks-bams", ",", "bulk bam files (comma separated)")
+	rootCmd.Flags().StringP("parents", "P", ",", "parent names (hp,lp)")
+	rootCmd.Flags().StringP("bulks", "B", ",", "bulk names (hb,lb)")
+	rootCmd.Flags().String("parents-bams", ",", "parent bam files (hp,lp)")
+	rootCmd.Flags().String("bulks-bams", ",", "bulk bam files (hb,lb)")
+	rootCmd.Flags().String("hp-reads", ",", "high parent reads (fwd,rev)")
+	rootCmd.Flags().String("lp-reads", ",", "low parent reads (fwd,rev)")
+	rootCmd.Flags().String("hb-reads", ",", "high bulk reads (fwd,rev)")
+	rootCmd.Flags().String("lb-reads", ",", "low bulk reads (fwd,rev)")
+
 
 	// ================================================ Parameters ================================================== //
 	// -------------------------------------------------- Inputs ---------------------------------------------------- //

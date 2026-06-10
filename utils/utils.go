@@ -9,7 +9,7 @@ import (
 	"github.com/brentp/vcfgo"
 )
 
-func getFloat(v *vcfgo.Variant, key string) (float64, bool) {
+func GetFloat(v *vcfgo.Variant, key string) (float64, bool) {
 	raw, err := v.Info().Get(key)
 	if err != nil || raw == nil {
 		return 0, false
