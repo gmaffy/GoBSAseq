@@ -4,12 +4,15 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	bam2 "github.com/biogo/hts/bam"
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
@@ -124,10 +127,10 @@ func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
 
 }
 
-func getRunType(cfg *utils.AnalysisConfig) (string,error) {
+func getRunType(cfg *utils.AnalysisConfig) (string, error) {
 
 	if cfg.VCF != "" {
-		if cfg.HighParBam == "" && cfg.LowParBam == "" && cfg.HighBulkBam == "" && cfg.LowBulkBam == ""  && cfg.HighParFwdReads == "" && cfg.HighParRevReads == "" && cfg.LowParFwdReads == "" && cfg.LowParRevReads == "" && cfg.HighBulkFwdReads == "" && cfg.HighBulkRevReads == "" && cfg.LowBulkFwdReads == "" && cfg.LowBulkRevReads == ""{
+		if cfg.HighParBam == "" && cfg.LowParBam == "" && cfg.HighBulkBam == "" && cfg.LowBulkBam == "" && cfg.HighParFwdReads == "" && cfg.HighParRevReads == "" && cfg.LowParFwdReads == "" && cfg.LowParRevReads == "" && cfg.HighBulkFwdReads == "" && cfg.HighBulkRevReads == "" && cfg.LowBulkFwdReads == "" && cfg.LowBulkRevReads == "" {
 			return "vcf", nil
 		}
 		return "", fmt.Errorf("if VCF flag is passed then no other flag should be passed")
@@ -216,6 +219,56 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	return nil
 }
 
+func GetBamName(bam string) (string, error) {
+	if strings.HasSuffix(bam, ".bam") {
+		bamFile, err := os.Open(bam)
+		if err != nil {
+			fmt.Println("Failed to open bam file:", bam)
+
+			return fmt.Sprintf("Failed to open bam file: %s", bam), err
+		}
+		defer bamFile.Close()
+		bamRdr, err := bam2.NewReader(bamFile, 2)
+		if err != nil {
+			return fmt.Sprintf("%s is not a valid bam file", bam), err
+		}
+		defer bamRdr.Close()
+
+		header := bamRdr.Header()
+		//fmt.Println(header)
+		for _, rg := range header.RGs() {
+			return rg.Name(), nil
+		}
+		return "", fmt.Errorf("no read group found")
+	} else if strings.HasSuffix(bam, ".cram") {
+
+		cmd := exec.Command("samtools", "view", "-H", bam)
+
+		out, err := cmd.Output()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		lines := strings.Split(string(out), "\n")
+
+		for _, line := range lines {
+			if strings.HasPrefix(line, "@RG") {
+				fields := strings.Split(line, "\t")
+				for _, f := range fields {
+					if strings.HasPrefix(f, "SM:") {
+						//fmt.Println("Sample:", strings.TrimPrefix(f, "SM:"))
+						return strings.TrimPrefix(f, "SM:"), nil
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("no sample name found")
+
+	}
+	return "", fmt.Errorf("invalid bam file")
+
+}
+
 func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	// ============================================ Run Type ====================================================== //
 	runType, err := getRunType(cfg)
@@ -230,20 +283,64 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	}
 	if runType == "bams" {
 		fmt.Printf("Running BSAseq with bam-based analysis\n")
+		hpBam := cfg.HighParBam
+		lpBam := cfg.LowParBam
+		hbBam := cfg.HighBulkBam
+		lbBam := cfg.LowBulkBam
+		if hpBam != "" {
+			cfg.HighParentName, err = GetBamName(hpBam)
+			fmt.Println(cfg.HighParentName)
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+		}
+		if lpBam != "" {
+			cfg.LowParentName, err = GetBamName(lpBam)
+			fmt.Println(cfg.LowParentName)
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+		}
+		if hbBam != "" {
+			cfg.HighBulkName, err = GetBamName(hbBam)
+			if err != nil {
+				fmt.Println(err)
+				return err
+			}
+
+			if lbBam != "" {
+				cfg.LowBulkName, err = GetBamName(lbBam)
+				if err != nil {
+					fmt.Println(err)
+					return err
+				}
+			}
+		}
+
+		bType, _, err := bsaseqType(cfg)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+
+		fmt.Printf("Running BAM BSAseq with %s analysis\n", bType)
+
 		return nil
+
 	}
+
 	if runType == "vcf" {
 		fmt.Printf("Running BSAseq with VCF-based analysis\n")
 		return nil
 	}
 
-
 	fmt.Printf("HighParent: %s\n", cfg.HighParentName)
 	fmt.Printf("LowParent: %s\n", cfg.LowParentName)
 	fmt.Printf("HighBulk: %s\n", cfg.HighBulkName)
 	fmt.Printf("LowBulk: %s\n", cfg.LowBulkName)
-
-
 
 	// =========================================== Gene Space Check ================================================= //
 	if missing := missingGeneSpaceParams(cfg); len(missing) > 0 {
@@ -255,8 +352,10 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		}
 		switch strings.ToLower(strings.TrimSpace(answer)) {
 		case "y", "yes":
+
 			color.Yellow("Continuing without gene space analysis.")
 		default:
+
 			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
 		}
 	}
@@ -462,6 +561,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
 	bType, idxs, err := bsaseqType(cfg)
 	if err != nil {
+		fmt.Println(err)
 		return err
 	}
 
@@ -471,4 +571,5 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	}
 
 	return nil
+
 }
