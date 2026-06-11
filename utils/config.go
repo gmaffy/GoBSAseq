@@ -21,7 +21,7 @@ type AnalysisConfig struct {
 	VCF string
 	Rdr *vcfgo.Reader
 
-	HighParFwdReads   string
+	HighParFwdReads  string
 	HighParRevReads  string
 	LowParFwdReads   string
 	LowParRevReads   string
@@ -29,7 +29,7 @@ type AnalysisConfig struct {
 	HighBulkRevReads string
 	LowBulkFwdReads  string
 	LowBulkRevReads  string
-	
+
 	HighParBam  string
 	LowParBam   string
 	HighBulkBam string
@@ -79,4 +79,12 @@ type AnalysisConfig struct {
 	Cds      string
 	GeneDesc string
 	Prg      string
+
+	Merger             string
+	Caller             string
+	NoMerging          bool
+	DeepVariantVersion string
+	ModelType          string
+	Verbose            bool
+	Threads            int
 }

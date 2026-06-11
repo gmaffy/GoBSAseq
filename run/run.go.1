@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"os"
 	"os/exec"
@@ -218,7 +219,7 @@ func getRunType(cfg *utils.AnalysisConfig) (string, error) {
 		}
 		return "", fmt.Errorf("if bulk bams flags are passed then neither VCFs or reads should be passed")
 	}
-	if cfg.HighParFwdReads != "" || cfg.HighParRevReads != "" || cfg.LowParFwdReads != "" || cfg.LowParRevReads != "" || cfg.HighBulkFwdReads != "" || cfg.HighBulkRevReads != "" || cfg.LowBulkFwdReads != "" || cfg.LowBulkRevReads != "" {
+	if cfg.HighParFwdReads != "" || cfg.HighParRevReads != "" || cfg.LowParFwdReads != "" || cfg.LowParRevReads != "" || cfg.HighBulkFwdReads != "" && cfg.HighBulkRevReads != "" && cfg.LowBulkFwdReads != "" && cfg.LowBulkRevReads != "" {
 		if cfg.VCF == "" && cfg.HighParBam == "" && cfg.LowParBam == "" && cfg.HighBulkBam == "" && cfg.LowBulkBam == "" {
 			return "reads", nil
 		}
@@ -330,7 +331,7 @@ func GetBamName(bam string) (string, error) {
 
 		out, err := cmd.Output()
 		if err != nil {
-			return "", fmt.Errorf("samtools failed for %s: %w", bam, err)
+			log.Fatal(err)
 		}
 
 		lines := strings.Split(string(out), "\n")
@@ -378,7 +379,6 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 				fmt.Printf("Gene space analysis requires %s to be present\n", gsFile)
 				return fmt.Errorf("gene space analysis requires %s to be present", gsFile)
 			}
-		}
 	}
 
 	// ============================================ Run Type ====================================================== //
@@ -418,14 +418,24 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
 		// ----------------------------------------- Run variant calling ------------------------------------------- //
 
-		vcfFile, err := variants.VariantCalling(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 4, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
+		vcfFile, err := variants.VariantCalling(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 4, "INFO", "deepvariant", "glnexus", logFile, "1.10.0", "WGS", true, false)
 		if err != nil {
-			fmt.Errorf("failed to run variant calling: %w", err)
+			fmt.Println(err)
 			return err
 		}
 		cfg.VCF = vcfFile
 		fmt.Println(cfg.VCF)
+		
+		// ----------------------------------------- Run BSAseq ----------------------------------------------------- //
+		//TODO: read vcf and get idxs
 
+		return nil
+
+	}
+
+	if runType == "vcf" {
+		fmt.Printf("Running BSAseq with VCF-based analysis\n")
+		return nil
 	}
 
 	fmt.Printf("HighParent: %s\n", cfg.HighParentName)

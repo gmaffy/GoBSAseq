@@ -68,6 +68,14 @@ var rootCmd = &cobra.Command{
 		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
 		prg, _ := cmd.Flags().GetString("prg")
 
+		merger, _ := cmd.Flags().GetString("merger")
+		caller, _ := cmd.Flags().GetString("caller")
+		noMerging, _ := cmd.Flags().GetBool("no-merging")
+		deepVariantVersion, _ := cmd.Flags().GetString("deepvariant-version")
+		modelType, _ := cmd.Flags().GetString("model-type")
+		verbose, _ := cmd.Flags().GetBool("verbose")
+		threads, _ := cmd.Flags().GetInt("threads")
+
 		parentNamesLst := strings.Split(parents, ",")
 		bulkNamesLst := strings.Split(bulks, ",")           //splitArg(bulks)
 		bulksDepthLst := strings.Split(bulksDepth, ",")     //splitArg(bulksDepth)
@@ -80,7 +88,6 @@ var rootCmd = &cobra.Command{
 		lpReadsLst := strings.Split(lpReads, ",")
 		hbReadsLst := strings.Split(hbReads, ",")
 		lbReadsLst := strings.Split(lbReads, ",")
-
 
 		highParentName := ""
 		lowParentName := ""
@@ -98,9 +105,6 @@ var rootCmd = &cobra.Command{
 		hbRevReads := ""
 		lbFwdReads := ""
 		lbRevReads := ""
-
-
-
 
 		highBulkName := ""
 		lowBulkName := ""
@@ -161,7 +165,6 @@ var rootCmd = &cobra.Command{
 			lpFwdReads = lpReadsLst[0]
 			lpRevReads = lpReadsLst[1]
 		}
-
 
 		// ========================================== Get Bulk Names =============================================== //
 		if len(bulkNamesLst) > 0 {
@@ -304,12 +307,12 @@ var rootCmd = &cobra.Command{
 		}
 
 		a_config := utils.AnalysisConfig{
-			VCF:           variant,
+			VCF: variant,
 
-			HighParFwdReads:   hpFwdReads,
-			HighParRevReads:  hpRevReads,
-			LowParFwdReads:   lpFwdReads,
-			LowParRevReads:   lpRevReads,
+			HighParFwdReads: hpFwdReads,
+			HighParRevReads: hpRevReads,
+			LowParFwdReads:  lpFwdReads,
+			LowParRevReads:  lpRevReads,
 
 			HighBulkFwdReads: hbFwdReads,
 			HighBulkRevReads: hbRevReads,
@@ -320,7 +323,6 @@ var rootCmd = &cobra.Command{
 			LowParBam:   lpBam,
 			HighBulkBam: hbBam,
 			LowBulkBam:  lbBam,
-
 
 			Population:    population,
 			WindowSize:    winSize,
@@ -352,6 +354,14 @@ var rootCmd = &cobra.Command{
 			Cds:      cds,
 			GeneDesc: geneDescriptions,
 			Prg:      prg,
+
+			Caller:             caller,
+			Merger:             merger,
+			NoMerging:          noMerging,
+			DeepVariantVersion: deepVariantVersion,
+			ModelType:          modelType,
+			Verbose:            verbose,
+			Threads:            threads,
 		}
 
 		err = run.Run(&a_config, hfConfig)
@@ -380,7 +390,6 @@ func init() {
 	rootCmd.Flags().String("lp-reads", ",", "low parent reads (fwd,rev)")
 	rootCmd.Flags().String("hb-reads", ",", "high bulk reads (fwd,rev)")
 	rootCmd.Flags().String("lb-reads", ",", "low bulk reads (fwd,rev)")
-
 
 	// ================================================ Parameters ================================================== //
 	// -------------------------------------------------- Inputs ---------------------------------------------------- //
@@ -417,12 +426,21 @@ func init() {
 	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
 	rootCmd.Flags().String("gff", "", "gff3 file path")
 	rootCmd.Flags().String("cds", "", "cds file path")
-	rootCmd.Flags().StringP("reference", "r", "", "cds fasta path")
+	rootCmd.Flags().StringP("reference", "r", "", "reference file path")
 	rootCmd.Flags().String("protein", "", "protein fasta path")
 	rootCmd.Flags().String("gene-descriptions", "", "gene descriptions file path")
 	rootCmd.Flags().String("prg", "", "prg blast file path ")
 
 	// ------------------------------------------- OutDir ----------------------------------------------------------- //
 	rootCmd.Flags().StringP("out", "o", ".", "Output directory")
+
+	// ------------------------------------------ Variant Calling --------------------------------------------------- //
+	rootCmd.Flags().String("caller", "deepvariant", "Variant caller to use. Options: gatk or deepvariant")
+	rootCmd.Flags().String("merger", "glnexus", "GVCF merger to use. Options: gatk or glnexus")
+	rootCmd.Flags().Bool("no-merging", false, "do not merge gvcfs.")
+	rootCmd.Flags().String("deepvariant-version", "1.10.0", "DeepVariant version")
+	rootCmd.Flags().String("model-type", "WGS", "DeepVariant Model Type: WGS,WES,PACBIO,ONT_R104,HYBRID_PACBIO_ILLUMINA")
+	rootCmd.Flags().BoolP("verbose", "v", false, "Verbose")
+	rootCmd.Flags().Int64P("threads", "t", 4, "Number of threads")
 
 }
