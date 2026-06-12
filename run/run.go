@@ -418,7 +418,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
 		// ----------------------------------------- Run variant calling ------------------------------------------- //
 
-		vcfFile, err := variants.VariantCalling(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 4, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
+		vcfFile, err := variants.VariantCalling(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 8, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
 		if err != nil {
 			fmt.Errorf("failed to run variant calling: %w", err)
 			return err
