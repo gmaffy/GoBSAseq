@@ -6,7 +6,7 @@ require (
 	github.com/biogo/hts v1.4.5
 	github.com/brentp/vcfgo v0.0.0-20250902214554-a31336cef488
 	github.com/fatih/color v1.19.0
-	github.com/gmaffy/genome-whisperer v0.0.0-20260611141640-de4b3b20c82f
+	github.com/gmaffy/genome-whisperer v0.0.0-20260616184634-904b0e40d321
 	github.com/go-echarts/go-echarts/v2 v2.7.2
 	github.com/schollz/progressbar/v3 v3.19.0
 	github.com/spf13/cobra v1.10.2
@@ -15,9 +15,9 @@ require (
 )
 
 require (
-	github.com/biogo/biogo v1.0.4 // indirect
-	github.com/brentp/irelate v0.0.1 // indirect
+	github.com/brentp/irelate v0.0.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
+	github.com/lmittmann/tint v1.1.3 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect

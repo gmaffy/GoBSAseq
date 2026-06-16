@@ -5,7 +5,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c8fd8c0f-4d75-492d-a3fe-ad2db847de31" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/run/run.go" beforeDir="false" afterPath="$PROJECT_DIR$/run/run.go" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -19,7 +22,7 @@
     </persistenceIdMap>
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="97" />
+    <option name="cachedIndexableFilesCount" value="25" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
   <component name="FileTemplateManagerImpl">
@@ -29,7 +32,7 @@
       </list>
     </option>
   </component>
-  <component name="GOROOT" url="file://$USER_HOME$/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.3.windows-amd64" />
+  <component name="GOROOT" url="file://$USER_HOME$/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.26.4.windows-amd64" />
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
@@ -39,61 +42,61 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="3.624325123606077E-4" />
-      <entry key="MS500" value="0.20504322779918527" />
-      <entry key="S2" value="0.67316330061752" />
-      <entry key="S5" value="0.8897232680897881" />
-      <entry key="S10" value="1.1373186599593774" />
-      <entry key="S30" value="2.2397919358981104" />
-      <entry key="S60" value="3.7919630325736793" />
-      <entry key="M2" value="7.146136255453738" />
-      <entry key="M5" value="16.092379380259683" />
-      <entry key="M10" value="24.31231471123593" />
-      <entry key="M15" value="28.8618349589456" />
-      <entry key="M30" value="38.883168262704004" />
-      <entry key="H1" value="61.18688357139074" />
-      <entry key="H2" value="111.98239983451717" />
-      <entry key="H4" value="201.23762171481846" />
-      <entry key="D1" value="439.34397707058787" />
-      <entry key="W1" value="525.9486035867101" />
+      <entry key="MS100" value="1.2662536172641534" />
+      <entry key="MS500" value="2.061022204780577" />
+      <entry key="S2" value="4.050356145878117" />
+      <entry key="S5" value="5.457241044249662" />
+      <entry key="S10" value="6.147728765904744" />
+      <entry key="S30" value="6.6954316611806926" />
+      <entry key="S60" value="6.8449805417497895" />
+      <entry key="M2" value="6.921792856097924" />
+      <entry key="M5" value="6.974085603462299" />
+      <entry key="M10" value="7.44074271613006" />
+      <entry key="M15" value="9.323034104393578" />
+      <entry key="M30" value="20.343950653789477" />
+      <entry key="H1" value="46.59546029243757" />
+      <entry key="H2" value="100.008195312836" />
+      <entry key="H4" value="193.68639606502464" />
+      <entry key="D1" value="458.5676742726793" />
+      <entry key="W1" value="558.2363300731239" />
     </decayedCancelled>
     <decayedSelected>
-      <entry key="MS100" value="1.0" />
-      <entry key="MS500" value="1.0000000000000007" />
-      <entry key="S2" value="1.000158855735245" />
-      <entry key="S5" value="1.0304245330980717" />
-      <entry key="S10" value="1.1897711297190756" />
-      <entry key="S30" value="2.0678410122163813" />
-      <entry key="S60" value="3.390449212452425" />
-      <entry key="M2" value="5.652559718828052" />
-      <entry key="M5" value="10.08900856989834" />
-      <entry key="M10" value="13.558007312192926" />
-      <entry key="M15" value="15.298553905757268" />
-      <entry key="M30" value="18.363535306079978" />
-      <entry key="H1" value="24.126614594242813" />
-      <entry key="H2" value="37.24681324021651" />
-      <entry key="H4" value="60.09288680565766" />
-      <entry key="D1" value="114.54354953977739" />
-      <entry key="W1" value="131.75589226929927" />
+      <entry key="MS100" value="0.0" />
+      <entry key="MS500" value="0.0" />
+      <entry key="S2" value="0.0" />
+      <entry key="S5" value="4.223320339958051E-231" />
+      <entry key="S10" value="1.079035039742452E-115" />
+      <entry key="S30" value="1.0650351385196385E-38" />
+      <entry key="S60" value="2.562952499047395E-19" />
+      <entry key="M2" value="1.817927094874573E-9" />
+      <entry key="M5" value="0.0021610623322822985" />
+      <entry key="M10" value="0.26643077911256274" />
+      <entry key="M15" value="1.367162751558276" />
+      <entry key="M30" value="7.321019455287619" />
+      <entry key="H1" value="18.829768763715983" />
+      <entry key="H2" value="36.83891608494737" />
+      <entry key="H4" value="63.69219793137809" />
+      <entry key="D1" value="128.09090417352493" />
+      <entry key="W1" value="149.02593579704723" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="3.8844554872571115E-4" />
-      <entry key="MS500" value="0.2096731153415456" />
-      <entry key="S2" value="0.8805737552758897" />
-      <entry key="S5" value="1.4426951708045068" />
-      <entry key="S10" value="2.0270084997715108" />
-      <entry key="S30" value="4.1309432679042075" />
-      <entry key="S60" value="7.025366923741759" />
-      <entry key="M2" value="12.651754335381657" />
-      <entry key="M5" value="26.063794441696086" />
-      <entry key="M10" value="37.78826807498977" />
-      <entry key="M15" value="44.09794222507292" />
-      <entry key="M30" value="57.208262193934935" />
-      <entry key="H1" value="85.28614766165705" />
-      <entry key="H2" value="149.20615063689493" />
-      <entry key="H4" value="261.31122355012286" />
-      <entry key="D1" value="553.881306762007" />
-      <entry key="W1" value="657.7034725935872" />
+      <entry key="MS100" value="1.2334291401505648" />
+      <entry key="MS500" value="2.0509433943972795" />
+      <entry key="S2" value="4.044523334700834" />
+      <entry key="S5" value="5.4537008928948225" />
+      <entry key="S10" value="6.145640476523583" />
+      <entry key="S30" value="6.694648904036302" />
+      <entry key="S60" value="6.8445771631012065" />
+      <entry key="M2" value="6.9215880736330115" />
+      <entry key="M5" value="6.976142303978317" />
+      <entry key="M10" value="7.705708283883777" />
+      <entry key="M15" value="10.685178611217566" />
+      <entry key="M30" value="27.6511196757839" />
+      <entry key="H1" value="65.40615567074532" />
+      <entry key="H2" value="136.82659581688023" />
+      <entry key="H4" value="257.359708584617" />
+      <entry key="D1" value="586.6519407426362" />
+      <entry key="W1" value="707.2611552928241" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -138,7 +141,7 @@
     &quot;git-widget-placeholder&quot;: &quot;main&quot;,
     &quot;go.sdk.automatically.set&quot;: &quot;true&quot;,
     &quot;junie.onboarding.icon.badge.shown&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;E:/GitHub/GoBSAseq/stats&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/mafir&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
@@ -189,8 +192,8 @@
         <entry key="$PROJECT_DIR$/go.mod">
           <value>
             <VersionUpgradeInfo>
-              <version>1.26.3</version>
-              <timestamp>1781119717435</timestamp>
+              <version>1.26.4</version>
+              <timestamp>1781620668477</timestamp>
             </VersionUpgradeInfo>
           </value>
         </entry>

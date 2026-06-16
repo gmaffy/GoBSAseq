@@ -18,6 +18,7 @@ import (
 	"github.com/gmaffy/GoBSAseq/plots"
 	"github.com/gmaffy/GoBSAseq/stats"
 	"github.com/gmaffy/GoBSAseq/utils"
+	utils2 "github.com/gmaffy/genome-whisperer/utils"
 	"github.com/gmaffy/genome-whisperer/variants"
 )
 
@@ -417,11 +418,11 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		logFile := filepath.Join(cfg.OutputDir, "vcfs", "variant_calling.log")
 
 		// ----------------------------------------- Run variant calling ------------------------------------------- //
-
-		vcfFile, err := variants.VariantCalling(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 8, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
+		//threads, _ := strconv.Atoi(cfg.Threads)
+		vcfFile, err := variants.VariantCalling(bams, cfg.Ref, cfg.SnpEffDB, cfg.SnpEffDB, vcDir, cfg.Caller, cfg.Merger, false, false, utils2.HardFilterConfig(hf), cfg.Verbose, "WARNING", cfg.Threads, logFile, cfg.DeepVariantVersion, cfg.ModelType) //(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 8, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
 		if err != nil {
-			fmt.Errorf("failed to run variant calling: %w", err)
-			return err
+			// wrap and return the error so the caller receives context
+			return fmt.Errorf("failed to run variant calling: %w", err)
 		}
 		cfg.VCF = vcfFile
 		fmt.Println(cfg.VCF)
