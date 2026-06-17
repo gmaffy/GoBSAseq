@@ -5,7 +5,6 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c8fd8c0f-4d75-492d-a3fe-ad2db847de31" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/go.mod" beforeDir="false" afterPath="$PROJECT_DIR$/go.mod" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/go.sum" beforeDir="false" afterPath="$PROJECT_DIR$/go.sum" afterDir="false" />
@@ -22,7 +21,7 @@
     </persistenceIdMap>
   </component>
   <component name="EmbeddingIndexingInfo">
-    <option name="cachedIndexableFilesCount" value="25" />
+    <option name="cachedIndexableFilesCount" value="26" />
     <option name="fileBasedEmbeddingIndicesEnabled" value="true" />
   </component>
   <component name="FileTemplateManagerImpl">
@@ -42,61 +41,61 @@
   </component>
   <component name="NextEditCompletionFeaturesState">
     <decayedCancelled>
-      <entry key="MS100" value="1.2662536172641534" />
-      <entry key="MS500" value="2.061022204780577" />
-      <entry key="S2" value="4.050356145878117" />
-      <entry key="S5" value="5.457241044249662" />
-      <entry key="S10" value="6.147728765904744" />
-      <entry key="S30" value="6.6954316611806926" />
-      <entry key="S60" value="6.8449805417497895" />
-      <entry key="M2" value="6.921792856097924" />
-      <entry key="M5" value="6.974085603462299" />
-      <entry key="M10" value="7.44074271613006" />
-      <entry key="M15" value="9.323034104393578" />
-      <entry key="M30" value="20.343950653789477" />
-      <entry key="H1" value="46.59546029243757" />
-      <entry key="H2" value="100.008195312836" />
-      <entry key="H4" value="193.68639606502464" />
-      <entry key="D1" value="458.5676742726793" />
-      <entry key="W1" value="558.2363300731239" />
+      <entry key="MS100" value="1.0000000000000964" />
+      <entry key="MS500" value="1.0024944156195783" />
+      <entry key="S2" value="1.2727572520472796" />
+      <entry key="S5" value="1.9930623800436158" />
+      <entry key="S10" value="2.681888536515561" />
+      <entry key="S30" value="3.932625092029497" />
+      <entry key="S60" value="5.885493556757815" />
+      <entry key="M2" value="9.448357257658625" />
+      <entry key="M5" value="14.900179241900315" />
+      <entry key="M10" value="18.273365316368917" />
+      <entry key="M15" value="21.037387823821753" />
+      <entry key="M30" value="32.45732247984359" />
+      <entry key="H1" value="58.69075701298741" />
+      <entry key="H2" value="112.06749067456232" />
+      <entry key="H4" value="205.90895170162722" />
+      <entry key="D1" value="472.4873072959686" />
+      <entry key="W1" value="573.0487585125006" />
     </decayedCancelled>
     <decayedSelected>
-      <entry key="MS100" value="0.0" />
-      <entry key="MS500" value="0.0" />
-      <entry key="S2" value="0.0" />
-      <entry key="S5" value="4.223320339958051E-231" />
-      <entry key="S10" value="1.079035039742452E-115" />
-      <entry key="S30" value="1.0650351385196385E-38" />
-      <entry key="S60" value="2.562952499047395E-19" />
-      <entry key="M2" value="1.817927094874573E-9" />
-      <entry key="M5" value="0.0021610623322822985" />
-      <entry key="M10" value="0.26643077911256274" />
-      <entry key="M15" value="1.367162751558276" />
-      <entry key="M30" value="7.321019455287619" />
-      <entry key="H1" value="18.829768763715983" />
-      <entry key="H2" value="36.83891608494737" />
-      <entry key="H4" value="63.69219793137809" />
-      <entry key="D1" value="128.09090417352493" />
-      <entry key="W1" value="149.02593579704723" />
+      <entry key="MS100" value="4.842281411453045E-60" />
+      <entry key="MS500" value="1.4547156166727948E-12" />
+      <entry key="S2" value="0.0016201024470789522" />
+      <entry key="S5" value="0.11436083426829702" />
+      <entry key="S10" value="0.47849060519612896" />
+      <entry key="S30" value="1.3517153851979977" />
+      <entry key="S60" value="1.9091911759030944" />
+      <entry key="M2" value="2.3530357856242694" />
+      <entry key="M5" value="2.7110484604680156" />
+      <entry key="M10" value="3.0396977952983346" />
+      <entry key="M15" value="3.9917830990663816" />
+      <entry key="M30" value="9.496625681099827" />
+      <entry key="H1" value="20.782361347540473" />
+      <entry key="H2" value="38.81280929252243" />
+      <entry key="H4" value="65.80380565911639" />
+      <entry key="D1" value="130.7925122946767" />
+      <entry key="W1" value="151.9763176481583" />
     </decayedSelected>
     <decayedShown>
-      <entry key="MS100" value="1.2334291401505648" />
-      <entry key="MS500" value="2.0509433943972795" />
-      <entry key="S2" value="4.044523334700834" />
-      <entry key="S5" value="5.4537008928948225" />
-      <entry key="S10" value="6.145640476523583" />
-      <entry key="S30" value="6.694648904036302" />
-      <entry key="S60" value="6.8445771631012065" />
-      <entry key="M2" value="6.9215880736330115" />
-      <entry key="M5" value="6.976142303978317" />
-      <entry key="M10" value="7.705708283883777" />
-      <entry key="M15" value="10.685178611217566" />
-      <entry key="M30" value="27.6511196757839" />
-      <entry key="H1" value="65.40615567074532" />
-      <entry key="H2" value="136.82659581688023" />
-      <entry key="H4" value="257.359708584617" />
-      <entry key="D1" value="586.6519407426362" />
-      <entry key="W1" value="707.2611552928241" />
+      <entry key="MS100" value="0.8705505632962068" />
+      <entry key="MS500" value="0.9750730830650849" />
+      <entry key="S2" value="1.2492583273793267" />
+      <entry key="S5" value="2.025295249654187" />
+      <entry key="S10" value="3.052261781758887" />
+      <entry key="S30" value="5.19390922632751" />
+      <entry key="S60" value="7.72409888834218" />
+      <entry key="M2" value="11.753285854945105" />
+      <entry key="M5" value="17.58701886467926" />
+      <entry key="M10" value="21.298856448172597" />
+      <entry key="M15" value="25.016118359483304" />
+      <entry key="M30" value="41.93690069385665" />
+      <entry key="H1" value="79.4527137048453" />
+      <entry key="H2" value="150.85915632609502" />
+      <entry key="H4" value="271.6935349668659" />
+      <entry key="D1" value="603.2730972217819" />
+      <entry key="W1" value="725.0239516479312" />
     </decayedShown>
   </component>
   <component name="ProjectColorInfo">{
@@ -122,33 +121,34 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;DefaultGoTemplateProperty&quot;: &quot;Go File&quot;,
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.GoLinterPluginOnboardingV2&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.GoLinterPluginStorageMigration&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.MCP Project settings loaded&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.go.analysis.ui.options.defaults&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.go.formatter.settings.were.checked&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.go.modules.go.list.on.any.changes.was.set&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
-    &quot;codeWithMe.voiceChat.enabledByDefault&quot;: &quot;false&quot;,
-    &quot;com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
-    &quot;go.sdk.automatically.set&quot;: &quot;true&quot;,
-    &quot;junie.onboarding.icon.badge.shown&quot;: &quot;true&quot;,
-    &quot;last_opened_file_path&quot;: &quot;C:/Users/mafir&quot;,
-    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
-    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
-    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;,
-    &quot;to.speed.mode.migration.done&quot;: &quot;true&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "DefaultGoTemplateProperty": "Go File",
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "RunOnceActivity.GoLinterPluginOnboardingV2": "true",
+    "RunOnceActivity.GoLinterPluginStorageMigration": "true",
+    "RunOnceActivity.MCP Project settings loaded": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "RunOnceActivity.go.analysis.ui.options.defaults": "true",
+    "RunOnceActivity.go.formatter.settings.were.checked": "true",
+    "RunOnceActivity.go.modules.go.list.on.any.changes.was.set": "true",
+    "RunOnceActivity.typescript.service.memoryLimit.init": "true",
+    "SHELLCHECK.PATH": "C:\\Users\\GodwinMafireyi\\AppData\\Roaming\\JetBrains\\GoLand2026.1\\plugins\\Shell Script\\shellcheck.exe",
+    "codeWithMe.voiceChat.enabledByDefault": "false",
+    "com.intellij.ml.llm.matterhorn.ej.ui.settings.DefaultModelSelectionForGA.v1": "true",
+    "git-widget-placeholder": "main",
+    "go.sdk.automatically.set": "true",
+    "junie.onboarding.icon.badge.shown": "true",
+    "last_opened_file_path": "C:/Users/GodwinMafireyi",
+    "node.js.detected.package.eslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "settings.editor.selected.configurable": "preferences.pluginManager",
+    "to.speed.mode.migration.done": "true"
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="E:\GitHub\GoBSAseq\stats" />

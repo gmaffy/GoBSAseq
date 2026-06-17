@@ -393,6 +393,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		fmt.Printf("Running BSAseq with read-based analysis\n")
 		return nil
 	}
+
 	if runType == "bams" {
 		fmt.Printf("Running BSAseq with bam-based analysis\n")
 		//--------------------------------------- Get valid bams and bsaseq type ----------------------------------- //
@@ -413,6 +414,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		fmt.Printf("Running BAM BSAseq with %s analysis\n", bType)
 		vcDir, _ := filepath.Abs(filepath.Join(cfg.OutputDir, "vcfs"))
 		if err := os.MkdirAll(vcDir, os.ModePerm); err != nil {
+
 			return fmt.Errorf("failed to create vcfs directory: %w", err)
 		}
 		logFile := filepath.Join(cfg.OutputDir, "vcfs", "variant_calling.log")
@@ -421,6 +423,7 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		//threads, _ := strconv.Atoi(cfg.Threads)
 		vcfFile, err := variants.VariantCalling(bams, cfg.Ref, cfg.SnpEffDB, cfg.SnpEffDB, vcDir, cfg.Caller, cfg.Merger, false, false, utils2.HardFilterConfig(hf), cfg.Verbose, "WARNING", cfg.Threads, logFile, cfg.DeepVariantVersion, cfg.ModelType) //(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 8, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
 		if err != nil {
+			fmt.Printf("variant calling failed: %v\n", err)
 			// wrap and return the error so the caller receives context
 			return fmt.Errorf("failed to run variant calling: %w", err)
 		}
