@@ -52,6 +52,184 @@ const (
 	//zSugg = 2.0 // ~p95 equivalent — suggestive
 )
 
+// DetectQTLsWithMCDirect uses the per-variant Monte Carlo thresholds directly for QTL detection.
+// This provides an alternative to the CompositeZ ≥ 3.0 rule, using the fully sound Monte Carlo
+// thresholds that account for depth and bulk size.
+// Returns QTL regions where statistics exceed their MC-derived thresholds.
+func DetectQTLsWithMCDirect(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats, thresholds []Thresholds) ([]QTLRecord, error) {
+	color.Cyan("===================================== Detecting QTLs with MC Thresholds =========================================")
+	if len(smoothed) == 0 {
+		fmt.Println("No smoothed stats to detect QTLs from")
+		return nil, nil
+	}
+	if len(thresholds) != len(smoothed) {
+		return nil, fmt.Errorf("smoothed and thresholds slices must have the same length")
+	}
+
+	// ── group by chromosome ──────────────────────────────────────────────────
+
+	byChr := make(map[string][]SmoothedStats)
+	byChrThresholds := make(map[string][]Thresholds)
+	for i, s := range smoothed {
+		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+		byChrThresholds[s.CHROM] = append(byChrThresholds[s.CHROM], thresholds[i])
+	}
+	chroms := make([]string, 0, len(byChr))
+	for c := range byChr {
+		chroms = append(chroms, c)
+	}
+	sort.Strings(chroms)
+
+	// ── scan each chromosome ─────────────────────────────────────────────────
+
+	var qtls []QTLRecord
+
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	for _, chrom := range chroms {
+		stats := byChr[chrom]
+		threshs := byChrThresholds[chrom]
+
+		// Collect every contiguous run where key statistics exceed their MC thresholds.
+		type run struct {
+			start, stop int64
+			peak        float64 // the most extreme statistic value at the peak
+		}
+
+		var runs []run
+		inRun := false
+		var cur run
+
+		for i, s := range stats {
+			t := threshs[i]
+			
+			// Check which statistics are significant based on MC thresholds
+			// We use a combined approach: any of the main statistics exceeding threshold
+			isSignificant := false
+			var maxStat float64
+			
+			if hasBothBulks {
+				// Check DeltaSI against MC threshold
+				if math.Abs(s.SmDeltaSI) >= t.TwoBulk.DeltaSIP99 || math.Abs(s.SmDeltaSI) <= t.TwoBulk.DeltaSIMp99 {
+					isSignificant = true
+					maxStat = math.Abs(s.SmDeltaSI)
+				}
+				// Check G-statistic
+				if !isSignificant && s.SmGstat >= t.TwoBulk.GstatP99 {
+					isSignificant = true
+					maxStat = s.SmGstat
+				}
+				// Check LOD
+				if !isSignificant && s.SmLOD >= t.TwoBulk.LODP99 {
+					isSignificant = true
+					maxStat = s.SmLOD
+				}
+				// Check BBLogBF
+				if !isSignificant && s.SmBBLogBF >= t.TwoBulk.BBLogBFP99 {
+					isSignificant = true
+					maxStat = s.SmBBLogBF
+				}
+				// Check ED4
+				if !isSignificant && s.SmED >= t.TwoBulk.ED4P99 {
+					isSignificant = true
+					maxStat = s.SmED
+				}
+			}
+			
+			if hasOneBulk {
+				// Check AFDev
+				if math.Abs(s.SmAFDev) >= t.OneBulk.AFDevP99 || math.Abs(s.SmAFDev) <= t.OneBulk.AFDevMp99 {
+					isSignificant = true
+					maxStat = math.Abs(s.SmAFDev)
+				}
+				// Check one-bulk statistics
+				if !isSignificant && s.SmOneBulkG >= t.OneBulk.OneBulkGstatP99 {
+					isSignificant = true
+					maxStat = s.SmOneBulkG
+				}
+				if !isSignificant && s.SmOneBulkLOD >= t.OneBulk.OneBulkLODP99 {
+					isSignificant = true
+					maxStat = s.SmOneBulkLOD
+				}
+				if !isSignificant && s.SmOneBulkBBLogBF >= t.OneBulk.OneBulkBBLogBFP99 {
+					isSignificant = true
+					maxStat = s.SmOneBulkBBLogBF
+				}
+			}
+
+			if isSignificant {
+				if !inRun {
+					inRun = true
+					cur = run{start: s.POS, stop: s.POS, peak: maxStat}
+				} else {
+					cur.stop = s.POS
+					if maxStat > math.Abs(cur.peak) {
+						cur.peak = maxStat
+					}
+				}
+			} else {
+				if inRun {
+					runs = append(runs, cur)
+					inRun = false
+				}
+			}
+		}
+		if inRun {
+			runs = append(runs, cur)
+		}
+
+		if len(runs) == 0 {
+			continue
+		}
+
+		// Keep only the run with the largest peak on this chromosome.
+		best := runs[0]
+		for _, r := range runs[1:] {
+			if math.Abs(r.peak) > math.Abs(best.peak) {
+				best = r
+			}
+		}
+
+		// Find the peak position and CompositeZ value for this run
+		peakZ := 0.0
+		for _, s := range stats {
+			if s.POS >= best.start && s.POS <= best.stop {
+				if math.Abs(s.CompositeZ) > math.Abs(peakZ) {
+					peakZ = s.CompositeZ
+				}
+			}
+		}
+
+		qtls = append(qtls, QTLRecord{
+			Chrom: chrom,
+			Start: best.start,
+			Stop:  best.stop,
+			Peak:  peakZ,
+		})
+	}
+
+	// ── write QTL TSV ────────────────────────────────────────────────────────
+	err := os.MkdirAll(filepath.Join(cfg.OutputDir, "qtls"), 0775)
+	if err != nil {
+		fmt.Println("DetectQTLsWithMCDirect: mkdir: ", err)
+		return nil, err
+	}
+	outPath := filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.mc_qtls.tsv", bsaType))
+	f, err := os.Create(outPath)
+	if err != nil {
+		return nil, fmt.Errorf("DetectQTLsWithMCDirect: create %s: %w", outPath, err)
+	}
+	defer f.Close()
+
+	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK")
+	for _, q := range qtls {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%.6f\n", q.Chrom, q.Start, q.Stop, q.Peak)
+	}
+
+	color.Green("MC-based QTLs written to %s (%d chromosomes with signal)", outPath, len(qtls))
+	return qtls, nil
+}
+
 // DetectQTLs scans the smoothed CompositeZ track for regions that exceed zSig
 // and keeps the most extreme run per chromosome.  Results are written to a TSV.
 func DetectQTLs(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats) ([]QTLRecord, error) {

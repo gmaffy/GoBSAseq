@@ -5,14 +5,28 @@ package stats
 // Approach
 // --------
 // For each unique sequencing depth observed in the smoothed data we run a
-// Monte Carlo null simulation: read counts are drawn from Binomial(depth, p₀)
-// where p₀ is the population-structure expected allele frequency under H₀
-// (no QTL).  All BSA test statistics are evaluated on every draw; their
+// Monte Carlo null simulation using a two-stage model that is particularly
+// accurate for deeply sequenced sites:
+//
+// Stage 1: Sample the number of alt alleles in the bulk population
+//   (Binomial(n=bulk_size, p=p₀)) - this represents the realized allele count
+//   among the actual individuals in the bulk.
+//
+// Stage 2: Sample the observed reads from that realized frequency
+//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+// This two-stage model is more biologically accurate for deep sequencing because it
+// accounts for the finite population of individuals in each bulk, rather than
+// assuming reads are drawn directly from the expected population frequency p₀.
+//
+// For each simulation draw, all BSA test statistics are evaluated; their
 // empirical 95th / 99th percentiles become the per-variant thresholds.
 //
-// This is biologically correct because:
+// This approach is biologically correct because:
 //   - p₀ reflects the actual segregation ratio of the mapping population
 //     (F2 = 0.5, BC1H = 0.75, RIL = 0.5, …) rather than a re-simulated mean.
+//   - The two-stage model correctly handles deep sequencing where many reads
+//     may come from the same individuals, reducing false positives.
 //   - Thresholds scale naturally with depth: deeper sites have narrower null
 //     distributions and therefore tighter (more stringent) thresholds.
 //   - Z-score thresholds are also empirical, derived from the same simulation,
@@ -22,7 +36,8 @@ package stats
 // ---------------------------
 // Unlike the Monte Carlo thresholds above which are per-variant and depth-dependent,
 // BRM uses a sliding-window analytical threshold based on the variance of allele
-// frequency in the population.
+// frequency in the population. BRM blocks DO incorporate bulk size in their
+// threshold calculations (see calculateBRMBlocksTwoBulk and calculateBRMBlocksOneBulk).
 //
 // For Two-Bulk:
 //   Threshold = u(α) * sqrt( [ (n₁+n₂)/(V_scale * n₁ * n₂) ] * p * (1-p) )
@@ -32,6 +47,13 @@ package stats
 // For One-Bulk:
 //   Threshold = u(α) * sqrt( [ p₀ * (1-p₀) ] / (V_scale * n) )
 //   where n is bulk size and p₀ is the expected null allele frequency.
+//
+// Note on QTL Detection
+// ---------------------
+// The CompositeZ ≥ 3.0 rule in DetectQTLs is the main driver for QTL calls.
+// Everything else (simulated thresholds, BRM) is secondary or just for plots.
+// For deeply sequenced sites, use DetectQTLsWithMCDirect() which applies the
+// fully sound Monte Carlo thresholds to individual plots.
 //
 // Speed
 // -----
@@ -119,6 +141,10 @@ type simParams struct {
 	p0Low     float64 // expected AF in low bulk under H₀ (usually == p0High)
 	p0One     float64 // expected AF for one-bulk mode
 	rep       int
+	// Bulk sizes for more accurate null model (finite population sampling)
+	highBulkSize int
+	lowBulkSize  int
+	oneBulkSize  int
 }
 
 // ── Module-level caches ──────────────────────────────────────────────────────
@@ -140,16 +166,32 @@ func nextSeed() int64 {
 
 // ── Two-bulk simulation ──────────────────────────────────────────────────────
 
-// simulateTwoBulk runs rep draws from Binomial(depth, p0) for both bulks and
-// returns the empirical null distributions of all two-bulk test statistics.
+// simulateTwoBulk runs rep draws from a two-stage null model for both bulks:
+// Stage 1: Sample the number of alt alleles in each bulk population
+//   (Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//   among the actual individuals in the bulk.
+// Stage 2: Sample the observed reads from that realized frequency
+//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+// This two-stage model is more biologically accurate for deep sequencing because it
+// accounts for the finite population of individuals in each bulk, rather than
+// assuming reads are drawn directly from the expected population frequency p0.
 func simulateTwoBulk(p simParams) TwoBulkThresholds {
 	if p.highDepth <= 0 || p.lowDepth <= 0 || p.rep <= 0 {
 		return TwoBulkThresholds{}
 	}
 
 	rng := rand.New(rand.NewSource(nextSeed()))
-	distHigh := distuv.Binomial{N: float64(p.highDepth), P: p.p0High, Src: rng}
-	distLow := distuv.Binomial{N: float64(p.lowDepth), P: p.p0Low, Src: rng}
+
+	// Use bulk sizes if provided, otherwise fall back to depth (for backwards compatibility)
+	highBulkSize := p.highBulkSize
+	lowBulkSize := p.lowBulkSize
+	if highBulkSize <= 0 {
+		highBulkSize = p.highDepth // fallback: assume each read is from a different individual
+	}
+	if lowBulkSize <= 0 {
+		lowBulkSize = p.lowDepth
+	}
 
 	hSIArr := make([]float64, p.rep)
 	lSIArr := make([]float64, p.rep)
@@ -160,9 +202,39 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
-		hAlt := distHigh.Rand()
-		lAlt := distLow.Rand()
+		// Stage 1: Sample realized allele counts in the bulk populations
+		// High bulk: sample alt allele count among highBulkSize individuals
+		realizedHighAlt := 0
+		if p.p0High > 0 && p.p0High < 1 {
+			// Binomial: number of alt alleles among highBulkSize individuals
+			distPopHigh := distuv.Binomial{N: float64(highBulkSize), P: p.p0High, Src: rng}
+			realizedHighAlt = int(distPopHigh.Rand())
+		} else if p.p0High >= 1 {
+			realizedHighAlt = highBulkSize
+		} // else p0High == 0, realizedHighAlt = 0
+
+		// Low bulk: sample alt allele count among lowBulkSize individuals
+		realizedLowAlt := 0
+		if p.p0Low > 0 && p.p0Low < 1 {
+			distPopLow := distuv.Binomial{N: float64(lowBulkSize), P: p.p0Low, Src: rng}
+			realizedLowAlt = int(distPopLow.Rand())
+		} else if p.p0Low >= 1 {
+			realizedLowAlt = lowBulkSize
+		}
+
+		// Calculate realized allele frequencies in each bulk
+		realizedHighAF := float64(realizedHighAlt) / float64(highBulkSize)
+		realizedLowAF := float64(realizedLowAlt) / float64(lowBulkSize)
+
+		// Stage 2: Sample observed reads from the realized allele frequencies
+		// High bulk reads
+		distHighReads := distuv.Binomial{N: float64(p.highDepth), P: realizedHighAF, Src: rng}
+		hAlt := distHighReads.Rand()
 		hRef := float64(p.highDepth) - hAlt
+
+		// Low bulk reads
+		distLowReads := distuv.Binomial{N: float64(p.lowDepth), P: realizedLowAF, Src: rng}
+		lAlt := distLowReads.Rand()
 		lRef := float64(p.lowDepth) - lAlt
 
 		hSI := hAlt / float64(p.highDepth)
@@ -208,8 +280,8 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 
 // twoBulkCacheKey builds a deterministic string key for the memo cache.
 func twoBulkCacheKey(p simParams) string {
-	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d",
-		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep)
+	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d",
+		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize)
 }
 
 // simulateTwoBulkCached returns cached results or runs the simulation once.
@@ -228,14 +300,28 @@ func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
 
 // ── One-bulk simulation ──────────────────────────────────────────────────────
 
-// simulateOneBulk runs rep draws from Binomial(depth, p0) for a single bulk.
+// simulateOneBulk runs rep draws from a two-stage null model for a single bulk:
+// Stage 1: Sample the number of alt alleles in the bulk population
+//   (Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//   among the actual individuals in the bulk.
+// Stage 2: Sample the observed reads from that realized frequency
+//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+// This two-stage model is more biologically accurate for deep sequencing because it
+// accounts for the finite population of individuals in the bulk, rather than
+// assuming reads are drawn directly from the expected population frequency p0.
 func simulateOneBulk(p simParams) OneBulkThresholds {
 	if p.highDepth <= 0 || p.p0One <= 0 || p.p0One >= 1 || p.rep <= 0 {
 		return OneBulkThresholds{}
 	}
 
 	rng := rand.New(rand.NewSource(nextSeed()))
-	dist := distuv.Binomial{N: float64(p.highDepth), P: p.p0One, Src: rng}
+
+	// Use bulk size if provided, otherwise fall back to depth (for backwards compatibility)
+	bulkSize := p.oneBulkSize
+	if bulkSize <= 0 {
+		bulkSize = p.highDepth // fallback: assume each read is from a different individual
+	}
 
 	afDevArr := make([]float64, p.rep)
 	gsArr := make([]float64, p.rep)
@@ -243,7 +329,23 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
-		altF := dist.Rand()
+		// Stage 1: Sample realized allele count in the bulk population
+		realizedAlt := 0
+		if p.p0One > 0 && p.p0One < 1 {
+			// Binomial: number of alt alleles among bulkSize individuals
+			distPop := distuv.Binomial{N: float64(bulkSize), P: p.p0One, Src: rng}
+			realizedAlt = int(distPop.Rand())
+		} else if p.p0One >= 1 {
+			realizedAlt = bulkSize
+		}
+		// else p0One == 0, realizedAlt = 0 (already initialized)
+
+		// Calculate realized allele frequency
+		realizedAF := float64(realizedAlt) / float64(bulkSize)
+
+		// Stage 2: Sample observed reads from the realized allele frequency
+		distReads := distuv.Binomial{N: float64(p.highDepth), P: realizedAF, Src: rng}
+		altF := distReads.Rand()
 		alt := int(altF)
 		ref := p.highDepth - alt
 		si := altF / float64(p.highDepth)
@@ -274,7 +376,7 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 
 // oneBulkCacheKey builds a deterministic string key for the one-bulk cache.
 func oneBulkCacheKey(p simParams) string {
-	return fmt.Sprintf("%d_%.6f_%d", p.highDepth, p.p0One, p.rep)
+	return fmt.Sprintf("%d_%.6f_%d_%d_%d_%d", p.highDepth, p.p0One, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize)
 }
 
 // simulateOneBulkCached returns cached results or runs the simulation once.
@@ -467,11 +569,15 @@ func CalculateThresholds(
 	)
 
 	// Base simParams; depth is overridden per variant inside the warm-up loops.
+	// Include bulk sizes for more accurate null model
 	base := simParams{
-		p0High: p0,
-		p0Low:  p0,
-		p0One:  p0,
-		rep:    cfg.Rep,
+		p0High:       p0,
+		p0Low:        p0,
+		p0One:        p0,
+		rep:          cfg.Rep,
+		highBulkSize: cfg.HighBulkSize,
+		lowBulkSize:  cfg.LowBulkSize,
+		oneBulkSize:  cfg.OneBulkSize,
 	}
 
 	// Pre-populate the cache in parallel for every depth in the dataset.
