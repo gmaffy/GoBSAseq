@@ -18,6 +18,21 @@ package stats
 //   - Z-score thresholds are also empirical, derived from the same simulation,
 //     so they account for the actual distribution rather than assuming normality.
 //
+// Bulk Reciprocal Model (BRM)
+// ---------------------------
+// Unlike the Monte Carlo thresholds above which are per-variant and depth-dependent,
+// BRM uses a sliding-window analytical threshold based on the variance of allele
+// frequency in the population.
+//
+// For Two-Bulk:
+//   Threshold = u(α) * sqrt( [ (n₁+n₂)/(V_scale * n₁ * n₂) ] * p * (1-p) )
+//   where n₁, n₂ are bulk sizes, V_scale is the population variance scale (e.g., 2 for F2),
+//   and p is the average allele frequency across both bulks.
+//
+// For One-Bulk:
+//   Threshold = u(α) * sqrt( [ p₀ * (1-p₀) ] / (V_scale * n) )
+//   where n is bulk size and p₀ is the expected null allele frequency.
+//
 // Speed
 // -----
 // Unique (highDepth, lowDepth) pairs are computed in parallel across all CPU

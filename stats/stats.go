@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -355,27 +356,37 @@ func euclideanDistance4(hSI, lSI float64) float64 {
 }
 
 func ExpectedAF(popStruc string) (float64, error) {
-	// Standard structures return 0.5 immediately
-	switch popStruc {
-	case "F2", "F3", "RIL":
+	p := strings.ToUpper(strings.TrimSpace(popStruc))
+	
+	switch p {
+	case "F2", "F3", "F4", "RIL":
 		return 0.5, nil
 	}
 
-	// Backcross structures calculated via formula:
-	// Recurrent High parent (H): 1 - (0.5^(gen+1))
-	// Recurrent Low parent (L): 0.5^(gen+1)
-	switch popStruc {
-	case "BC1H":
-		return 1.0 - math.Pow(0.5, 2), nil
-	case "BC1L":
-		return math.Pow(0.5, 2), nil
-	case "BC2H":
-		return 1.0 - math.Pow(0.5, 3), nil
-	case "BC2L":
-		return math.Pow(0.5, 3), nil
-	default:
-		return 0, fmt.Errorf("unknown population structure: %s", popStruc)
+	if strings.HasPrefix(p, "BC") {
+		suffix := p[2:]
+		var n int
+		var err error
+		var isHigh bool
+		
+		if strings.HasSuffix(suffix, "F2H") || strings.HasSuffix(suffix, "F2L") {
+			isHigh = strings.HasSuffix(suffix, "F2H")
+			n, err = strconv.Atoi(suffix[:len(suffix)-3])
+		} else if strings.HasSuffix(suffix, "H") || strings.HasSuffix(suffix, "L") {
+			isHigh = strings.HasSuffix(suffix, "H")
+			n, err = strconv.Atoi(suffix[:len(suffix)-1])
+		}
+
+		if err == nil && n >= 1 {
+			p0 := 1.0 - math.Pow(0.5, float64(n+1))
+			if isHigh {
+				return p0, nil
+			}
+			return 1.0 - p0, nil
+		}
 	}
+	
+	return 0, fmt.Errorf("unknown population structure: %s", popStruc)
 }
 
 func oneBulkGStatistic(success, fail int, p0 float64) float64 {
