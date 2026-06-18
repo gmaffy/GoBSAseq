@@ -2,7 +2,7 @@
 
 **A high-performance Bulk Segregant Analysis (BSAseq) pipeline in Go**
 
-GoBSAseq identifies genomic regions associated with phenotypic traits by applying hard filtering to VCF files, computing allele frequency statistics, performing Gaussian smoothing, and detecting QTL intervals using Z-score thresholding and Bayesian regression modeling (BRM).
+GoBSAseq identifies genomic regions associated with phenotypic traits by applying hard filtering to VCF files, computing allele frequency statistics, performing Gaussian smoothing, and detecting QTL intervals using Z-score thresholding, Monte Carlo simulations, and Bayesian regression modeling (BRM).
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `-B` / `--bulks` | string | — | Bulk sample names: `high,low` (use `None` to skip) |
 | `-p` / `--parents-depth` | string | `5,5` | Min read depth for parents (high,low) |
 | `-b` / `--bulks-depth` | string | `40,40` | Min read depth for bulks (high,low) |
-| `-S` / `--bulk-sizes` | string | `20,20` | Number of individuals in bulks (high,low) |
+| `-S` / `--bulk-sizes` | string | `20,20` | Number of individuals in bulks (high,low) - **Important for deep sequencing: used in Monte Carlo null model** |
 | `-o` / `--out` | string | `.` | Output directory |
 
 #### BAM & Read Inputs (Optional)
@@ -172,8 +172,9 @@ stats/
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
   *.lowqual.vcf.gz                 # Variants failing hard filter
 qtls/
-  *.qtls.tsv                       # Z-score QTLs (|CompositeZ| ≥ 3.0)
+  *.qtls.tsv                       # Z-score QTLs (|CompositeZ| ≥ 3.0) - **Primary output**
   *.merged_qtls.tsv                # Union of Z-score + BRM intervals
+  *.mc_qtls.tsv                   # Monte Carlo threshold-based QTLs (optional)
 plots/
   *.individual_plots.html          # Per-statistic charts with thresholds
   *.robust_z_overlay.html          # All Z-scores overlaid per chromosome
@@ -198,12 +199,13 @@ genespace/  (if annotation enabled)
 1. Hard Filter         → Remove low-quality variants (SNP/INDEL-specific thresholds)
 2. Raw Statistics      → Per-variant SI, ΔSI, G-stat, LOD, Bayes factor
 3. Smooth & Normalise  → Gaussian kernel smoothing, robust Z-scores (MAD), Stouffer composite Z
-4. Thresholds          → Empirical simulation-based thresholds per population structure
-5. BRM Detection       → Bayesian regression model block detection
-6. QTL Detection       → Regions with |CompositeZ| ≥ 3.0
-7. Merge               → Union of Z-score and BRM intervals
-8. Plots               → Interactive HTML charts (echarts)
-9. Gene Space          → Annotate QTLs with genes (optional, requires --gff)
+4. Thresholds          → **Two-stage Monte Carlo simulation** for empirical thresholds per depth + bulk size
+5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
+6. QTL Detection       → Regions with |CompositeZ| ≥ 3.0 (**primary method**)
+7. MC QTL Detection    → Optional: QTLs using per-variant MC thresholds (fully sound for deep sequencing)
+8. Merge               → Union of Z-score and BRM intervals
+9. Plots               → Interactive HTML charts (echarts) with all thresholds
+10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
 ```
 
 ### Statistical Methods
@@ -217,7 +219,8 @@ genespace/  (if annotation enabled)
 | **Bayes Factor** | Beta-binomial log₁₀ BF with Beta(0.5, 0.5) prior |
 | **Robust Z-score** | `(x − median) / (1.4826 × MAD)`; outlier-resistant |
 | **Composite Z** | Stouffer: `Σ Zᵢ / √k`; combines all Z-scores |
-| **BRM** | Threshold = `u_α √((n₁+n₂)·p(1−p) / (2n₁n₂))` for two-bulk |
+| **BRM** | Threshold = `u_α √((n₁+n₂)·p(1−p) / (V_scale·n₁n₂))` for two-bulk |
+| **MC Thresholds** | Two-stage: `Binomial(bulk_size, p₀) → Binomial(depth, realized_af)`; empirical per-depth thresholds |
 
 ### Population Structures
 
@@ -228,6 +231,40 @@ genespace/  (if annotation enabled)
 | BC1L | 0.25 | Backcross to low parent |
 | BC2H | 0.875 | Two backcrosses to high parent |
 | BC2L | 0.125 | Two backcrosses to low parent |
+
+---
+
+## Deep Sequencing & Monte Carlo Thresholds
+
+### Two-Stage Null Model (For Accurate Deep Sequencing)
+
+For deeply sequenced datasets, GoBSAseq uses a **two-stage Monte Carlo null model** that properly accounts for the finite population of individuals in each bulk:
+
+**Stage 1**: Sample the realized allele count in the bulk population
+```
+Alt Alleles ~ Binomial(n = bulk_size, p = p₀)
+```
+
+**Stage 2**: Sample the observed reads from that realized frequency
+```
+Reads ~ Binomial(n = depth, p = realized_allele_frequency)
+```
+
+**Why This Matters**: In deep sequencing, many reads may come from the same individuals. The old model (directly sampling reads from p₀) overestimated variance, leading to excessive false positives. The two-stage model correctly models this structure.
+
+**When to Use**: This model is automatically used when `--bulk-sizes` is provided. For best results with deep sequencing (>50x coverage per bulk), always specify accurate bulk sizes.
+
+### QTL Detection Methods
+
+GoBSAseq provides **two complementary QTL detection approaches**:
+
+| Method | Threshold | Primary/Secondary | Output File |
+|--------|-----------|----------------|-------------|
+| **Composite Z-score** | |CompositeZ| ≥ 3.0 | **Primary** | `*.qtls.tsv` |
+| **Monte Carlo** | Empirical per-variant thresholds | Secondary | `*.mc_qtls.tsv` (optional) |
+| **BRM Blocks** | Analytical window-based | Secondary | `*.brm_blocks.tsv` |
+
+**Composite Z ≥ 3.0 is the main driver for QTL calls** as it provides robust, consistent detection across different sequencing depths. Monte Carlo thresholds and BRM blocks are used for validation and visualization.
 
 ---
 
@@ -257,6 +294,24 @@ genespace/  (if annotation enabled)
   -w 2000000 -s 100000 -m F2 \
   -o results
 # Mode: hphb — computes AF deviation, one-bulk G/LOD/BF
+```
+
+### Deep Sequencing (>50x Coverage)
+
+```bash
+# For deep sequencing, specify bulk sizes for accurate Monte Carlo thresholds
+./gobsaseq \
+  -V deep_seq.vcf.gz \
+  -P parent_a,parent_b \
+  -B bulk_high,bulk_low \
+  -p 20,20 -b 200,200 \
+  -S 150,150  # <-- Bulk sizes: 150 individuals each
+  -w 2000000 -s 100000 \
+  -m F2 --rep 2000  # More simulations for deep data
+  -o results_deep
+
+# The two-stage Monte Carlo model will automatically use bulk sizes
+# to reduce false positives from deep coverage
 ```
 
 ---

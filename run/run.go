@@ -251,25 +251,22 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return err
 	}
 
-	fmt.Println(len(smoothedStats))
-
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
 	thresholds, err := stats.CalculateThresholds(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
-	fmt.Println(len(thresholds))
 
 	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
 	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Detected %d BRM blocks\n", len(brmBlocks))
+	color.Green("Detected %d BRM blocks", len(brmBlocks))
 
 	// ------------------------------------------------ Plots ------------------------------------------------------- //
 	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks); err != nil {
-		fmt.Println("Error generating plots:", err)
+		color.Red("Error generating plots: %v", err)
 		return err
 	}
 
@@ -278,14 +275,14 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Detected %d QTLs\n", len(qtls))
+	color.Green("Detected %d QTLs", len(qtls))
 
 	// -------------------------------------------- Merge QTLs + BRM ------------------------------------------------ //
 	merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Merged intervals: %d\n", len(merged))
+	color.Green("Merged intervals: %d", len(merged))
 
 	// --------------------------------------------------- Gene Space ---------------------------------------------- //
 	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))

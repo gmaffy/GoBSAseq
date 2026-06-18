@@ -304,7 +304,20 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 			if expectedSI == 0 {
 				expectedSI = 0.5
 			}
-			blocks = calculateBRMBlocksOneBulk(chrom, stats, cfg.OneBulkSize, popScale, expectedSI, uAlpha)
+			// Determine bulk size: try OneBulkSize first, then HighBulkSize/LowBulkSize, then default
+			bulkSize := cfg.OneBulkSize
+			if bulkSize <= 0 {
+				if cfg.HighBulkSize > 0 {
+					bulkSize = cfg.HighBulkSize
+				} else if cfg.LowBulkSize > 0 {
+					bulkSize = cfg.LowBulkSize
+				} else {
+					// Default to a reasonable bulk size if none specified
+					// This handles cases where only depth is available
+					bulkSize = 100
+				}
+			}
+			blocks = calculateBRMBlocksOneBulk(chrom, stats, bulkSize, popScale, expectedSI, uAlpha)
 		}
 		if len(blocks) > 0 {
 			allBlocks = append(allBlocks, blocks...)
