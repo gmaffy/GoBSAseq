@@ -202,7 +202,7 @@ genespace/  (if annotation enabled)
 4. Thresholds          → **Two-stage Monte Carlo simulation** for empirical thresholds per depth + bulk size
 5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
 6. QTL Detection       → Regions with |CompositeZ| ≥ 3.0 (**primary method**)
-7. MC QTL Detection    → Optional: QTLs using per-variant MC thresholds (fully sound for deep sequencing)
+7. MC QTL Detection    → **QTLs using per-variant MC thresholds** (fully sound for deep sequencing)
 8. Merge               → Union of Z-score and BRM intervals
 9. Plots               → Interactive HTML charts (echarts) with all thresholds
 10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
@@ -261,10 +261,10 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 | Method | Threshold | Primary/Secondary | Output File |
 |--------|-----------|----------------|-------------|
 | **Composite Z-score** | |CompositeZ| ≥ 3.0 | **Primary** | `*.qtls.tsv` |
-| **Monte Carlo** | Empirical per-variant thresholds | Secondary | `*.mc_qtls.tsv` (optional) |
-| **BRM Blocks** | Analytical window-based | Secondary | `*.brm_blocks.tsv` |
+| **Monte Carlo** | Empirical per-variant thresholds | **Secondary** | `*.mc_qtls.tsv` |
+| **BRM Blocks** | Analytical window-based | **Secondary** | `*.brm_blocks.tsv` |
 
-**Composite Z ≥ 3.0 is the main driver for QTL calls** as it provides robust, consistent detection across different sequencing depths. Monte Carlo thresholds and BRM blocks are used for validation and visualization.
+**Both CompositeZ ≥ 3.0 and Monte Carlo threshold-based detection are run by default.** CompositeZ is the primary method, while Monte Carlo detection provides a fully sound alternative for deep sequencing that uses the simulated thresholds directly.
 
 ---
 

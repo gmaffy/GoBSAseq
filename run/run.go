@@ -271,13 +271,23 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	}
 
 	// ---------------------------------------------- Detect QTLs --------------------------------------------------- //
+	// Primary detection: CompositeZ >= 3.0 rule
 	qtls, err := stats.DetectQTLs(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
-	color.Green("Detected %d QTLs", len(qtls))
+	color.Green("Detected %d QTLs using CompositeZ >= 3.0", len(qtls))
+
+	// Secondary detection: Monte Carlo threshold-based (fully sound for deep sequencing)
+	mcQtls, err := stats.DetectQTLsWithMCDirect(*cfg, btype, smoothedStats, thresholds)
+	if err != nil {
+		color.Yellow("Warning: MC-based QTL detection failed: %v", err)
+	} else {
+		color.Green("Detected %d QTLs using Monte Carlo thresholds", len(mcQtls))
+	}
 
 	// -------------------------------------------- Merge QTLs + BRM ------------------------------------------------ //
+	// Merge primary QTLs with BRM blocks
 	merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
 	if err != nil {
 		return err
