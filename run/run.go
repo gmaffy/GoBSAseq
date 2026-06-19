@@ -271,12 +271,12 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	}
 
 	// ---------------------------------------------- Detect QTLs --------------------------------------------------- //
-	// Primary detection: CompositeZ >= 3.0 rule
-	qtls, err := stats.DetectQTLs(*cfg, btype, smoothedStats)
+	// Primary detection: CompositeZ with empirical thresholds
+	qtls, err := stats.DetectQTLs(*cfg, btype, smoothedStats, thresholds)
 	if err != nil {
 		return err
 	}
-	color.Green("Detected %d QTLs using CompositeZ >= 3.0", len(qtls))
+	color.Green("Detected %d QTLs using empirical CompositeZ thresholds", len(qtls))
 
 	// Secondary detection: Monte Carlo threshold-based (fully sound for deep sequencing)
 	mcQtls, err := stats.DetectQTLsWithMCDirect(*cfg, btype, smoothedStats, thresholds)

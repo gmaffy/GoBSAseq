@@ -230,20 +230,28 @@ func DetectQTLsWithMCDirect(cfg utils.AnalysisConfig, bsaType string, smoothed [
 	return qtls, nil
 }
 
-// DetectQTLs scans the smoothed CompositeZ track for regions that exceed zSig
-// and keeps the most extreme run per chromosome.  Results are written to a TSV.
-func DetectQTLs(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats) ([]QTLRecord, error) {
+// DetectQTLs scans the smoothed CompositeZ track for regions that exceed a threshold
+// and keeps the most extreme run per chromosome. Results are written to a TSV.
+// If thresholds are provided, uses empirical CompositeZ thresholds; otherwise uses zSig.
+func DetectQTLs(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats, thresholds []Thresholds) ([]QTLRecord, error) {
 	color.Cyan("===================================== Detecting QTLs =========================================")
 	if len(smoothed) == 0 {
 		fmt.Println("No smoothed stats to detect QTLs from")
 		return nil, nil
 	}
 
+	// Determine threshold to use
+	useEmpiricalThresholds := len(thresholds) == len(smoothed) && len(thresholds) > 0
+	
 	// ── group by chromosome ──────────────────────────────────────────────────
 
 	byChr := make(map[string][]SmoothedStats)
-	for _, s := range smoothed {
+	byChrThresholds := make(map[string][]Thresholds)
+	for i, s := range smoothed {
 		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+		if useEmpiricalThresholds {
+			byChrThresholds[s.CHROM] = append(byChrThresholds[s.CHROM], thresholds[i])
+		}
 	}
 	chroms := make([]string, 0, len(byChr))
 	for c := range byChr {
@@ -257,8 +265,9 @@ func DetectQTLs(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedSta
 
 	for _, chrom := range chroms {
 		stats := byChr[chrom]
+		threshs := byChrThresholds[chrom]
 
-		// Collect every contiguous run where |CompositeZ| ≥ zSig.
+		// Collect every contiguous run where |CompositeZ| ≥ threshold.
 		type run struct {
 			start, stop int64
 			peak        float64 // signed CompositeZ at the most extreme position
@@ -268,9 +277,17 @@ func DetectQTLs(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedSta
 		inRun := false
 		var cur run
 
-		for _, s := range stats {
+		for i, s := range stats {
 			z := s.CompositeZ
-			if math.Abs(z) >= zSig {
+			
+			// Determine threshold for this variant
+			threshold := zSig
+			if useEmpiricalThresholds {
+				// Use empirical CompositeZ threshold (P99 = 99.5th percentile for two-tailed)
+				threshold = threshs[i].Z.CompositeZP99
+			}
+			
+			if math.Abs(z) >= threshold {
 				if !inRun {
 					inRun = true
 					cur = run{start: s.POS, stop: s.POS, peak: z}
