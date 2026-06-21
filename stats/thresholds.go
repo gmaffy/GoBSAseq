@@ -1,67 +1,5 @@
 package stats
 
-// thresholds.go — empirical significance thresholds for BSA statistics.
-//
-// Approach
-// --------
-// For each unique sequencing depth observed in the smoothed data we run a
-// Monte Carlo null simulation using a two-stage model that is particularly
-// accurate for deeply sequenced sites:
-//
-// Stage 1: Sample the number of alt alleles in the bulk population
-//   (Binomial(n=bulk_size, p=p₀)) - this represents the realized allele count
-//   among the actual individuals in the bulk.
-//
-// Stage 2: Sample the observed reads from that realized frequency
-//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
-//
-// This two-stage model is more biologically accurate for deep sequencing because it
-// accounts for the finite population of individuals in each bulk, rather than
-// assuming reads are drawn directly from the expected population frequency p₀.
-//
-// For each simulation draw, all BSA test statistics are evaluated; their
-// empirical 95th / 99th percentiles become the per-variant thresholds.
-//
-// This approach is biologically correct because:
-//   - p₀ reflects the actual segregation ratio of the mapping population
-//     (F2 = 0.5, BC1H = 0.75, RIL = 0.5, …) rather than a re-simulated mean.
-//   - The two-stage model correctly handles deep sequencing where many reads
-//     may come from the same individuals, reducing false positives.
-//   - Thresholds scale naturally with depth: deeper sites have narrower null
-//     distributions and therefore tighter (more stringent) thresholds.
-//   - Z-score thresholds are also empirical, derived from the same simulation,
-//     so they account for the actual distribution rather than assuming normality.
-//
-// Bulk Reciprocal Model (BRM)
-// ---------------------------
-// Unlike the Monte Carlo thresholds above which are per-variant and depth-dependent,
-// BRM uses a sliding-window analytical threshold based on the variance of allele
-// frequency in the population. BRM blocks DO incorporate bulk size in their
-// threshold calculations (see calculateBRMBlocksTwoBulk and calculateBRMBlocksOneBulk).
-//
-// For Two-Bulk:
-//   Threshold = u(α) * sqrt( [ (n₁+n₂)/(V_scale * n₁ * n₂) ] * p * (1-p) )
-//   where n₁, n₂ are bulk sizes, V_scale is the population variance scale (e.g., 2 for F2),
-//   and p is the average allele frequency across both bulks.
-//
-// For One-Bulk:
-//   Threshold = u(α) * sqrt( [ p₀ * (1-p₀) ] / (V_scale * n) )
-//   where n is bulk size and p₀ is the expected null allele frequency.
-//
-// Note on QTL Detection
-// ---------------------
-// The CompositeZ ≥ 3.0 rule in DetectQTLs is the main driver for QTL calls.
-// Everything else (simulated thresholds, BRM) is secondary or just for plots.
-// For deeply sequenced sites, use DetectQTLsWithMCDirect() which applies the
-// fully sound Monte Carlo thresholds to individual plots.
-//
-// Speed
-// -----
-// Unique (highDepth, lowDepth) pairs are computed in parallel across all CPU
-// cores.  Results are memoised in a sync.Map so each unique depth combination
-// is only simulated once per program run.  golang.org/x/sync/singleflight
-// prevents redundant concurrent simulation of the same key.
-
 import (
 	"encoding/csv"
 	"fmt"
@@ -84,51 +22,40 @@ import (
 
 // ── Threshold structs ────────────────────────────────────────────────────────
 
-// Thresholds holds empirical significance thresholds for a single variant.
-// All values are two-tailed where applicable (P99/P95 = upper tail,
-// Mp99/Mp95 = lower tail for signed statistics).
 type Thresholds struct {
 	TwoBulk TwoBulkThresholds
 	OneBulk OneBulkThresholds
 	Z       ZThresholds
 }
 
-// TwoBulkThresholds holds thresholds for two-bulk BSA statistics.
 type TwoBulkThresholds struct {
-	// Segregation index thresholds (signed, so upper and lower tails)
-	HighSIP99, HighSIP95     float64 // upper tail
-	HighSIMp99, HighSIMp95   float64 // lower tail
+	HighSIP99, HighSIP95     float64
+	HighSIMp99, HighSIMp95   float64
 	LowSIP99, LowSIP95       float64
 	LowSIMp99, LowSIMp95     float64
 	DeltaSIP99, DeltaSIP95   float64
 	DeltaSIMp99, DeltaSIMp95 float64
 
-	// One-tailed statistics (larger = more evidence)
 	GstatP99, GstatP95     float64
 	ED4P99, ED4P95         float64
 	LODP99, LODP95         float64
 	BBLogBFP99, BBLogBFP95 float64
 }
 
-// OneBulkThresholds holds thresholds for single-bulk BSA statistics.
 type OneBulkThresholds struct {
-	AFDevP99, AFDevP95                   float64 // upper tail
+	AFDevP99, AFDevP95                   float64
 	AFDevMp99, AFDevMp95                 float64 // lower tail
 	OneBulkGstatP99, OneBulkGstatP95     float64
 	OneBulkLODP99, OneBulkLODP95         float64
 	OneBulkBBLogBFP99, OneBulkBBLogBFP95 float64
 }
 
-// ZThresholds holds empirical thresholds for the robust Z-scores and composite
-// scores produced by smoothing.go.  These are derived from the same null
-// simulation as the raw-stat thresholds, so they reflect the actual null
-// distribution of the smoothed, normalised scores.
 type ZThresholds struct {
-	ZP99, ZP95                   float64 // upper tail
-	ZN99, ZN95                   float64 // lower tail (negative)
+	ZP99, ZP95                   float64
+	ZN99, ZN95                   float64
 	CompositeZP99, CompositeZP95 float64
 	CompositeZN99, CompositeZN95 float64
-	NumStats                     int // number of statistics combined in CompositeZ
+	NumStats                     int
 }
 
 // ── Simulation parameters ────────────────────────────────────────────────────
@@ -168,10 +95,13 @@ func nextSeed() int64 {
 
 // simulateTwoBulk runs rep draws from a two-stage null model for both bulks:
 // Stage 1: Sample the number of alt alleles in each bulk population
-//   (Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
-//   among the actual individuals in the bulk.
+//
+//	(Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//	among the actual individuals in the bulk.
+//
 // Stage 2: Sample the observed reads from that realized frequency
-//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+//	(Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
 //
 // This two-stage model is more biologically accurate for deep sequencing because it
 // accounts for the finite population of individuals in each bulk, rather than
@@ -302,10 +232,13 @@ func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
 
 // simulateOneBulk runs rep draws from a two-stage null model for a single bulk:
 // Stage 1: Sample the number of alt alleles in the bulk population
-//   (Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
-//   among the actual individuals in the bulk.
+//
+//	(Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//	among the actual individuals in the bulk.
+//
 // Stage 2: Sample the observed reads from that realized frequency
-//   (Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+//	(Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
 //
 // This two-stage model is more biologically accurate for deep sequencing because it
 // accounts for the finite population of individuals in the bulk, rather than
@@ -446,10 +379,10 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 
 	// Pre-compute robust Z-score normalization parameters by simulating a large null dataset
 	// We'll generate many null samples, compute their Z-scores, then use those to normalize
-	
+
 	// For efficiency, we generate all null samples at once, then normalize them
 	nullRawStats := make([]float64, p.rep*k) // Each row is one simulation, each column is one statistic
-	
+
 	for i := 0; i < p.rep; i++ {
 		// Generate k correlated null statistics (they're correlated because they're from the same variant)
 		for j := 0; j < k; j++ {
@@ -461,7 +394,7 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 			nullRawStats[i*k+j] = baseZ + statNoise
 		}
 	}
-	
+
 	// Now normalize these to get Z-scores (this mimics robust normalization)
 	// Compute median and MAD for each statistic across all simulations
 	for j := 0; j < k; j++ {
@@ -473,11 +406,11 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 		mad := medianOfAbsDeviations(vals, med) * 1.4826
 		if mad > 0 {
 			for i := 0; i < p.rep; i++ {
-				nullRawStats[i*k+j] = (nullRawStats[i*k+j]-med) / mad
+				nullRawStats[i*k+j] = (nullRawStats[i*k+j] - med) / mad
 			}
 		}
 	}
-	
+
 	// Now compute CompositeZ for each simulation
 	for i := 0; i < p.rep; i++ {
 		sumZ := 0.0
@@ -511,7 +444,7 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 
 	// For efficiency, generate all null samples at once, then normalize
 	nullRawStats := make([]float64, p.rep*k)
-	
+
 	for i := 0; i < p.rep; i++ {
 		// Generate k correlated null statistics
 		for j := 0; j < k; j++ {
@@ -520,7 +453,7 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 			nullRawStats[i*k+j] = baseZ + statNoise
 		}
 	}
-	
+
 	// Normalize to Z-scores (mimics robust normalization)
 	for j := 0; j < k; j++ {
 		vals := make([]float64, p.rep)
@@ -531,11 +464,11 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 		mad := medianOfAbsDeviations(vals, med) * 1.4826
 		if mad > 0 {
 			for i := 0; i < p.rep; i++ {
-				nullRawStats[i*k+j] = (nullRawStats[i*k+j]-med) / mad
+				nullRawStats[i*k+j] = (nullRawStats[i*k+j] - med) / mad
 			}
 		}
 	}
-	
+
 	// Compute CompositeZ for each simulation
 	for i := 0; i < p.rep; i++ {
 		sumZ := 0.0
@@ -610,7 +543,7 @@ func calculateEmpiricalCompositeZThresholds(
 			p0:           p0,
 			popScale:     popScale,
 			hasBothBulks: true,
-			hasOneBulk:  false,
+			hasOneBulk:   false,
 			numStats:     numStats,
 			rep:          rep,
 		}
@@ -622,7 +555,7 @@ func calculateEmpiricalCompositeZThresholds(
 			p0:           p0,
 			popScale:     popScale,
 			hasBothBulks: false,
-			hasOneBulk:  true,
+			hasOneBulk:   true,
 			numStats:     numStats,
 			rep:          rep,
 		}
@@ -636,16 +569,16 @@ func calculateEmpiricalCompositeZThresholds(
 	sort.Float64s(allNullCompositeZ)
 
 	return ZThresholds{
-		ZP99:            2.576, // Keep theoretical for individual Z-scores
-		ZP95:            1.960,
-		ZN99:            -2.576,
-		ZN95:            -1.960,
+		ZP99: 2.576, // Keep theoretical for individual Z-scores
+		ZP95: 1.960,
+		ZN99: -2.576,
+		ZN95: -1.960,
 		// Use empirical thresholds for CompositeZ
-		CompositeZP99:   r6(stat.Quantile(0.995, stat.Empirical, allNullCompositeZ, nil)),
-		CompositeZP95:   r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil)),
-		CompositeZN99:  -r6(stat.Quantile(0.995, stat.Empirical, allNullCompositeZ, nil)),
-		CompositeZN95:  -r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil)),
-		NumStats:        numStats,
+		CompositeZP99: r6(stat.Quantile(0.995, stat.Empirical, allNullCompositeZ, nil)),
+		CompositeZP95: r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil)),
+		CompositeZN99: -r6(stat.Quantile(0.995, stat.Empirical, allNullCompositeZ, nil)),
+		CompositeZN95: -r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil)),
+		NumStats:      numStats,
 	}, nil
 }
 
