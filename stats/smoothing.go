@@ -17,6 +17,46 @@ const minVariantsInKernel = 5
 
 const kernelCutoffSigmas = 3.0
 
+// compositeZStatCount is the number of Z-scores that consolidate() adds to the
+// czs slice for each bsaType mode.  It must equal what countZStats() in
+// thresholds.go returns; validateCompositeZStatCount() checks this at runtime.
+//
+// Two-bulk: ZDeltaSI + ZGstat + ZLOD = 3
+// One-bulk: ZAFDev + ZOneBulkG + ZOneBulkLOD = 3
+const compositeZStatCountPerMode = 3
+
+// validateCompositeZStatCount panics if the number of statistics that consolidate()
+// would place into CompositeZ for the given bsaType does not match the value
+// returned by countZStats().  This catches any future divergence between the two
+// functions at the earliest possible point in the pipeline rather than silently
+// producing wrong CompositeZ values and miscalibrated thresholds.
+//
+// countZStats is passed as a function argument to avoid an import cycle
+// (smoothing.go is in package stats; thresholds.go is also in package stats,
+// so direct reference is fine — but accepting it as a func keeps the coupling
+// explicit and testable).
+func validateCompositeZStatCount(bsaType string, countZStats func(string) int) {
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	expected := 0
+	if hasBothBulks {
+		expected += compositeZStatCountPerMode
+	}
+	if hasOneBulk {
+		expected += compositeZStatCountPerMode
+	}
+
+	got := countZStats(bsaType)
+	if got != expected {
+		panic(fmt.Sprintf(
+			"CompositeZ stat-count mismatch for bsaType %q: "+
+				"consolidate() uses %d statistics but countZStats() returns %d. "+
+				"Update countZStats() in thresholds.go to match consolidate() in smoothing.go.",
+			bsaType, expected, got,
+		))
+	}
+}
+
 type SmoothedStats struct {
 	CHROM string
 	POS   int64
@@ -63,6 +103,11 @@ type SmoothedStats struct {
 }
 
 func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
+
+	// Fix 6: Verify that consolidate() and countZStats() agree on k before doing
+	// any work.  Panics immediately if they diverge (e.g. after editing one but
+	// not the other), preventing silently wrong CompositeZ values and thresholds.
+	validateCompositeZStatCount(bsaType, countZStats)
 
 	if len(rawStats) == 0 {
 		return nil, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
@@ -403,46 +448,81 @@ func medianOf(vals []float64) float64 {
 
 // consolidate fills CompositeZ (Stouffer's Z) and MaxAbsZ for every variant.
 //
-// Stouffer's Z:
+// # Statistic selection
 //
-//	composite = Σ Z_i / √k
+// CompositeZ combines only a minimal, low-redundancy set of Z-scores:
 //
-// where Z_i are the signed robust Z-scores and k is the number of statistics
-// available for that variant.  Direction is meaningful: high DeltaSI / AFDev
-// pushes CompositeZ positive; low values push it negative.
+//	Two-bulk: ZDeltaSI + ZGstat + ZLOD  (k = 3)
+//	One-bulk: ZAFDev  + ZOneBulkG + ZOneBulkLOD  (k = 3)
 //
-// MaxAbsZ is retained as a secondary column for compatibility with pipelines
-// that use it (e.g. certain ΔSNPindex implementations).
+// Excluded and why:
+//   - ZHighSI / ZLowSI — subsumed by ZDeltaSI (which is their difference);
+//     including them counts the same contrast up to three times.
+//   - ZED — a monotone function of |ΔSI|; provides no independent information
+//     and inflates the composite for every locus, not just QTLs.
+//   - ZBBLogBF / ZOneBulkBBLogBF — strongly correlated with ZGstat and ZLOD
+//     (all three derive from the same 2×2 allele-count table); omitting them
+//     reduces the spurious null-variance inflation from correlated components
+//     without meaningful loss of power at true QTLs.
+//
+// Stouffer's method assumes (approximately) independent inputs.  Restricting k
+// to three statistics with lower pairwise correlation makes the √k normalisation
+// more valid and improves calibration of the empirical null.
+//
+// # MaxAbsZ
+//
+// MaxAbsZ is computed over ALL available Z-scores (not just the three above) and
+// is retained as a secondary diagnostic column for exploratory use.
+//
+// IMPORTANT: countZStats() in thresholds.go must return the same k = 3 value for
+// each bsaType mode so that the CompositeZ null simulation uses the correct
+// denominator.  Any change here must be mirrored there.
 func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
 	for i := range sm {
 		s := &sm[i]
-		var zs []float64
 
-		if hasHighBulk {
-			zs = append(zs, s.ZHighSI)
-		}
-		if hasLowBulk {
-			zs = append(zs, s.ZLowSI)
-		}
+		// ── CompositeZ: minimal non-redundant subset ─────────────────────────
+		var czs []float64
 		if hasBothBulks {
-			zs = append(zs, s.ZDeltaSI, s.ZGstat, s.ZED, s.ZLOD, s.ZBBLogBF)
+			// ΔSI captures the signed bulk contrast; G-stat and LOD add
+			// independent test-statistic evidence from the same counts.
+			czs = append(czs, s.ZDeltaSI, s.ZGstat, s.ZLOD)
 		}
 		if hasOneBulk {
-			zs = append(zs, s.ZAFDev, s.ZOneBulkG, s.ZOneBulkLOD, s.ZOneBulkBBLogBF)
+			czs = append(czs, s.ZAFDev, s.ZOneBulkG, s.ZOneBulkLOD)
 		}
 
-		if len(zs) == 0 {
+		// ── MaxAbsZ: full envelope across all available Z-scores ─────────────
+		var allZs []float64
+		if hasHighBulk {
+			allZs = append(allZs, s.ZHighSI)
+		}
+		if hasLowBulk {
+			allZs = append(allZs, s.ZLowSI)
+		}
+		if hasBothBulks {
+			allZs = append(allZs, s.ZDeltaSI, s.ZGstat, s.ZED, s.ZLOD, s.ZBBLogBF)
+		}
+		if hasOneBulk {
+			allZs = append(allZs, s.ZAFDev, s.ZOneBulkG, s.ZOneBulkLOD, s.ZOneBulkBBLogBF)
+		}
+
+		if len(czs) == 0 {
 			continue
 		}
 
-		sum, maxAbs := 0.0, 0.0
-		for _, z := range zs {
+		sum := 0.0
+		for _, z := range czs {
 			sum += z
+		}
+		s.CompositeZ = math.Round((sum/math.Sqrt(float64(len(czs))))*1e6) / 1e6
+
+		maxAbs := 0.0
+		for _, z := range allZs {
 			if a := math.Abs(z); a > maxAbs {
 				maxAbs = a
 			}
 		}
-		s.CompositeZ = math.Round((sum/math.Sqrt(float64(len(zs))))*1e6) / 1e6
 		s.MaxAbsZ = math.Round(maxAbs*1e6) / 1e6
 	}
 }

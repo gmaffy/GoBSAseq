@@ -305,9 +305,13 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		)
 
 		// ── composite signal chart ───────────────────────────────────────────
+		// Use the empirical CompositeZ thresholds from the first variant on this
+		// chromosome (they are global — identical for every variant — so any entry
+		// gives the same value).
+		czThresh := entries[0].t.Z
 
 		compositePage.AddCharts(
-			createCompositeChart(chrom, x, compositeZ, maxAbsZ, chromBRM),
+			createCompositeChart(chrom, x, compositeZ, maxAbsZ, chromBRM, czThresh),
 		)
 	}
 
@@ -681,43 +685,60 @@ func createZOverlayChart(
 
 // createCompositeChart renders both the Stouffer CompositeZ (signed, from
 // smoothing.go) and MaxAbsZ (unsigned envelope) on the same chart.
-// z = ±2 and ±3 reference lines are drawn; BRM block shading is included.
-// This replaces the legacy createCompositeSignalChart.
+// Threshold lines are drawn from the empirical MC-derived ZThresholds (P99 / P95)
+// rather than the legacy hard-coded ±3 / ±2 constants.
+// BRM block shading is included.
 func createCompositeChart(
 	chrom string,
 	x []int64,
 	compositeZ, maxAbsZ []float64,
 	brmBlocks []stats.BRMBlock,
+	czThresh stats.ZThresholds,
 ) *charts.Line {
 
+	czP99 := czThresh.CompositeZP99
+	czP95 := czThresh.CompositeZP95
+	czN99 := czThresh.CompositeZN99
+	czN95 := czThresh.CompositeZN95
+
 	title := chrom + " — Composite Signal"
-	subtitle := "Stouffer CompositeZ (signed, all statistics) and max |Z| envelope. " +
-		"z = ±2 suggestive · z = ±3 significant. Shaded bands: BRM blocks."
+	subtitle := fmt.Sprintf(
+		"Stouffer CompositeZ (ΔSI + G-stat + LOD, k=%d) and max |Z| envelope. "+
+			"Dashed lines: empirical MC p99 (%.3f / %.3f) and p95 (%.3f / %.3f). "+
+			"Shaded bands: BRM blocks.",
+		czThresh.NumStats, czP99, czN99, czP95, czN95,
+	)
 
 	line := charts.NewLine()
 	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "Z-score", chartWidth, chartHeight, true)...)
+
+	// Embed the empirical threshold values into the JS tooltip so the reader
+	// sees "★ p99 significant" / "● p95 suggestive" relative to the actual MC
+	// thresholds, not the old hard-coded 3.0 / 2.0.
+	tooltipJS := fmt.Sprintf(`function(params) {
+		var czP99 = %f, czP95 = %f, czN99 = %f, czN95 = %f;
+		let pos = params[0].axisValue;
+		let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
+		let result = '<strong>' + posStr + '</strong><br/>';
+		params.forEach(function(item) {
+			let val = parseFloat(item.value);
+			if (isNaN(val)) return;
+			let sig = '';
+			if (item.seriesName === 'CompositeZ' || item.seriesName === 'MaxAbsZ') {
+				if (val >= czP99 || val <= czN99)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99 significant</span>';
+				else if (val >= czP95 || val <= czN95) sig = ' <span style="color:#f39c12">● p95 suggestive</span>';
+			}
+			result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
+		});
+		return result;
+	}`, czP99, czP95, czN99, czN95)
 
 	line.SetGlobalOptions(
 		charts.WithTooltipOpts(opts.Tooltip{
 			Show:        opts.Bool(true),
 			Trigger:     "axis",
 			AxisPointer: &opts.AxisPointer{Type: "cross"},
-			Formatter: opts.FuncOpts(`function(params) {
-				let pos = params[0].axisValue;
-				let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
-				let result = '<strong>' + posStr + '</strong><br/>';
-				params.forEach(function(item) {
-					let val = parseFloat(item.value);
-					if (isNaN(val)) return;
-					let sig = '';
-					if (item.seriesName === 'CompositeZ' || item.seriesName === 'MaxAbsZ') {
-						if (Math.abs(val) >= 3.0)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ z≥3 significant</span>';
-						else if (Math.abs(val) >= 2.0) sig = ' <span style="color:#f39c12">● z≥2 suggestive</span>';
-					}
-					result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
-				});
-				return result;
-			}`),
+			Formatter:   opts.FuncOpts(tooltipJS),
 		}),
 	)
 
@@ -737,6 +758,11 @@ func createCompositeChart(
 	}
 	compositeOpts = append(compositeOpts, brmMarkAreaOpts(brmBlocks, x)...)
 
+	p99Label := fmt.Sprintf("p99 (%.3f)", czP99)
+	p95Label := fmt.Sprintf("p95 (%.3f)", czP95)
+	n99Label := fmt.Sprintf("p99 (%.3f)", czN99)
+	n95Label := fmt.Sprintf("p95 (%.3f)", czN95)
+
 	line.SetXAxis(positionLabels(x)).
 		AddSeries("CompositeZ", floatSliceToLineData(compositeZ), compositeOpts...).
 		AddSeries("MaxAbsZ", floatSliceToLineData(maxAbsZ),
@@ -744,19 +770,19 @@ func createCompositeChart(
 			charts.WithLineStyleOpts(opts.LineStyle{Width: 1.8, Color: "#9467bd", Type: "dotted"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		).
-		AddSeries("z=+2 (sugg.)", mkRef(zSugg),
+		AddSeries(p95Label, mkRef(czP95),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		).
-		AddSeries("z=+3 (sig.)", mkRef(zSig),
+		AddSeries(p99Label, mkRef(czP99),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		).
-		AddSeries("z=-2 (sugg.)", mkRef(-zSugg),
+		AddSeries(n95Label, mkRef(czN95),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		).
-		AddSeries("z=-3 (sig.)", mkRef(-zSig),
+		AddSeries(n99Label, mkRef(czN99),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		)

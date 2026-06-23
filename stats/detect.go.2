@@ -1,0 +1,300 @@
+package stats
+
+import (
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/fatih/color"
+	"github.com/gmaffy/genome-whisperer/utils"
+)
+
+package stats
+
+import (
+"fmt"
+"math"
+"os"
+"path/filepath"
+"sort"
+"strings"
+
+"github.com/fatih/color"
+"github.com/gmaffy/GoBSAseq/utils"
+)
+
+// QTLRecord holds a detected QTL interval with metadata about how it was identified.
+// The 'Peak' field name is preserved to maintain compatibility with MergeQTLsAndBRM.
+type QTLRecord struct {
+	Chrom     string
+	Start     int64
+	Stop      int64
+	PeakPos   int64
+	Peak      float64 // Preserved for downstream MergeQTLsAndBRM compatibility
+	Stat      string  // "Stouffer" or "MaxAbsZ"
+	Threshold string  // "P99" or "P95"
+}
+
+// DetectQTLs identifies genomic regions exceeding significance limits using a
+// hierarchical search strategy: Stouffer P99 -> Stouffer P95 -> MaxAbsZ P99 -> MaxAbsZ P95.
+func DetectQTLs(smoothed []SmoothedStats, thresh *Thresholds, bsaType string, cfg *utils.Config) ([]QTLRecord, error) {
+	color.Cyan("--> Detecting QTLs via hierarchical CompositeZ / MaxAbsZ tracks...")
+
+	// Group variants by chromosome
+	chrMap := make(map[string][]SmoothedStats)
+	var chroms []string
+	for _, s := range smoothed {
+		if _, ok := chrMap[s.CHROM]; !ok {
+			chroms = append(chroms, s.CHROM)
+		}
+		chrMap[s.CHROM] = append(chrMap[s.CHROM], s)
+	}
+	sort.Strings(chroms)
+
+	var allQTLs []QTLRecord
+
+	// Process each chromosome independently using the fallback hierarchy
+	for _, chrom := range chroms {
+		variants := chrMap[chrom]
+		if len(variants) == 0 {
+			continue
+		}
+
+		var chrQTLs []QTLRecord
+		calledStat := ""
+		calledThresh := ""
+
+		// Hierarchy Tier 1: Stouffer (CompositeZ) P99 (Empirical)
+		chrQTLs = findZSegments(variants, thresh.Z.CompositeZP99, true)
+		if len(chrQTLs) > 0 {
+			calledStat = "Stouffer"
+			calledThresh = "P99"
+		} else {
+			// Hierarchy Tier 2: Stouffer (CompositeZ) P95 (Empirical)
+			chrQTLs = findZSegments(variants, thresh.Z.CompositeZP95, true)
+			if len(chrQTLs) > 0 {
+				calledStat = "Stouffer"
+				calledThresh = "P95"
+			} else {
+				// Hierarchy Tier 3: MaxAbsZ P99 (Theoretical robust normal cutoff: 2.576)
+				chrQTLs = findZSegments(variants, 2.576, false)
+				if len(chrQTLs) > 0 {
+					calledStat = "MaxAbsZ"
+					calledThresh = "P99"
+				} else {
+					// Hierarchy Tier 4: MaxAbsZ P95 (Theoretical robust normal cutoff: 1.960)
+					chrQTLs = findZSegments(variants, 1.960, false)
+					if len(chrQTLs) > 0 {
+						calledStat = "MaxAbsZ"
+						calledThresh = "P95"
+					}
+				}
+			}
+		}
+
+		// Fill in metadata for identified peaks on this chromosome
+		for i := range chrQTLs {
+			chrQTLs[i].Stat = calledStat
+			chrQTLs[i].Threshold = calledThresh
+			allQTLs = append(allQTLs, chrQTLs[i])
+		}
+	}
+
+	// Write output to qtls.tsv
+	outDir := filepath.Join(cfg.OutputDir, "qtls")
+	if err := os.MkdirAll(outDir, 0775); err != nil {
+		return nil, err
+	}
+	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.qtls.tsv", bsaType))
+	f, err := os.Create(outPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK_VAL\tSTAT\tTHRESHOLD")
+	for _, q := range allQTLs {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.6f\t%s\t%s\n",
+			q.Chrom, q.Start, q.Stop, q.PeakPos, q.Peak, q.Stat, q.Threshold)
+	}
+
+	color.Green("    [OK] Hierarchical QTL analysis completed. Written to: %s", outPath)
+	return allQTLs, nil
+}
+
+// Helper function to scan a chromosome track and group contiguous blocks above threshold
+func findZSegments(variants []SmoothedStats, cutoff float64, useComposite bool) []QTLRecord {
+	var records []QTLRecord
+	var currentRun []SmoothedStats
+
+	appendRun := func() {
+		if len(currentRun) == 0 {
+			return
+		}
+		start := currentRun.POS
+		stop := currentRun[len(currentRun)-1].POS
+
+		var peakPos int64
+		var peakVal float64
+		maxAbs := -1.0
+
+		for _, v := range currentRun {
+			val := v.MaxAbsZ
+			if useComposite {
+				val = v.CompositeZ
+			}
+			if math.Abs(val) > maxAbs {
+				maxAbs = math.Abs(val)
+				peakPos = v.POS
+				peakVal = val
+			}
+		}
+
+		records = append(records, QTLRecord{
+			Chrom:   currentRun.CHROM,
+			Start:   start,
+			Stop:    stop,
+			PeakPos: peakPos,
+			Peak:    peakVal,
+		})
+		currentRun = nil
+	}
+
+	for _, v := range variants {
+		score := v.MaxAbsZ
+		if useComposite {
+			score = v.CompositeZ
+		}
+
+		if math.Abs(score) >= cutoff {
+			currentRun = append(currentRun, v)
+		} else {
+			appendRun()
+		}
+	}
+	appendRun()
+
+	return records
+}
+
+// DirectQTLRecord holds direct per-statistic single-variant direct discovery records.
+type DirectQTLRecord struct {
+	Chrom      string
+	Start      int64
+	Stop       int64
+	PeakPos    int64
+	ZPeak      float64
+	Statistics string
+	Threshold  string
+}
+
+// DetectQTLsWithMCDirect performs single-variant direct hypothesis evaluation on individual metrics
+// against their custom empirical null tiers (P99 vs P95), prioritizing P99 discovery.
+func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaType string, cfg *utils.Config) error {
+	color.Cyan("--> Running direct single-statistic Monte Carlo evaluations...")
+
+	hasBothBulks := strings.Contains(strings.ToLower(bsaType), "twobulk") || strings.Contains(strings.ToLower(bsaType), "2p2b")
+	hasOneBulk := strings.Contains(strings.ToLower(bsaType), "onebulk") || strings.Contains(strings.ToLower(bsaType), "1p1b")
+
+	var activeRuns []SmoothedStats
+	var records []DirectQTLRecord
+
+	flushDirectRun := func(run []SmoothedStats, statsNames []string, tierLabel string) {
+		if len(run) == 0 {
+			return
+		}
+		var peakPos int64
+		var maxPeak float64
+		maxAbs := -1.0
+
+		for _, s := range run {
+			if math.Abs(s.CompositeZ) > maxAbs {
+				maxAbs = math.Abs(s.CompositeZ)
+				peakPos = s.POS
+				maxPeak = s.CompositeZ
+			}
+		}
+
+		records = append(records, DirectQTLRecord{
+			Chrom:      run.CHROM,
+			Start:      run.POS,
+			Stop:       run[len(run)-1].POS,
+			PeakPos:    peakPos,
+			ZPeak:      maxPeak,
+			Statistics: strings.Join(statsNames, ","),
+			Threshold:  tierLabel,
+		})
+	}
+
+	for i, s := range smoothed {
+		t := thresh[i]
+		var crossedP99 []string
+		var crossedP95 []string
+
+		if hasBothBulks {
+			tb := t.TwoBulk
+			if s.SmDeltaSI >= tb.DeltaSIP99 || s.SmDeltaSI <= tb.DeltaSIMp99 { crossedP99 = append(crossedP99, "DeltaSI") }
+			if s.SmGstat >= tb.GstatP99 { crossedP99 = append(crossedP99, "Gstat") }
+			if s.SmLOD >= tb.LODP99 { crossedP99 = append(crossedP99, "LOD") }
+			if s.SmBBLogBF >= tb.BBLogBFP99 { crossedP99 = append(crossedP99, "BBLogBF") }
+
+			if s.SmDeltaSI >= tb.DeltaSIP95 || s.SmDeltaSI <= tb.DeltaSIMp95 { crossedP95 = append(crossedP95, "DeltaSI") }
+			if s.SmGstat >= tb.GstatP95 { crossedP95 = append(crossedP95, "Gstat") }
+			if s.SmLOD >= tb.LODP95 { crossedP95 = append(crossedP95, "LOD") }
+			if s.SmBBLogBF >= tb.BBLogBFP95 { crossedP95 = append(crossedP95, "BBLogBF") }
+		}
+
+		if hasOneBulk {
+			ob := t.OneBulk
+			if s.SmAFDev >= ob.AFDevP99 || s.SmAFDev <= ob.AFDevMp99 { crossedP99 = append(crossedP99, "AFDev") }
+			if s.SmOneBulkG >= ob.GstatP99 { crossedP99 = append(crossedP99, "Gstat") }
+			if s.SmOneBulkLOD >= ob.LODP99 { crossedP99 = append(crossedP99, "LOD") }
+			if s.SmOneBulkBBLogBF >= ob.BBLogBFP99 { crossedP99 = append(crossedP99, "BBLogBF") }
+
+			if s.SmAFDev >= ob.AFDevP95 || s.SmAFDev <= ob.AFDevMp95 { crossedP95 = append(crossedP95, "AFDev") }
+			if s.SmOneBulkG >= ob.GstatP95 { crossedP95 = append(crossedP95, "Gstat") }
+			if s.SmOneBulkLOD >= ob.LODP95 { crossedP95 = append(crossedP95, "LOD") }
+			if s.SmOneBulkBBLogBF >= ob.BBLogBFP95 { crossedP95 = append(crossedP95, "BBLogBF") }
+		}
+
+		if len(crossedP99) > 0 {
+			activeRuns = append(activeRuns, s)
+			if i == len(smoothed)-1 || smoothed[i+1].CHROM != s.CHROM {
+				flushDirectRun(activeRuns, crossedP99, "P99")
+				activeRuns = nil
+			}
+		} else if len(crossedP95) > 0 {
+			activeRuns = append(activeRuns, s)
+			if i == len(smoothed)-1 || smoothed[i+1].CHROM != s.CHROM {
+				flushDirectRun(activeRuns, crossedP95, "P95")
+				activeRuns = nil
+			}
+		} else {
+			if len(activeRuns) > 0 {
+				flushDirectRun(activeRuns, []string{"MultiStat"}, "P95")
+				activeRuns = nil
+			}
+		}
+	}
+
+	outDir := filepath.Join(cfg.OutputDir, "qtls")
+	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.individual_stats_qtls.tsv", bsaType))
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK_POS\tZPEAK\tSTATISTICS\tTHRESHOLD")
+	for _, r := range records {
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.6f\t%s\t%s\n",
+			r.Chrom, r.Start, r.Stop, r.PeakPos, r.ZPeak, r.Statistics, r.Threshold)
+	}
+
+	color.Green("    [OK] Direct single-statistic analysis complete. Written to: %s", outPath)
+	return nil
+}
