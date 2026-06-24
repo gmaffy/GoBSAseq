@@ -92,35 +92,35 @@ func bsaseqType(cfg *utils.AnalysisConfig) (string, []int, error) {
 
 	switch {
 	case hp && lp && hb && lb:
-		fmt.Println("================================ Running 2 parent 2 bulk analysis ==========================================")
+		color.Cyan("================================ Running 2 parent 2 bulk analysis ==========================================")
 		return "2p2b", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 
 	case hp && lp && hb && !lb:
-		fmt.Println("=================================== Running 2 parent High Bulk ============================================")
+		color.Cyan("=================================== Running 2 parent High Bulk ============================================")
 		return "2phb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx}, nil
 	case hp && lp && !hb && lb:
-		fmt.Println("=================================== Running 2 parent Low bulk =============================================")
+		color.Cyan("=================================== Running 2 parent Low bulk =============================================")
 		return "2plb", []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx}, nil
 	case hp && !lp && hb && lb:
-		fmt.Println("=================================== Running High parent 2 bulks ===========================================")
+		color.Cyan("=================================== Running High parent 2 bulks ===========================================")
 		return "hp2b", []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	case hp && !lp && hb && !lb:
-		fmt.Println("=================================== Running high parent high bulk ==========================================")
+		color.Cyan("=================================== Running high parent high bulk ==========================================")
 		return "hphb", []int{cfg.HighParentIdx, cfg.HighBulkIdx}, nil
 	case hp && !lp && !hb && lb:
-		fmt.Println("=================================== Running High parent low bulk ===========================================")
+		color.Cyan("=================================== Running High parent low bulk ===========================================")
 		return "hplb", []int{cfg.HighParentIdx, cfg.LowBulkIdx}, nil
 	case !hp && lp && hb && lb:
-		fmt.Println("=================================== Running Low parent 2 bulks =============================================")
+		color.Cyan("=================================== Running Low parent 2 bulks =============================================")
 		return "lp2b", []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	case !hp && lp && hb && !lb:
-		fmt.Println("Running Low parent high bulk")
+		color.Cyan("Running Low parent high bulk")
 		return "lphb", []int{cfg.LowParentIdx, cfg.HighBulkIdx}, nil
 	case !hp && lp && !hb && lb:
-		fmt.Println("Running Low parent low bulk")
+		color.Cyan("Running Low parent low bulk")
 		return "lplb", []int{cfg.LowParentIdx, cfg.LowBulkIdx}, nil
 	case !hp && !lp && hb && lb:
-		fmt.Println("Running bulks only")
+		color.Cyan("Running bulks only")
 		return "2b", []int{cfg.HighBulkIdx, cfg.LowBulkIdx}, nil
 	default:
 		return "bad", []int{}, fmt.Errorf("invalid combination — at least one bulk is required")
@@ -231,13 +231,37 @@ func getRunType(cfg *utils.AnalysisConfig) (string, error) {
 
 func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype string, idxs []int) error {
 	//--------------------------------------- Filter -----------------------------------------------------------------//
-	fmt.Printf("Filtering %s with bsaseq Type %v\n", cfg.VCF, btype)
+
+	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v ...\n\n", cfg.VCF, btype)
+	fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
+	fmt.Printf("SNP_QD > %v\n", hfcfg.SNP_QD_Min)
+	fmt.Printf("SNP_QUAL > %v\n", hfcfg.SNP_QUAL_Min)
+	fmt.Printf("SNP_SOR < %v\n", hfcfg.SNP_SOR_Max)
+	fmt.Printf("SNP_FS < %v\n", hfcfg.SNP_FS_Max)
+	fmt.Printf("SNP_MQ > %v\n", hfcfg.SNP_MQ_Min)
+	fmt.Printf("SNP_MQRankSum > %v\n", hfcfg.SNP_MQRankSum_Min)
+	fmt.Printf("SNP_ReadPosRankSum > %v\n", hfcfg.SNP_ReadPosRankSum_Min)
+	fmt.Printf("INDEL_QD > %v\n", hfcfg.INDEL_QD_Min)
+	fmt.Printf("INDEL_QUAL > %v\n", hfcfg.INDEL_QUAL_Min)
+	fmt.Printf("INDEL_FS < %v\n", hfcfg.INDEL_FS_Max)
+	fmt.Printf("INDEL_ReadPosRankSum > %v\n", hfcfg.INDEL_ReadPosRankSum_Min)
+	fmt.Printf("INDEL_SOR < %v\n\n", hfcfg.INDEL_SOR_Max)
+
+	fmt.Printf("Min High parent depth: %v\n", cfg.HighParentDepth)
+	fmt.Printf("Min Low parent depth: %v\n", cfg.LowParentDepth)
+	fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
+	fmt.Printf("Min Low bulk depth: %v\n", cfg.LowBulkDepth)
+
 	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
 	if err != nil {
 		return err
 	}
-	color.Cyan("Original variants: %v\nFiltered Variants: %v", original, passed)
+	fmt.Printf("Original variants: %v\nFiltered Variants: %v\n\n", original, passed)
+
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 2/10: Calculating raw BSAseq statistics ...\n")
 
 	// ----------------------------------------- Stats ---------------------------------------------------------------//
 	rawStats, err := stats.RawStats(*cfg, btype, idxs, passedVariants)
@@ -245,17 +269,29 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return err
 	}
 
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 3/10: Smoothing and normalising raw statistics ...\n")
+
 	// ---------------------------------------- smoothing ------------------------------------------------------------//
 	smoothedStats, err := stats.SmoothAndNormalise(*cfg, btype, rawStats)
 	if err != nil {
 		return err
 	}
 
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 4/10: Calculating thresholds ...\n")
+
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
 	thresholds, err := stats.CalculateThresholds(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
+
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 5/10: Calculating BRM blocks ...\n")
 
 	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
 	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
@@ -264,40 +300,52 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	}
 	color.Green("Detected %d BRM blocks", len(brmBlocks))
 
-	// ------------------------------------------------ Plots ------------------------------------------------------- //
-	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks); err != nil {
-		color.Red("Error generating plots: %v", err)
-		return err
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 6/10: Detecting QTLs from individual statistics ...\n")
+
+	err = stats.DetectQTLsWithMCDirect(smoothedStats, thresholds, btype, cfg)
+	if err != nil {
+		color.Yellow("Warning: MC-based QTL detection failed: %v", err)
 	}
 
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
 	// ---------------------------------------------- Detect QTLs --------------------------------------------------- //
-	// Primary detection: CompositeZ with empirical thresholds
 	qtls, err := stats.DetectQTLs(smoothedStats, thresholds, btype, cfg)
 	if err != nil {
 		return err
 	}
 	color.Green("Detected %d QTLs using empirical CompositeZ thresholds", len(qtls))
 
-	// Secondary detection: Monte Carlo threshold-based (fully sound for deep sequencing)
-	if err := stats.DetectQTLsWithMCDirect(smoothedStats, thresholds, btype, cfg); err != nil {
-		color.Yellow("Warning: MC-based QTL detection failed: %v", err)
-	} else {
-		color.Green("MC-based QTL detection completed")
-	}
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	// -------------------------------------------- Merge QTLs + BRM ------------------------------------------------ //
-	// Merge primary QTLs with BRM blocks
+	color.Cyan("STEP 8/10: Merging QTLs and BRM blocks ...\n")
+
 	merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
 	if err != nil {
 		return err
 	}
 	color.Green("Merged intervals: %d", len(merged))
 
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+
+	color.Cyan("STEP 9/10: Plotting ...\n")
+
+	// ------------------------------------------------ Plots ------------------------------------------------------- //
+	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks); err != nil {
+		color.Red("Error generating plots: %v", err)
+		return err
+	}
+	color.Green("MC-based QTL detection completed\n\n")
+
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+	color.Cyan("STEP 10/10: Gene space analysis ...")
 	// --------------------------------------------------- Gene Space ---------------------------------------------- //
 	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
 	if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
 		color.Red("Gene space analysis error: %v", err)
-		// Non-fatal — log and continue.
 	}
 
 	return nil
@@ -444,7 +492,6 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	fmt.Printf("LowBulk: %s\n", cfg.LowBulkName)
 
 	// ========================================== Open VCF ========================================================== //
-	fmt.Println("Running BSAseq using a VCF file ...")
 
 	bold := color.New(color.Bold).SprintFunc()
 	color.Cyan("=============================== Checking parameters =====================================================\n")

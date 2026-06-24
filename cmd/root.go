@@ -4,6 +4,7 @@ Copyright © 2026 Godwin Mafireyi <mafireyi@gmail.com>
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,19 +21,192 @@ var rootCmd = &cobra.Command{
 	Use:   "GoBSAseq",
 	Short: "Pipeline for BSAseq analysis implemented in Go",
 	Long:  `Pipeline for BSAseq analysis implemented in Go.`,
-	// Uncomment the following line if your bare application
-	// has an action associated with it:
+
 	Run: func(cmd *cobra.Command, args []string) {
 
-		variant, _ := cmd.Flags().GetString("variant")
-		parents, _ := cmd.Flags().GetString("parents")
-		bulks, _ := cmd.Flags().GetString("bulks")
-		parentsBams, _ := cmd.Flags().GetString("parents-bams")
-		bulksBams, _ := cmd.Flags().GetString("bulks-bams")
-		hpReads, _ := cmd.Flags().GetString("hp-reads")
-		lpReads, _ := cmd.Flags().GetString("lp-reads")
-		hbReads, _ := cmd.Flags().GetString("hb-reads")
-		lbReads, _ := cmd.Flags().GetString("lb-reads")
+		ref := ""
+		gff := ""
+		cds := ""
+		protein := ""
+		geneDescriptions := ""
+		prg := ""
+		vcfFile := ""
+
+		highParentName := ""
+		lowParentName := ""
+
+		hpBam := ""
+		lpBam := ""
+		hbBam := ""
+		lbBam := ""
+
+		hpFwdReads := ""
+		hpRevReads := ""
+		lpFwdReads := ""
+		lpRevReads := ""
+		hbFwdReads := ""
+		hbRevReads := ""
+		lbFwdReads := ""
+		lbRevReads := ""
+
+		highBulkName := ""
+		lowBulkName := ""
+
+		var err error
+		configFilePath, _ := cmd.Flags().GetString("config")
+		if configFilePath != "" {
+			configFile, err := os.Open(configFilePath)
+			if err != nil {
+				color.Red("Error opening config file: %v", err)
+				return
+			}
+			defer configFile.Close()
+
+			scanner := bufio.NewScanner(configFile)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+
+				if line == "" {
+					continue
+				}
+
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) != 2 {
+					continue
+				}
+
+				key := strings.TrimSpace(parts[0])
+				value := strings.TrimSpace(parts[1])
+
+				switch key {
+				case "Reference":
+					ref = value
+				case "gff":
+					gff = value
+				case cds:
+					cds = value
+				case "proteins":
+					protein = value
+				case "gene-descriptions":
+					geneDescriptions = value
+				case "prg":
+					prg = value
+				case "HighParentReads":
+					hpReads := strings.Split(value, " ")
+					if len(hpReads) == 3 {
+						hpFwdReads = hpReads[0]
+						hpRevReads = hpReads[1]
+						highParentName = hpReads[2]
+					}
+				case "LowParentReads":
+					lpReads := strings.Split(value, " ")
+					if len(lpReads) == 3 {
+						lpFwdReads = lpReads[0]
+						lpRevReads = lpReads[1]
+						lowParentName = lpReads[2]
+					}
+				case "HighBulkReads":
+					hbReads := strings.Split(value, " ")
+					if len(hbReads) == 3 {
+						hbFwdReads = hbReads[0]
+						hbRevReads = hbReads[1]
+						highBulkName = hbReads[2]
+					}
+				case "LowBulkReads":
+					lbReads := strings.Split(value, " ")
+					if len(lbReads) == 3 {
+						lbFwdReads = lbReads[0]
+						lbRevReads = lbReads[1]
+						lowBulkName = lbReads[2]
+					}
+				case "HighParentBam":
+					hpBam = value
+				case "LowParentBam":
+					lpBam = value
+				case "HighBulkBam":
+					hbBam = value
+				case "LowBulkBam":
+					lbBam = value
+				case "VCF":
+					vcfFile = value
+				}
+			}
+
+		} else {
+			vcfFile, _ = cmd.Flags().GetString("variant")
+
+			// ============================================  Bams ================================================ //
+			parentsBams, _ := cmd.Flags().GetString("parents-bams")
+			parentBamsLst := strings.Split(parentsBams, ",")
+			if len(parentBamsLst) == 2 {
+				hpBam = parentBamsLst[0]
+				lpBam = parentBamsLst[1]
+			}
+
+			bulksBams, _ := cmd.Flags().GetString("bulks-bams")
+			bulkBamsLst := strings.Split(bulksBams, ",")
+			if len(bulkBamsLst) == 2 {
+				hbBam = bulkBamsLst[0]
+				lbBam = bulkBamsLst[1]
+			}
+
+			// =========================================== Reads ==================================================== //
+
+			hpReads, _ := cmd.Flags().GetString("hp-reads")
+			hpReadsLst := strings.Split(hpReads, ",")
+			if len(hpReadsLst) == 2 {
+				hpFwdReads = hpReadsLst[0]
+				hpRevReads = hpReadsLst[1]
+			}
+
+			lpReads, _ := cmd.Flags().GetString("lp-reads")
+			lpReadsLst := strings.Split(lpReads, ",")
+			if len(lpReadsLst) == 2 {
+				lpFwdReads = lpReadsLst[0]
+				lpRevReads = lpReadsLst[1]
+			}
+
+			hbReads, _ := cmd.Flags().GetString("hb-reads")
+			hbReadsLst := strings.Split(hbReads, ",")
+			if len(hbReadsLst) == 2 {
+				hbFwdReads = hbReadsLst[0]
+				hbRevReads = hbReadsLst[1]
+
+			}
+
+			lbReads, _ := cmd.Flags().GetString("lb-reads")
+			lbReadsLst := strings.Split(lbReads, ",")
+			if len(lbReadsLst) == 2 {
+				lbFwdReads = lbReadsLst[0]
+				lbRevReads = lbReadsLst[1]
+			}
+
+			// =============================================== Names ================================================ //
+
+			parents, _ := cmd.Flags().GetString("parents")
+			parentNamesLst := strings.Split(parents, ",")
+			if len(parentNamesLst) == 2 {
+				highParentName = parentNamesLst[0]
+				lowParentName = parentNamesLst[1]
+			}
+
+			bulks, _ := cmd.Flags().GetString("bulks")
+			bulkNamesLst := strings.Split(bulks, ",")
+			if len(bulkNamesLst) == 2 {
+				highBulkName = bulkNamesLst[0]
+				lowBulkName = bulkNamesLst[1]
+			}
+
+			// ======================================= Gene Space Analysis ========================================== //
+
+			gff, _ = cmd.Flags().GetString("gff")
+			cds, _ = cmd.Flags().GetString("cds")
+			ref, _ = cmd.Flags().GetString("reference")
+			protein, _ = cmd.Flags().GetString("protein")
+			geneDescriptions, _ = cmd.Flags().GetString("gene-descriptions")
+			prg, _ = cmd.Flags().GetString("prg")
+
+		}
 
 		parentsDepth, _ := cmd.Flags().GetString("parents-depth")
 		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
@@ -61,12 +235,6 @@ var rootCmd = &cobra.Command{
 		maxSOR_INDEL, _ := cmd.Flags().GetFloat64("max-SOR-INDEL")
 
 		snpEffDB, _ := cmd.Flags().GetString("snpEffDB")
-		gff, _ := cmd.Flags().GetString("gff")
-		cds, _ := cmd.Flags().GetString("cds")
-		ref, _ := cmd.Flags().GetString("reference")
-		protein, _ := cmd.Flags().GetString("protein")
-		geneDescriptions, _ := cmd.Flags().GetString("gene-descriptions")
-		prg, _ := cmd.Flags().GetString("prg")
 
 		merger, _ := cmd.Flags().GetString("merger")
 		caller, _ := cmd.Flags().GetString("caller")
@@ -76,38 +244,9 @@ var rootCmd = &cobra.Command{
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		threads, _ := cmd.Flags().GetInt("threads")
 
-		parentNamesLst := strings.Split(parents, ",")
-		bulkNamesLst := strings.Split(bulks, ",")           //splitArg(bulks)
 		bulksDepthLst := strings.Split(bulksDepth, ",")     //splitArg(bulksDepth)
 		bulkSizesLst := strings.Split(bulkSizes, ",")       //splitArg(bulkSizes)
 		parentsDepthLst := strings.Split(parentsDepth, ",") //splitArg(parentsDepth)
-
-		parentBamsLst := strings.Split(parentsBams, ",")
-		bulkBamsLst := strings.Split(bulksBams, ",")
-		hpReadsLst := strings.Split(hpReads, ",")
-		lpReadsLst := strings.Split(lpReads, ",")
-		hbReadsLst := strings.Split(hbReads, ",")
-		lbReadsLst := strings.Split(lbReads, ",")
-
-		highParentName := ""
-		lowParentName := ""
-
-		hpBam := ""
-		lpBam := ""
-		hbBam := ""
-		lbBam := ""
-
-		hpFwdReads := ""
-		hpRevReads := ""
-		lpFwdReads := ""
-		lpRevReads := ""
-		hbFwdReads := ""
-		hbRevReads := ""
-		lbFwdReads := ""
-		lbRevReads := ""
-
-		highBulkName := ""
-		lowBulkName := ""
 
 		highBulkDepth := 0
 		lowBulkDepth := 0
@@ -119,92 +258,6 @@ var rootCmd = &cobra.Command{
 		lowBulkSize := 0
 
 		winSize := 0
-
-		var err error
-
-		// ========================================== Get parents =================================================== //
-
-		//------------------------------------------- Parent Names -------------------------------------------------- //
-		if len(parentNamesLst) > 0 {
-			if len(parentNamesLst) != 2 {
-				color.Red("parents is supposed to be in the form a,b (where a and b are parent names)")
-				return
-			}
-
-			highParentName = parentNamesLst[0]
-			lowParentName = parentNamesLst[1]
-
-		}
-
-		// ---------------------------------------- Parent Bams ----------------------------------------------------- //
-		if len(parentBamsLst) > 0 {
-			if len(parentBamsLst) != 2 {
-				color.Red("parentsBams is supposed to be in the form a,b (where a and b are parent bam files)")
-				return
-			}
-			hpBam = parentBamsLst[0]
-			lpBam = parentBamsLst[1]
-
-		}
-
-		// --------------------------------------- Parent Reads ----------------------------------------------------- //
-		if len(hpReadsLst) > 0 {
-			if len(hpReadsLst) != 2 {
-				color.Red("hpReads is supposed to be in the form a,b (where a and b are parent reads)")
-				return
-			}
-			hpFwdReads = hpReadsLst[0]
-			hpRevReads = hpReadsLst[1]
-		}
-
-		if len(lpReadsLst) > 0 {
-			if len(lpReadsLst) != 2 {
-				color.Red("lpReads is supposed to be in the form a,b (where a and b are parent reads)")
-				return
-			}
-			lpFwdReads = lpReadsLst[0]
-			lpRevReads = lpReadsLst[1]
-		}
-
-		// ========================================== Get Bulk Names =============================================== //
-		if len(bulkNamesLst) > 0 {
-			if len(bulkNamesLst) != 2 {
-				color.Red("bulks is supposed to be in the form a,b (where a and b are bulk names)")
-				return
-			}
-			highBulkName = bulkNamesLst[0]
-			lowBulkName = bulkNamesLst[1]
-
-		}
-
-		// ---------------------------------------- Bulk Bams ----------------------------------------------------- //
-		if len(bulkBamsLst) > 0 {
-			if len(bulkBamsLst) != 2 {
-				color.Red("bulkBams is supposed to be in the form a,b (where a and b are bam files)")
-				return
-			}
-			hbBam = bulkBamsLst[0]
-			lbBam = bulkBamsLst[1]
-		}
-
-		// ---------------------------------------- Bulk Reads ----------------------------------------------------- //
-		if len(hbReadsLst) > 0 {
-			if len(hbReadsLst) != 2 {
-				color.Red("hbReads is supposed to be in the form fwdReads,revReads")
-				return
-			}
-			hbFwdReads = hbReadsLst[0]
-			hbRevReads = hbReadsLst[1]
-		}
-
-		if len(lbReadsLst) > 0 {
-			if len(lbReadsLst) != 2 {
-				color.Red("lbReads is supposed to be in the form fwdReads,revReads")
-				return
-			}
-			lbFwdReads = lbReadsLst[0]
-			lbRevReads = lbReadsLst[1]
-		}
 
 		// ========================================== Get bulk depths =============================================== //
 		if len(bulksDepth) > 0 {
@@ -307,7 +360,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		a_config := utils.AnalysisConfig{
-			VCF: variant,
+			VCF: vcfFile,
 
 			HighParFwdReads: hpFwdReads,
 			HighParRevReads: hpRevReads,
@@ -381,6 +434,7 @@ func Execute() {
 
 func init() {
 	// ---------------------------------------- Input files ----------------------------------------------------- //
+	rootCmd.Flags().StringP("config", "c", "", "Config file path")
 	rootCmd.Flags().StringP("variant", "V", "", "Variant File")
 	rootCmd.Flags().StringP("parents", "P", ",", "parent names (hp,lp)")
 	rootCmd.Flags().StringP("bulks", "B", ",", "bulk names (hb,lb)")
@@ -441,7 +495,7 @@ func init() {
 	rootCmd.Flags().String("deepvariant-version", "1.10.0", "DeepVariant version")
 	rootCmd.Flags().String("model-type", "WGS", "DeepVariant Model Type: WGS,WES,PACBIO,ONT_R104,HYBRID_PACBIO_ILLUMINA")
 	rootCmd.Flags().BoolP("verbose", "v", false, "Verbose")
-	
+
 	rootCmd.Flags().IntP("threads", "t", 4, "Number of threads")
 
 }
