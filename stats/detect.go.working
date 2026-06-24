@@ -129,22 +129,20 @@ func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaTy
 		})
 	}
 
-	// FIX 3: tier-aware run-state machine with short-gap bridging.
-	// activeRun accumulates variants in the current contiguous run. Short
-	// non-significant dips are bridged so a single visible peak is not split
-	// into multiple QTLs, and runs shorter than the noise floor are dropped.
+	// FIX 3: tier-aware run-state machine.
+	// activeRun accumulates variants in the current contiguous significant run.
+	// activeTier tracks whether it is a "P99" or "P95" run so that a tier change
+	// (P99 → P95 or vice versa) correctly terminates the previous run.
+	// activeNames records the union of statistic names seen during the run.
 	type runState struct {
-		variants   []SmoothedStats
-		names      []string
-		tier       string
-		gapCounter int
+		variants []SmoothedStats
+		names    []string
+		tier     string
 	}
-	const directMaxGaps = 3
-	const directMinVariants = 5
 	var active *runState
 
 	flush := func() {
-		if active != nil && len(active.variants) >= directMinVariants {
+		if active != nil && len(active.variants) > 0 {
 			flushDirectRun(active.variants, active.names, active.tier)
 		}
 		active = nil
@@ -237,13 +235,8 @@ func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaTy
 		chromBreak := i == len(smoothed)-1 || smoothed[i+1].CHROM != s.CHROM
 
 		if thisTier == "" {
-			// Non-significant variant: bridge a short gap; otherwise close the run.
-			if active != nil && active.gapCounter < directMaxGaps {
-				active.variants = append(active.variants, s)
-				active.gapCounter++
-			} else {
-				flush()
-			}
+			// Non-significant variant: close any open run.
+			flush()
 		} else {
 			// Significant variant.
 			if active != nil && active.tier != thisTier {
@@ -254,7 +247,6 @@ func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaTy
 				active = &runState{tier: thisTier}
 			}
 			active.variants = append(active.variants, s)
-			active.gapCounter = 0
 			// Accumulate statistic names (deduplicated by the receiver).
 			active.names = append(active.names, theseNames...)
 		}
@@ -300,42 +292,13 @@ func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaTy
 		if len(pool) == 0 {
 			continue
 		}
-
-		// Merge overlapping or directly adjacent runs on the same chromosome so
-		// distinct QTL regions are counted once even if the same peak is split
-		// into multiple threshold-crossing runs.
-		sort.Slice(pool, func(i, j int) bool {
-			if pool[i].Start == pool[j].Start {
-				return pool[i].Stop < pool[j].Stop
-			}
-			return pool[i].Start < pool[j].Start
-		})
-
-		mergedPool := make([]DirectQTLRecord, 0, len(pool))
-		current := pool[0]
+		best := pool[0]
 		for _, r := range pool[1:] {
-			if r.Start <= current.Stop+1 {
-				if r.Stop > current.Stop {
-					current.Stop = r.Stop
-				}
-				if math.Abs(r.ZPeak) > math.Abs(current.ZPeak) {
-					current.ZPeak = r.ZPeak
-					current.PeakPos = r.PeakPos
-				}
-				continue
-			}
-			mergedPool = append(mergedPool, current)
-			current = r
-		}
-		mergedPool = append(mergedPool, current)
-
-		best := mergedPool[0]
-		for _, r := range mergedPool[1:] {
 			if math.Abs(r.ZPeak) > math.Abs(best.ZPeak) {
 				best = r
 			}
 		}
-		best.NQTLs = len(mergedPool)
+		best.NQTLs = len(pool)
 		finalRecords = append(finalRecords, best)
 	}
 
@@ -362,8 +325,8 @@ func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaTy
 	return nil
 }
 
-// DetectQTLs scans for regions where |CompositeZ| or |MaxAbsZ| exceeds the
-// empirical MC threshold using a four-tier fallback hierarchy per chromosome:
+// DetectQTLs scans for regions where CompositeZ or MaxAbsZ exceeds the
+// empirical MC upper-tail threshold using a four-tier fallback hierarchy per chromosome:
 //
 //  1. CompositeZ  ≥ P99
 //  2. CompositeZ  ≥ P95
@@ -408,18 +371,54 @@ func DetectQTLs(smoothed []SmoothedStats, thresh []Thresholds, bsaType string, c
 			continue
 		}
 
-		chrQTLs, calledStat, calledThresh := selectChromQTLPool(variants, chromThresholds)
+		var chrQTLs []QTLRecord
+		calledStat := ""
+		calledThresh := ""
+
+		// Hierarchy Tier 1: Stouffer (CompositeZ) P99
+		chrQTLs = findZSegments(variants, chromThresholds, true, func(t Thresholds) float64 { return t.Z.CompositeZP99 })
+		if len(chrQTLs) > 0 {
+			calledStat = "Stouffer"
+			calledThresh = "P99"
+		} else {
+			// Hierarchy Tier 2: Stouffer (CompositeZ) P95
+			chrQTLs = findZSegments(variants, chromThresholds, true, func(t Thresholds) float64 { return t.Z.CompositeZP95 })
+			if len(chrQTLs) > 0 {
+				calledStat = "Stouffer"
+				calledThresh = "P95"
+			} else {
+				// Hierarchy Tier 3: MaxAbsZ P99
+				chrQTLs = findZSegments(variants, chromThresholds, false, func(t Thresholds) float64 { return t.Z.ZP99 })
+				if len(chrQTLs) > 0 {
+					calledStat = "MaxAbsZ"
+					calledThresh = "P99"
+				} else {
+					// Hierarchy Tier 4: MaxAbsZ P95
+					chrQTLs = findZSegments(variants, chromThresholds, false, func(t Thresholds) float64 { return t.Z.ZP95 })
+					if len(chrQTLs) > 0 {
+						calledStat = "MaxAbsZ"
+						calledThresh = "P95"
+					}
+				}
+			}
+		}
 
 		if len(chrQTLs) == 0 {
 			continue
 		}
 
-		// Retain only the single run with the highest absolute peak or valley
-		// magnitude on the chromosome; record the full pool size in N_QTLS.
-		best := selectBestQTL(chrQTLs)
+		// Retain only the single run with the highest |PeakVal|; record the
+		// total count for the N_QTLS column.
+		nQTLs := len(chrQTLs)
+		best := chrQTLs[0]
+		for _, q := range chrQTLs[1:] {
+			if math.Abs(q.PeakVal) > math.Abs(best.PeakVal) {
+				best = q
+			}
+		}
 		best.Stat = calledStat
 		best.Threshold = calledThresh
-		best.NQTLs = len(chrQTLs)
+		best.NQTLs = nQTLs
 		allQTLs = append(allQTLs, best)
 	}
 
@@ -447,95 +446,42 @@ func DetectQTLs(smoothed []SmoothedStats, thresh []Thresholds, bsaType string, c
 
 // findZSegments returns all contiguous runs of variants whose score
 // (CompositeZ when useComposite=true, MaxAbsZ otherwise) meets or exceeds
-// the per-variant cutoff derived from thresholds.
-//
-// CompositeZ is always ≥ 0 after the |ZDeltaSI| / |ZAFDev| change in
-// consolidate(), so a simple score >= cutoff is a correct one-tailed test.
-// MaxAbsZ is also always ≥ 0 by construction, so the same comparison applies.
-//
-//	func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposite bool, cutoffFn func(Thresholds) float64) []QTLRecord {
-//		var records []QTLRecord
-//		var currentRun []SmoothedStats
-//
-//		appendRun := func() {
-//			if len(currentRun) == 0 {
-//				return
-//			}
-//			start := currentRun[0].POS
-//			stop := currentRun[len(currentRun)-1].POS
-//
-//			var peakPos int64
-//			var peakVal float64
-//
-//			for _, v := range currentRun {
-//				val := v.MaxAbsZ
-//				if useComposite {
-//					val = v.CompositeZ
-//				}
-//				if val > peakVal {
-//					peakVal = val
-//					peakPos = v.POS
-//				}
-//			}
-//
-//			records = append(records, QTLRecord{
-//				Chrom:   currentRun[0].CHROM,
-//				Start:   start,
-//				Stop:    stop,
-//				PeakPos: peakPos,
-//				PeakVal: peakVal,
-//			})
-//			currentRun = nil
-//		}
-//
-//		for i, v := range variants {
-//			score := v.MaxAbsZ
-//			if useComposite {
-//				score = v.CompositeZ
-//			}
-//
-//			if score >= cutoffFn(thresholds[i]) {
-//				currentRun = append(currentRun, v)
-//			} else {
-//				appendRun()
-//			}
-//		}
-//		appendRun()
-//
-//		return records
-//	}
-//
-// findZSegments returns all contiguous runs of variants whose score
-// (CompositeZ when useComposite=true, MaxAbsZ otherwise) meets or exceeds
-// the per-variant cutoff derived from thresholds.
-//
-// Bridges micro-gaps and filters single-variant noise peaks to align
-// reported metrics precisely with the visual plot tracks.
+// the per-variant upper-tail cutoff derived from thresholds.
 func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposite bool, cutoffFn func(Thresholds) float64) []QTLRecord {
 	var records []QTLRecord
 	var currentRun []SmoothedStats
 
-	const maxGaps = 3
-	const minVariants = 5
-	gapCounter := 0
-
 	appendRun := func() {
-		if len(currentRun) < minVariants {
-			currentRun = nil
-			gapCounter = 0
+		if len(currentRun) == 0 {
 			return
 		}
+		start := currentRun[0].POS
+		stop := currentRun[len(currentRun)-1].POS
 
-		peakPos, peakVal := peakPosition(currentRun, useComposite)
+		var peakPos int64
+		var peakVal float64
+		maxAbs := -1.0
+
+		for _, v := range currentRun {
+			val := v.MaxAbsZ
+			if useComposite {
+				val = v.CompositeZ
+			}
+			if math.Abs(val) > maxAbs {
+				maxAbs = math.Abs(val)
+				peakPos = v.POS
+				peakVal = val
+			}
+		}
+
 		records = append(records, QTLRecord{
 			Chrom:   currentRun[0].CHROM,
-			Start:   currentRun[0].POS,
-			Stop:    currentRun[len(currentRun)-1].POS,
+			Start:   start,
+			Stop:    stop,
 			PeakPos: peakPos,
 			PeakVal: peakVal,
 		})
 		currentRun = nil
-		gapCounter = 0
 	}
 
 	for i, v := range variants {
@@ -544,13 +490,16 @@ func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposi
 			score = v.CompositeZ
 		}
 
-		if score >= cutoffFn(thresholds[i]) {
-			currentRun = append(currentRun, v)
-			gapCounter = 0
-		} else if len(currentRun) > 0 {
-			if gapCounter < maxGaps {
+		cutoff := cutoffFn(thresholds[i])
+		if useComposite {
+			if score >= cutoff {
 				currentRun = append(currentRun, v)
-				gapCounter++
+			} else {
+				appendRun()
+			}
+		} else {
+			if math.Abs(score) >= cutoff {
+				currentRun = append(currentRun, v)
 			} else {
 				appendRun()
 			}
@@ -559,68 +508,6 @@ func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposi
 	appendRun()
 
 	return records
-}
-
-func peakPosition(variants []SmoothedStats, useComposite bool) (int64, float64) {
-	var peakPos int64
-	var peakVal float64
-	maxAbs := -1.0
-	for _, v := range variants {
-		val := v.MaxAbsZ
-		if useComposite {
-			val = v.CompositeZ
-		}
-		if math.Abs(val) > maxAbs {
-			maxAbs = math.Abs(val)
-			peakVal = val
-			peakPos = v.POS
-		}
-	}
-	return peakPos, peakVal
-}
-
-func selectChromQTLPool(variants []SmoothedStats, thresholds []Thresholds) ([]QTLRecord, string, string) {
-	// When a chromosome has any P99-significant run, lower-tier P95 regions are
-	// ignored entirely so the final count and representative interval reflect the
-	// strongest tier only.
-	if chrQTLs := findZSegments(variants, thresholds, true, func(t Thresholds) float64 { return t.Z.CompositeZP99 }); len(chrQTLs) > 0 {
-		for i := range chrQTLs {
-			chrQTLs[i].NQTLs = len(chrQTLs)
-		}
-		return chrQTLs, "Stouffer", "P99"
-	}
-	if chrQTLs := findZSegments(variants, thresholds, true, func(t Thresholds) float64 { return t.Z.CompositeZP95 }); len(chrQTLs) > 0 {
-		for i := range chrQTLs {
-			chrQTLs[i].NQTLs = len(chrQTLs)
-		}
-		return chrQTLs, "Stouffer", "P95"
-	}
-	if chrQTLs := findZSegments(variants, thresholds, false, func(t Thresholds) float64 { return t.Z.ZP99 }); len(chrQTLs) > 0 {
-		for i := range chrQTLs {
-			chrQTLs[i].NQTLs = len(chrQTLs)
-		}
-		return chrQTLs, "MaxAbsZ", "P99"
-	}
-	if chrQTLs := findZSegments(variants, thresholds, false, func(t Thresholds) float64 { return t.Z.ZP95 }); len(chrQTLs) > 0 {
-		for i := range chrQTLs {
-			chrQTLs[i].NQTLs = len(chrQTLs)
-		}
-		return chrQTLs, "MaxAbsZ", "P95"
-	}
-	return nil, "", ""
-}
-
-func selectBestQTL(records []QTLRecord) QTLRecord {
-	if len(records) == 0 {
-		return QTLRecord{}
-	}
-	best := records[0]
-	for _, q := range records[1:] {
-		if math.Abs(q.PeakVal) > math.Abs(best.PeakVal) {
-			best = q
-		}
-	}
-	return best
 }
 
 // ── Merging ───────────────────────────────────────────────────────────────────

@@ -52,7 +52,9 @@ type OneBulkThresholds struct {
 
 type ZThresholds struct {
 	ZP99, ZP95                   float64
+	ZN99, ZN95                   float64
 	CompositeZP99, CompositeZP95 float64
+	CompositeZN99, CompositeZN95 float64
 	NumStats                     int
 }
 
@@ -327,14 +329,18 @@ func simulateOneBulkCached(p simParams) OneBulkThresholds {
 // ── Empirical Z thresholds ───────────────────────────────────────────────────
 
 // empiricalZThresholds is the fallback used when calculateEmpiricalCompositeZThresholds
-// fails.  It uses standard-normal quantiles (2.576 / 1.960), which are a
-// reasonable approximation for high-depth, F2/RIL populations.  The primary
-// path always runs the full Monte Carlo simulation.
+// fails.  It uses standard-normal upper-tail quantiles (2.576 / 1.960), which are
+// a reasonable approximation for symmetric, high-depth, F2/RIL populations but
+// will be anti-conservative when inter-statistic correlation is high.  The
+// primary path always runs the full Monte Carlo simulation.
 func empiricalZThresholds(bsaType string) ZThresholds {
 	numStats := countZStats(bsaType)
 	return ZThresholds{
-		ZP99:          2.576, ZP95: 1.960,
+		ZP99: 2.576, ZP95: 1.960,
+		ZN99: -2.576, ZN95: -1.960,
+		// Lower-tail values are negative by definition of the N(0,1) distribution.
 		CompositeZP99: 2.576, CompositeZP95: 1.960,
+		CompositeZN99: -2.576, CompositeZN95: -1.960,
 		NumStats: numStats,
 	}
 }
@@ -472,12 +478,13 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 		lSI := lAlt / float64(p.repDepth)
 
 		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
-		//   col 0: |DeltaSI|  (|ZDeltaSI|) — absolute value mirrors consolidate()
-		//   col 1: Gstat      (ZGstat)
-		//   col 2: LOD        (ZLOD)
-		// Using |DeltaSI| ensures all three components are non-negative, producing
-		// a symmetric null so a single upper-tail threshold is correct and complete.
-		mat[i*k+0] = math.Abs(hSI - lSI)
+		//   col 0: DeltaSI  (ZDeltaSI)
+		//   col 1: Gstat    (ZGstat)
+		//   col 2: LOD      (ZLOD)
+		// HighSI, LowSI, ED4, and BBLogBF are excluded from CompositeZ in
+		// consolidate() and must not appear here — they would overwrite valid
+		// columns and cause an index-out-of-range panic (k=3, not 7).
+		mat[i*k+0] = hSI - lSI
 		mat[i*k+1] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
 		mat[i*k+2] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
 	}
@@ -485,10 +492,14 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 	// Step 4: robust-Z normalise columns (mirrors genome-wide normalise()).
 	robustZNormCols(mat, p.rep, k)
 
-	// Step 5: Stouffer combine.
+	// Step 5: Stouffer combine using one-sided positive tails.
+	// The signed DeltaSI component is converted to its absolute Z before
+	// the sum so that CompositeZ is always non-negative and thresholding
+	// can use the upper-tail P99/P95 cutoff directly.
 	nullCompositeZ := make([]float64, p.rep)
 	sqrtK := math.Sqrt(float64(k))
 	for i := 0; i < p.rep; i++ {
+		mat[i*k+0] = math.Abs(mat[i*k+0])
 		sum := 0.0
 		for j := 0; j < k; j++ {
 			sum += mat[i*k+j]
@@ -542,12 +553,13 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 		si := altF / float64(p.repDepth)
 
 		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
-		//   col 0: |AFDev|       (|ZAFDev|) — absolute value mirrors consolidate()
+		//   col 0: AFDev         (ZAFDev)
 		//   col 1: OneBulkGstat  (ZOneBulkG)
 		//   col 2: OneBulkLOD    (ZOneBulkLOD)
-		// Using |AFDev| ensures all three components are non-negative, producing
-		// a symmetric null so a single upper-tail threshold is correct and complete.
-		mat[i*k+0] = math.Abs(si - p.p0) // |AFDev|
+		// The leading SI column and OneBulkBBLogBF are excluded from CompositeZ in
+		// consolidate() and must not appear here. The old `siCols = k-4` formula
+		// produced -1 when k=3, causing a negative-index panic on the first write.
+		mat[i*k+0] = si - p.p0 // AFDev
 		mat[i*k+1] = oneBulkGStatistic(alt, ref, p.p0)
 		mat[i*k+2] = oneBulkLOD(alt, ref, p.p0)
 	}
@@ -558,6 +570,7 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 	nullCompositeZ := make([]float64, p.rep)
 	sqrtK := math.Sqrt(float64(k))
 	for i := 0; i < p.rep; i++ {
+		mat[i*k+0] = math.Abs(mat[i*k+0])
 		sum := 0.0
 		for j := 0; j < k; j++ {
 			sum += mat[i*k+j]
@@ -569,9 +582,9 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 
 // calculateEmpiricalCompositeZThresholds computes empirical CompositeZ thresholds
 // by running the full two-stage pipeline null through simulateNullCompositeZTwoBulk
-// or simulateNullCompositeZOneBulk.  Both the upper and lower tails are derived
-// directly from the simulated distribution so they are valid even for asymmetric
-// nulls (e.g. backcross populations where p0 ≠ 0.5).
+// or simulateNullCompositeZOneBulk.  Only the upper-tail positive thresholds are
+// used for QTL detection, so the simulation is calibrated to the same one-sided
+// definition of CompositeZ used in consolidate().
 func calculateEmpiricalCompositeZThresholds(
 	cfg utils.AnalysisConfig,
 	bsaType string,
@@ -658,18 +671,19 @@ func calculateEmpiricalCompositeZThresholds(
 
 	sort.Float64s(allNullCompositeZ)
 
-	// CompositeZ is now always ≥ 0 (all components are non-negative after using
-	// |ZDeltaSI| / |ZAFDev| in consolidate()).  The null distribution is therefore
-	// one-sided, so we take the 99th and 95th percentiles directly rather than
-	// the 99.5th / 97.5th that a two-tailed test would require.
-	czP99 := r6(stat.Quantile(0.99, stat.Empirical, allNullCompositeZ, nil))
+	// Use only the upper-tail positive thresholds for one-sided QTL calls.
+	czP99 := r6(stat.Quantile(0.995, stat.Empirical, allNullCompositeZ, nil))
 	czP95 := r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil))
 
 	return ZThresholds{
 		ZP99:          2.576, // Retain theoretical for individual per-stat Z-scores
 		ZP95:          1.960,
+		ZN99:          0,
+		ZN95:          0,
 		CompositeZP99: czP99,
 		CompositeZP95: czP95,
+		CompositeZN99: 0,
+		CompositeZN95: 0,
 		NumStats:      numStats,
 	}, nil
 }
@@ -940,8 +954,8 @@ func writeThresholdsTSV(
 		)
 	}
 	header = append(header,
-		"Z_P99", "Z_P95",
-		"CompositeZ_P99", "CompositeZ_P95",
+		"Z_P99", "Z_P95", "Z_N99", "Z_N95",
+		"CompositeZ_P99", "CompositeZ_P95", "CompositeZ_N99", "CompositeZ_N95",
 	)
 
 	if err := w.Write(header); err != nil {
@@ -983,8 +997,8 @@ func writeThresholdsTSV(
 
 		z := t.Z
 		row = append(row,
-			f4(z.ZP99), f4(z.ZP95),
-			f4(z.CompositeZP99), f4(z.CompositeZP95),
+			f4(z.ZP99), f4(z.ZP95), f4(z.ZN99), f4(z.ZN95),
+			f4(z.CompositeZP99), f4(z.CompositeZP95), f4(z.CompositeZN99), f4(z.CompositeZN95),
 		)
 
 		if err := w.Write(row); err != nil {

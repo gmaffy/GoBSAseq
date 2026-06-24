@@ -698,15 +698,13 @@ func createCompositeChart(
 
 	czP99 := czThresh.CompositeZP99
 	czP95 := czThresh.CompositeZP95
-	czN99 := czThresh.CompositeZN99
-	czN95 := czThresh.CompositeZN95
 
 	title := chrom + " — Composite Signal"
 	subtitle := fmt.Sprintf(
 		"Stouffer CompositeZ (ΔSI + G-stat + LOD, k=%d) and max |Z| envelope. "+
-			"Dashed lines: empirical MC p99 (%.3f / %.3f) and p95 (%.3f / %.3f). "+
+			"Dashed lines: empirical MC upper-tail p99 (%.3f) and p95 (%.3f). "+
 			"Shaded bands: BRM blocks.",
-		czThresh.NumStats, czP99, czN99, czP95, czN95,
+		czThresh.NumStats, czP99, czP95,
 	)
 
 	line := charts.NewLine()
@@ -714,9 +712,9 @@ func createCompositeChart(
 
 	// Embed the empirical threshold values into the JS tooltip so the reader
 	// sees "★ p99 significant" / "● p95 suggestive" relative to the actual MC
-	// thresholds, not the old hard-coded 3.0 / 2.0.
+	// upper-tail thresholds, not the old hard-coded 3.0 / 2.0.
 	tooltipJS := fmt.Sprintf(`function(params) {
-		var czP99 = %f, czP95 = %f, czN99 = %f, czN95 = %f;
+		var czP99 = %f, czP95 = %f;
 		let pos = params[0].axisValue;
 		let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
 		let result = '<strong>' + posStr + '</strong><br/>';
@@ -725,13 +723,13 @@ func createCompositeChart(
 			if (isNaN(val)) return;
 			let sig = '';
 			if (item.seriesName === 'CompositeZ' || item.seriesName === 'MaxAbsZ') {
-				if (val >= czP99 || val <= czN99)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99 significant</span>';
-				else if (val >= czP95 || val <= czN95) sig = ' <span style="color:#f39c12">● p95 suggestive</span>';
+				if (val >= czP99)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99 significant</span>';
+				else if (val >= czP95) sig = ' <span style="color:#f39c12">● p95 suggestive</span>';
 			}
 			result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
 		});
 		return result;
-	}`, czP99, czP95, czN99, czN95)
+	}`, czP99, czP95)
 
 	line.SetGlobalOptions(
 		charts.WithTooltipOpts(opts.Tooltip{
@@ -760,8 +758,6 @@ func createCompositeChart(
 
 	p99Label := fmt.Sprintf("p99 (%.3f)", czP99)
 	p95Label := fmt.Sprintf("p95 (%.3f)", czP95)
-	n99Label := fmt.Sprintf("p99 (%.3f)", czN99)
-	n95Label := fmt.Sprintf("p95 (%.3f)", czN95)
 
 	line.SetXAxis(positionLabels(x)).
 		AddSeries("CompositeZ", floatSliceToLineData(compositeZ), compositeOpts...).
@@ -775,14 +771,6 @@ func createCompositeChart(
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		).
 		AddSeries(p99Label, mkRef(czP99),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries(n95Label, mkRef(czN95),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries(n99Label, mkRef(czN99),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 		)

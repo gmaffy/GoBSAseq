@@ -94,9 +94,10 @@ type SmoothedStats struct {
 	ZOneBulkBBLogBF float64
 
 	// ── consolidated scores ──────────────────────────────────────────────
-	// Stouffer's Z: (|ZDeltaSI| + ZGstat + ZLOD) / √k — always ≥ 0.
-	// Direction is handled by the individual-stat tracks; CompositeZ
-	// measures signal strength only, enabling a single upper-tail threshold.
+	// CompositeZ is a one-sided, positive summary of evidence: the signed
+	// DeltaSI/AFDev components are converted to absolute Z before Stouffer's
+	// combination, so both tails of the original contrast are collapsed into a
+	// single positive signal for QTL thresholding.
 	CompositeZ float64
 	// max|Z| across all valid statistics (unsigned)
 	MaxAbsZ float64
@@ -454,17 +455,8 @@ func medianOf(vals []float64) float64 {
 //
 // CompositeZ combines only a minimal, low-redundancy set of Z-scores:
 //
-//	Two-bulk: |ZDeltaSI| + ZGstat + ZLOD  (k = 3)
-//	One-bulk: |ZAFDev|  + ZOneBulkG + ZOneBulkLOD  (k = 3)
-//
-// |ZDeltaSI| / |ZAFDev| are used rather than the signed values because
-// ZGstat and ZLOD are always ≥ 0 (they measure magnitude of allele frequency
-// separation, not direction).  Using the signed ΔSI with unsigned statistics
-// produces a right-skewed null under H0, requiring a two-tailed threshold.
-// Taking |ZDeltaSI| makes all three components non-negative and the null
-// symmetric around zero, so a single upper-tail threshold is both correct
-// and sufficient.  Direction is fully captured by the individual-stat tracks
-// (ZDeltaSI / ZAFDev retain their signs there).
+//	Two-bulk: ZDeltaSI + ZGstat + ZLOD  (k = 3)
+//	One-bulk: ZAFDev  + ZOneBulkG + ZOneBulkLOD  (k = 3)
 //
 // Excluded and why:
 //   - ZHighSI / ZLowSI — subsumed by ZDeltaSI (which is their difference);
@@ -495,12 +487,13 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 		// ── CompositeZ: minimal non-redundant subset ─────────────────────────
 		var czs []float64
 		if hasBothBulks {
-			// |ZDeltaSI| folds both tails into a single positive signal-strength
-			// score, matching the always-positive ZGstat and ZLOD components so
-			// the Stouffer sum and its null distribution are symmetric.
+			// ΔSI is signed by design, but QTL calls are one-sided and positive,
+			// so we use |ZΔSI| in the composite score to avoid cancelling evidence
+			// from opposite tails.
 			czs = append(czs, math.Abs(s.ZDeltaSI), s.ZGstat, s.ZLOD)
 		}
 		if hasOneBulk {
+			// AFDev is also signed; use its absolute value for the same reason.
 			czs = append(czs, math.Abs(s.ZAFDev), s.ZOneBulkG, s.ZOneBulkLOD)
 		}
 
