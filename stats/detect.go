@@ -17,9 +17,9 @@ type QTLRecord struct {
 	Stop      int64
 	PeakPos   int64
 	PeakVal   float64
-	Stat      string // "Stouffer" or "MaxAbsZ"
-	Threshold string // "P99" or "P95"
-	NQTLs     int    // total runs found above the selected threshold tier on this chromosome
+	Stat      string
+	Threshold string
+	NQTLs     int
 }
 
 type DirectQTLRecord struct {
@@ -30,30 +30,20 @@ type DirectQTLRecord struct {
 	ZPeak      float64
 	Statistics string
 	Threshold  string
-	NQTLs      int // total runs found above the selected threshold tier on this chromosome
+	NQTLs      int
 }
 
-// MergedQTL is a unified QTL record that may originate from CompositeZ
-// detection, BRM block detection, or both.  When both methods agree on a
-// chromosome the intervals are unioned and both peak values are recorded.
 type MergedQTL struct {
 	Chrom string
 	Start int64
 	Stop  int64
-
-	// CompositeZ peak (from DetectQTLs); math.NaN() when absent.
 	ZPeak float64
-	// BRM peak delta-SI / AF-deviation (from RunBRM); math.NaN() when absent.
 	BRMPeak float64
-	// BRM significance threshold at the peak position; math.NaN() when absent.
 	BRMThreshold float64
-
-	// Source summarises which method(s) contributed.
-	// Values: "ZScore", "BRM", "ZScore+BRM"
 	Source string
 }
 
-// geneSpaceRegion satisfies the GeneSpaceInterval interface in genespace.go.
+
 func (m MergedQTL) geneSpaceRegion() (string, int, int) {
 	return m.Chrom, int(m.Start), int(m.Stop)
 }
@@ -64,27 +54,6 @@ const (
 	//zSugg = 2.0 // ~p95 equivalent — suggestive
 )
 
-// DetectQTLsWithMCDirect scans each smoothed variant against its per-variant
-// Monte Carlo thresholds and emits contiguous runs of significant windows as
-// DirectQTLRecord entries, written to a TSV.
-//
-// Per chromosome, only the single run with the highest |ZPeak| is retained.
-// When both P99 and P95 runs exist on a chromosome the P99 pool is used
-// (matching the composite hierarchy).  N_QTLS records how many runs existed
-// in the selected pool before filtering.
-//
-// Fixes applied vs the original:
-//  1. bsaType detection replaced with BulkFlags() — consistent with all other
-//     callers in the package.
-//  2. Dangling orphaned code block after the closed hasOneBulk scope removed;
-//     duplicate checks and non-existent field names (ob.GstatP99 etc.) fixed to
-//     use the correct OneBulkThresholds field names.
-//  3. Run-flushing logic rewritten: the previous code only flushed a run when
-//     hitting the chromosome boundary, silently dropping every run that ended
-//     mid-chromosome.  A tier-aware state machine now correctly flushes on any
-//     break in significance or tier change.
-//  4. os.MkdirAll added before os.Create so the output directory is guaranteed
-//     to exist.
 func DetectQTLsWithMCDirect(smoothed []SmoothedStats, thresh []Thresholds, bsaType string, cfg *utils.AnalysisConfig) error {
 	color.Cyan("--> Running direct single-statistic Monte Carlo evaluations...")
 
@@ -445,72 +414,6 @@ func DetectQTLs(smoothed []SmoothedStats, thresh []Thresholds, bsaType string, c
 	return allQTLs, nil
 }
 
-// findZSegments returns all contiguous runs of variants whose score
-// (CompositeZ when useComposite=true, MaxAbsZ otherwise) meets or exceeds
-// the per-variant cutoff derived from thresholds.
-//
-// CompositeZ is always ≥ 0 after the |ZDeltaSI| / |ZAFDev| change in
-// consolidate(), so a simple score >= cutoff is a correct one-tailed test.
-// MaxAbsZ is also always ≥ 0 by construction, so the same comparison applies.
-//
-//	func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposite bool, cutoffFn func(Thresholds) float64) []QTLRecord {
-//		var records []QTLRecord
-//		var currentRun []SmoothedStats
-//
-//		appendRun := func() {
-//			if len(currentRun) == 0 {
-//				return
-//			}
-//			start := currentRun[0].POS
-//			stop := currentRun[len(currentRun)-1].POS
-//
-//			var peakPos int64
-//			var peakVal float64
-//
-//			for _, v := range currentRun {
-//				val := v.MaxAbsZ
-//				if useComposite {
-//					val = v.CompositeZ
-//				}
-//				if val > peakVal {
-//					peakVal = val
-//					peakPos = v.POS
-//				}
-//			}
-//
-//			records = append(records, QTLRecord{
-//				Chrom:   currentRun[0].CHROM,
-//				Start:   start,
-//				Stop:    stop,
-//				PeakPos: peakPos,
-//				PeakVal: peakVal,
-//			})
-//			currentRun = nil
-//		}
-//
-//		for i, v := range variants {
-//			score := v.MaxAbsZ
-//			if useComposite {
-//				score = v.CompositeZ
-//			}
-//
-//			if score >= cutoffFn(thresholds[i]) {
-//				currentRun = append(currentRun, v)
-//			} else {
-//				appendRun()
-//			}
-//		}
-//		appendRun()
-//
-//		return records
-//	}
-//
-// findZSegments returns all contiguous runs of variants whose score
-// (CompositeZ when useComposite=true, MaxAbsZ otherwise) meets or exceeds
-// the per-variant cutoff derived from thresholds.
-//
-// Bridges micro-gaps and filters single-variant noise peaks to align
-// reported metrics precisely with the visual plot tracks.
 func findZSegments(variants []SmoothedStats, thresholds []Thresholds, useComposite bool, cutoffFn func(Thresholds) float64) []QTLRecord {
 	var records []QTLRecord
 	var currentRun []SmoothedStats

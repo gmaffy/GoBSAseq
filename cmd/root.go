@@ -441,7 +441,7 @@ func init() {
 	rootCmd.Flags().String("deepvariant-version", "1.10.0", "DeepVariant version")
 	rootCmd.Flags().String("model-type", "WGS", "DeepVariant Model Type: WGS,WES,PACBIO,ONT_R104,HYBRID_PACBIO_ILLUMINA")
 	rootCmd.Flags().BoolP("verbose", "v", false, "Verbose")
-	// threads is an int and retrieved with GetInt; use IntP for consistency
+	
 	rootCmd.Flags().IntP("threads", "t", 4, "Number of threads")
 
 }
