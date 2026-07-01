@@ -304,30 +304,31 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 6/10: Detecting QTLs from individual statistics ...\n")
 
-	err = stats.DetectQTLsWithMCDirect(smoothedStats, thresholds, btype, cfg)
+	individualQTLs, err := stats.DetectIndividualStatQTLs(smoothedStats, thresholds, btype, cfg)
 	if err != nil {
-		color.Yellow("Warning: MC-based QTL detection failed: %v", err)
+		return err
 	}
+	color.Green("Detected %d individual-stat QTLs", len(individualQTLs))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
 	// ---------------------------------------------- Detect QTLs --------------------------------------------------- //
-	qtls, err := stats.DetectQTLs(smoothedStats, thresholds, btype, cfg)
-	if err != nil {
-		return err
-	}
-	color.Green("Detected %d QTLs using empirical CompositeZ thresholds", len(qtls))
+	//qtls, err := stats.DetectQTLs(smoothedStats, thresholds, btype, cfg)
+	//if err != nil {
+	//	return err
+	//}
+	//color.Green("Detected %d QTLs using empirical CompositeZ thresholds", len(qtls))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 8/10: Merging QTLs and BRM blocks ...\n")
 
-	merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
-	if err != nil {
-		return err
-	}
-	color.Green("Merged intervals: %d", len(merged))
+	//merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
+	//if err != nil {
+	//	return err
+	//}
+	//color.Green("Merged intervals: %d", len(merged))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
@@ -343,10 +344,10 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 	color.Cyan("STEP 10/10: Gene space analysis ...")
 	// --------------------------------------------------- Gene Space ---------------------------------------------- //
-	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
-	if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
-		color.Red("Gene space analysis error: %v", err)
-	}
+	//hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
+	//if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
+	//	color.Red("Gene space analysis error: %v", err)
+	//}
 
 	return nil
 }
