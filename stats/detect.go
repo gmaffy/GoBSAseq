@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gmaffy/GoBSAseq/utils"
 )
@@ -139,110 +140,128 @@ func DetectIndividualStatQTLs(smoothed []SmoothedStats, thresholds []Thresholds,
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.individual_stats_qtls.tsv", bsaType))
 
-	var allQtls []QTL
-
 	// Group smoothed stats by chromosome
 	chromToStats := make(map[string][]SmoothedStats)
 	for _, s := range smoothed {
 		chromToStats[s.CHROM] = append(chromToStats[s.CHROM], s)
 	}
 
-	// Create a map from position to threshold index for this chromosome
-	// Since smoothed stats are already sorted, we can find the corresponding threshold
-	// by matching the index in the original smoothed slice
-	
-	// Process each chromosome
-	for chrom, chromStats := range chromToStats {
-		// Sort by position
-		sort.Slice(chromStats, func(i, j int) bool { return chromStats[i].POS < chromStats[j].POS })
+	// Build O(1) index: (CHROM, POS) → original slice index for threshold lookup.
+	type chromPos struct{ chrom string; pos int64 }
+	posToIdx := make(map[chromPos]int, len(smoothed))
+	for i, s := range smoothed {
+		posToIdx[chromPos{s.CHROM, s.POS}] = i
+	}
 
-		// Find the indices in the original smoothed slice that correspond to this chromosome
-		// For now, we'll use the first threshold for all variants on this chromosome
-		// This is a simplification - in a more complete implementation, we'd map each
-		// variant to its specific threshold
-		var chromThresholds []Thresholds
-		for _, s := range smoothed {
-			if s.CHROM == chrom {
-				// Find the index of this variant in the original smoothed slice
-				for i, orig := range smoothed {
-					if orig.CHROM == s.CHROM && orig.POS == s.POS {
-						chromThresholds = append(chromThresholds, thresholds[i])
-						break
+	// Sorted chromosome list for deterministic output order.
+	chroms := make([]string, 0, len(chromToStats))
+	for c := range chromToStats {
+		chroms = append(chroms, c)
+	}
+	sort.Strings(chroms)
+
+	// Process chromosomes concurrently.
+	type chromResult struct {
+		qtls []QTL
+		err  error
+	}
+	results := make([]chromResult, len(chroms))
+	var wg sync.WaitGroup
+	wg.Add(len(chroms))
+
+	for ci, chrom := range chroms {
+		go func(ci int, chrom string) {
+			defer wg.Done()
+
+			chromStats := chromToStats[chrom]
+			sort.Slice(chromStats, func(i, j int) bool { return chromStats[i].POS < chromStats[j].POS })
+
+			// Build per-chromosome thresholds via the O(1) map.
+			chromThresholds := make([]Thresholds, len(chromStats))
+			for i, s := range chromStats {
+				chromThresholds[i] = thresholds[posToIdx[chromPos{s.CHROM, s.POS}]]
+			}
+
+			positions := make([]int64, len(chromStats))
+			var qtls []QTL
+
+			// Two-bulk stats
+			if hasBothBulks {
+				for _, sf := range []struct {
+					name      string
+					getVal    func(SmoothedStats) float64
+					getThresh func(Thresholds) float64
+				}{
+					{"DeltaSI", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP95 }},
+					{"Gstat", func(s SmoothedStats) float64 { return s.SmGstat }, func(t Thresholds) float64 { return t.TwoBulk.GstatP95 }},
+					{"ED", func(s SmoothedStats) float64 { return s.SmED }, func(t Thresholds) float64 { return t.TwoBulk.ED4P95 }},
+					{"LOD", func(s SmoothedStats) float64 { return s.SmLOD }, func(t Thresholds) float64 { return t.TwoBulk.LODP95 }},
+					{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }},
+				} {
+					for i, s := range chromStats {
+						positions[i] = s.POS
 					}
+					thresh := make([]float64, len(chromStats))
+					for i, t := range chromThresholds {
+						thresh[i] = sf.getThresh(t)
+					}
+					statVals := make([]float64, len(chromStats))
+					for i, s := range chromStats {
+						statVals[i] = sf.getVal(s)
+					}
+					q, err := detectPeaks(chrom, positions, statVals, thresh)
+					if err != nil {
+						results[ci] = chromResult{err: err}
+						return
+					}
+					qtls = append(qtls, q...)
 				}
 			}
-		}
-		
-		positions := make([]int64, len(chromStats))
-		
-		// For two-bulk: use SmDeltaSI, SmGstat, SmED, SmLOD, SmBBLogBF
-		// For one-bulk: use SmAFDev, SmOneBulkG, SmOneBulkLOD, SmOneBulkBBLogBF
-		if hasBothBulks {
-			// Detect peaks for each stat
-			for _, statField := range []struct{ name string; getVal func(SmoothedStats) float64; getThresh func(Thresholds) float64 }{
-				{"DeltaSI", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP95 }},
-				{"Gstat", func(s SmoothedStats) float64 { return s.SmGstat }, func(t Thresholds) float64 { return t.TwoBulk.GstatP95 }},
-				{"ED", func(s SmoothedStats) float64 { return s.SmED }, func(t Thresholds) float64 { return t.TwoBulk.ED4P95 }},
-				{"LOD", func(s SmoothedStats) float64 { return s.SmLOD }, func(t Thresholds) float64 { return t.TwoBulk.LODP95 }},
-				{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }},
-			} {
-				for i, s := range chromStats {
-					positions[i] = s.POS
-				}
 
-				// Get threshold for this stat
-				thresh := make([]float64, len(chromStats))
-				for i, t := range chromThresholds {
-					thresh[i] = statField.getThresh(t)
+			// One-bulk stats
+			if hasOneBulk {
+				for _, sf := range []struct {
+					name      string
+					getVal    func(SmoothedStats) float64
+					getThresh func(Thresholds) float64
+				}{
+					{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }},
+					{"OneBulkG", func(s SmoothedStats) float64 { return s.SmOneBulkG }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP95 }},
+					{"OneBulkLOD", func(s SmoothedStats) float64 { return s.SmOneBulkLOD }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP95 }},
+					{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }},
+				} {
+					for i, s := range chromStats {
+						positions[i] = s.POS
+					}
+					thresh := make([]float64, len(chromStats))
+					for i, t := range chromThresholds {
+						thresh[i] = sf.getThresh(t)
+					}
+					statVals := make([]float64, len(chromStats))
+					for i, s := range chromStats {
+						statVals[i] = sf.getVal(s)
+					}
+					q, err := detectPeaks(chrom, positions, statVals, thresh)
+					if err != nil {
+						results[ci] = chromResult{err: err}
+						return
+					}
+					qtls = append(qtls, q...)
 				}
-
-				// Extract stat values
-				statVals := make([]float64, len(chromStats))
-				for i, s := range chromStats {
-					statVals[i] = statField.getVal(s)
-				}
-
-				// Detect peaks
-				qtls, err := detectPeaks(chrom, positions, statVals, thresh)
-				if err != nil {
-					return nil, err
-				}
-				allQtls = append(allQtls, qtls...)
 			}
+
+			results[ci] = chromResult{qtls: qtls}
+		}(ci, chrom)
+	}
+	wg.Wait()
+
+	// Collect results in chromosome order.
+	var allQtls []QTL
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
-
-		if hasOneBulk {
-			// Detect peaks for one-bulk stats
-			for _, statField := range []struct{ name string; getVal func(SmoothedStats) float64; getThresh func(Thresholds) float64 }{
-				{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }},
-				{"OneBulkG", func(s SmoothedStats) float64 { return s.SmOneBulkG }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP95 }},
-				{"OneBulkLOD", func(s SmoothedStats) float64 { return s.SmOneBulkLOD }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP95 }},
-				{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }},
-			} {
-				for i, s := range chromStats {
-					positions[i] = s.POS
-				}
-
-				// Get threshold for this stat
-				thresh := make([]float64, len(chromStats))
-				for i, t := range chromThresholds {
-					thresh[i] = statField.getThresh(t)
-				}
-
-				// Extract stat values
-				statVals := make([]float64, len(chromStats))
-				for i, s := range chromStats {
-					statVals[i] = statField.getVal(s)
-				}
-
-				// Detect peaks
-				qtls, err := detectPeaks(chrom, positions, statVals, thresh)
-				if err != nil {
-					return nil, err
-				}
-				allQtls = append(allQtls, qtls...)
-			}
-		}
+		allQtls = append(allQtls, r.qtls...)
 	}
 
 	// Write results
