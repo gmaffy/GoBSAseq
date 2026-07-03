@@ -207,7 +207,6 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	return peaks
 }
 
-// findPeaksWithFallback tries P99 threshold first, falls back to P95 if no peaks found
 func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, threshP95 func(Thresholds) float64, tail Tail, label string) []PeakIntersection {
 	p99Peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP99, tail)
 	if len(p99Peaks) > 0 {
@@ -215,7 +214,7 @@ func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds,
 		fmt.Println(p99Peaks)
 		return p99Peaks
 	}
-	
+
 	p95Peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP95, tail)
 	if len(p95Peaks) > 0 {
 		fmt.Printf("%-10s %-10s : %2d peaks\n", sm[0].CHROM, label, len(p95Peaks))
@@ -225,7 +224,8 @@ func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds,
 	return nil
 }
 
-func FindAllPeakIntersections(smoothed []SmoothedStats, thresholds []Thresholds, hasBothBulks bool, hasOneBulk bool) ([]PeakIntersection, []ConsolidatedQTL) {
+func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) ([]PeakIntersection, []ConsolidatedQTL) {
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
 	var peaks []PeakIntersection
 	var qtls []ConsolidatedQTL
@@ -248,7 +248,7 @@ func FindAllPeakIntersections(smoothed []SmoothedStats, thresholds []Thresholds,
 		if hasBothBulks {
 			// Two-bulk statistics
 			statConfigs := []struct {
-				name   string
+				name    string
 				valueFn func(SmoothedStats) float64
 				p99     func(Thresholds) float64
 				p95     func(Thresholds) float64
@@ -274,7 +274,7 @@ func FindAllPeakIntersections(smoothed []SmoothedStats, thresholds []Thresholds,
 		if hasOneBulk {
 			// One-bulk statistics
 			oneBulkConfigs := []struct {
-				name   string
+				name    string
 				valueFn func(SmoothedStats) float64
 				p99     func(Thresholds) float64
 				p95     func(Thresholds) float64
@@ -295,16 +295,12 @@ func FindAllPeakIntersections(smoothed []SmoothedStats, thresholds []Thresholds,
 				}
 			}
 		}
-		
+
 		chrQTLs := ConsolidateQTLs(peaks)
 		qtls = append(qtls, chrQTLs...)
 	}
 
 	return peaks, qtls
-}
-
-func overlaps(a, b PeakIntersection) bool {
-	return a.Start <= b.End && b.Start <= a.End
 }
 
 func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
@@ -418,10 +414,9 @@ func ConsolidateQTLs(peaks []PeakIntersection) []ConsolidatedQTL {
 	return qtls
 }
 
-// WriteConsolidatedQTLToExcel writes the consolidated QTLs to an Excel file
-func WriteConsolidatedQTLToExcel(qtls []ConsolidatedQTL, filename string) error {
+func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, filename string) error {
 	f := excelize.NewFile()
-	
+
 	// Create header
 	header := []interface{}{
 		"Chrom", "Start", "End", "Threshold",
@@ -437,14 +432,14 @@ func WriteConsolidatedQTLToExcel(qtls []ConsolidatedQTL, filename string) error 
 		"OneBulkLOD_Pos", "OneBulkLOD_Value",
 		"OneBulkBBLogBF_Pos", "OneBulkBBLogBF_Value",
 	}
-	
+
 	// Write header to row 1
 	f.SetSheetRow("Sheet1", "A1", &header)
-	
+
 	// Write data rows
 	for rowIdx, qtl := range qtls {
 		row := rowIdx + 2 // Start from row 2 (after header)
-		
+
 		// Build row data
 		rowData := []interface{}{
 			qtl.Chrom,
@@ -452,7 +447,7 @@ func WriteConsolidatedQTLToExcel(qtls []ConsolidatedQTL, filename string) error 
 			qtl.End,
 			qtl.Threshold,
 		}
-		
+
 		// Helper to add peak data
 		addPeakData := func(peak *Peak) {
 			if peak != nil {
@@ -461,7 +456,7 @@ func WriteConsolidatedQTLToExcel(qtls []ConsolidatedQTL, filename string) error 
 				rowData = append(rowData, "", "")
 			}
 		}
-		
+
 		// Add all peak data in order
 		addPeakData(qtl.HighSI)
 		addPeakData(qtl.LowSI)
@@ -474,17 +469,16 @@ func WriteConsolidatedQTLToExcel(qtls []ConsolidatedQTL, filename string) error 
 		addPeakData(qtl.OneBulkG)
 		addPeakData(qtl.OneBulkLOD)
 		addPeakData(qtl.OneBulkBBLogBF)
-		
+
 		// Write the row
 		cell, _ := excelize.CoordinatesToCellName(1, row)
 		f.SetSheetRow("Sheet1", cell, &rowData)
 	}
-	
+
 	// Save the file
 	if err := f.SaveAs(filename); err != nil {
 		return fmt.Errorf("failed to save Excel file: %w", err)
 	}
-	
+
 	return nil
 }
-

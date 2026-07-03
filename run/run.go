@@ -308,8 +308,12 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	//if err != nil {
 	//	return err
 	//}
-	peaks := stats.FindAllPeakIntersections(smoothedStats, thresholds, true, false, false, false)
-	color.Green("Detected %d individual-stat QTLs", len(peaks))
+	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype)
+	err = stats.WriteIndividualQTLsToExcel(qtls, filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
+	if err != nil {
+		return err
+	}
+	color.Green("Detected %d individual-stat QTLs", len(qtls))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
