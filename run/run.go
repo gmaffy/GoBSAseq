@@ -304,13 +304,19 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 6/10: Detecting QTLs from individual statistics ...\n")
 
+	qtlDir := filepath.Join(cfg.OutputDir, "qtls")
+	if err := os.MkdirAll(qtlDir, 0775); err != nil {
+		return fmt.Errorf("failed to create qtls directory: %w", err)
+	}
+
 	//individualQTLs, err := stats.DetectIndividualStatQTLs(smoothedStats, thresholds, btype, cfg)
 	//if err != nil {
 	//	return err
 	//}
 	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype)
-	err = stats.WriteIndividualQTLsToExcel(qtls, filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
+	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
+		fmt.Printf("Error writing individual QTLs to Excel: %v\n", err)
 		return err
 	}
 	color.Green("Detected %d individual-stat QTLs", len(qtls))
@@ -318,22 +324,26 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
-	// ---------------------------------------------- Detect QTLs --------------------------------------------------- //
-	//qtls, err := stats.DetectQTLs(smoothedStats, thresholds, btype, cfg)
-	//if err != nil {
-	//	return err
-	//}
-	//color.Green("Detected %d QTLs using empirical CompositeZ thresholds", len(qtls))
+
+	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype)
+	err = stats.WriteCompositeZQTLsToExcel(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
+	if err != nil {
+		fmt.Printf("Error writing composite Z QTLs to Excel: %v\n", err)
+		return err
+	}
+	color.Green("Detected %d CompositeZ QTL peaks", len(compositePeaks))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 8/10: Merging QTLs and BRM blocks ...\n")
 
-	//merged, err := stats.MergeQTLsAndBRM(*cfg, btype, qtls, brmBlocks)
-	//if err != nil {
-	//	return err
-	//}
-	//color.Green("Merged intervals: %d", len(merged))
+	merged := stats.MergeCompositeBRM(compositePeaks, brmBlocks)
+	err = stats.WriteFinalQTLsToExcel(merged, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.final.qtl.xlsx", btype)))
+	if err != nil {
+		fmt.Printf("Error writing final QTLs to Excel: %v\n", err)
+		return err
+	}
+	color.Green("Merged intervals: %d", len(merged))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 

@@ -1,0 +1,588 @@
+package stats
+
+import (
+	"fmt"
+	"math"
+	"sort"
+
+	"github.com/xuri/excelize/v2"
+)
+
+type PeakIntersection struct {
+	Stat           string
+	Chrom          string
+	Start          float64
+	End            float64
+	PeakPos        int64
+	PeakValue      float64
+	Threshold      float64
+	ThresholdLevel string
+	StartIndex     int
+	EndIndex       int
+	PeakIndex      int
+}
+
+type Peak struct {
+	Pos   int64
+	Value float64
+}
+
+type ConsolidatedQTL struct {
+	Chrom     string
+	Start     float64
+	End       float64
+	Threshold string
+
+	DeltaSI *Peak
+	Gstat   *Peak
+	ED      *Peak
+	LOD     *Peak
+	BBLogBF *Peak
+
+	AFDev          *Peak
+	OneBulkG       *Peak
+	OneBulkLOD     *Peak
+	OneBulkBBLogBF *Peak
+}
+type Tail int
+
+const (
+	UpperTail Tail = iota
+	LowerTail
+)
+
+func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds []Thresholds, valueFn func(SmoothedStats) float64, threshFn func(Thresholds) float64, tail Tail) []PeakIntersection {
+
+	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
+		return nil
+	}
+
+	var threshSum float64
+	for _, t := range thresholds {
+		threshSum += threshFn(t)
+	}
+	avgThresh := threshSum / float64(len(thresholds))
+
+	var peaks []PeakIntersection
+
+	inPeak := false
+
+	var (
+		startPos   float64
+		startIndex int
+		peakPos    int64
+		peakValue  float64
+		peakThresh float64
+		peakIndex  int
+	)
+
+	for i := 0; i < len(smoothed)-1; i++ {
+
+		y1 := valueFn(smoothed[i])
+		y2 := valueFn(smoothed[i+1])
+
+		t1 := avgThresh
+		t2 := avgThresh
+
+		var d1, d2 float64
+
+		switch tail {
+		case UpperTail:
+			d1 = y1 - t1
+			d2 = y2 - t2
+
+		case LowerTail:
+			d1 = t1 - y1
+			d2 = t2 - y2
+		}
+
+		//--------------------------------------------------------
+		// Enter region
+		//--------------------------------------------------------
+		if !inPeak && d1 <= 0 && d2 > 0 {
+
+			f := d1 / (d1 - d2)
+
+			startPos = float64(smoothed[i].POS) +
+				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+
+			startIndex = i + 1
+
+			inPeak = true
+			peakPos = smoothed[i+1].POS
+			peakValue = y2
+			peakThresh = t2
+			peakIndex = i + 1
+
+			continue
+		}
+
+		if !inPeak {
+			continue
+		}
+
+		//--------------------------------------------------------
+		// Update best point
+		//--------------------------------------------------------
+		better := false
+
+		switch tail {
+		case UpperTail:
+			better = y2 > peakValue
+
+		case LowerTail:
+			better = y2 < peakValue
+		}
+
+		if better {
+			peakValue = y2
+			peakPos = smoothed[i+1].POS
+			peakThresh = t2
+			peakIndex = i + 1
+		}
+
+		//--------------------------------------------------------
+		// Leave region
+		//--------------------------------------------------------
+		if d1 > 0 && d2 <= 0 {
+
+			f := d1 / (d1 - d2)
+
+			endPos := float64(smoothed[i].POS) +
+				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+
+			peaks = append(peaks, PeakIntersection{
+				Stat:  statName,
+				Chrom: smoothed[i].CHROM,
+
+				Start: startPos,
+				End:   endPos,
+
+				PeakPos:   peakPos,
+				PeakValue: peakValue,
+				Threshold: peakThresh,
+
+				StartIndex: startIndex,
+				EndIndex:   i,
+				PeakIndex:  peakIndex,
+			})
+
+			inPeak = false
+		}
+	}
+
+	//--------------------------------------------------------
+	// Region continues to chromosome end
+	//--------------------------------------------------------
+	if inPeak {
+
+		last := len(smoothed) - 1
+
+		peaks = append(peaks, PeakIntersection{
+			Stat:  statName,
+			Chrom: smoothed[last].CHROM,
+
+			Start: startPos,
+			End:   float64(smoothed[last].POS),
+
+			PeakPos:   peakPos,
+			PeakValue: peakValue,
+			Threshold: peakThresh,
+
+			StartIndex: startIndex,
+			EndIndex:   last,
+			PeakIndex:  peakIndex,
+		})
+	}
+
+	return peaks
+}
+
+func normalizePeakChroms(peaks []PeakIntersection, chrom string) {
+	for i := range peaks {
+		peaks[i].Chrom = chrom
+	}
+}
+
+func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, threshP95 func(Thresholds) float64, tail Tail, label string) []PeakIntersection {
+	chrom := sm[0].CHROM
+
+	p99Peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP99, tail)
+	if len(p99Peaks) > 0 {
+		for i := range p99Peaks {
+			p99Peaks[i].ThresholdLevel = "p99"
+		}
+		normalizePeakChroms(p99Peaks, chrom)
+		fmt.Printf("%-10s %-10s : %2d peaks\n", chrom, label, len(p99Peaks))
+		fmt.Println(p99Peaks)
+		return p99Peaks
+	}
+
+	p95Peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP95, tail)
+	if len(p95Peaks) > 0 {
+		for i := range p95Peaks {
+			p95Peaks[i].ThresholdLevel = "p95"
+		}
+		normalizePeakChroms(p95Peaks, chrom)
+		fmt.Printf("%-10s %-10s : %2d peaks\n", chrom, label, len(p95Peaks))
+		fmt.Println(p95Peaks)
+		return p95Peaks
+	}
+	return nil
+}
+
+func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) ([]PeakIntersection, []ConsolidatedQTL) {
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	var peaks []PeakIntersection
+	var qtls []ConsolidatedQTL
+	byChr := make(map[string][]int)
+
+	for i := range smoothed {
+		byChr[smoothed[i].CHROM] = append(byChr[smoothed[i].CHROM], i)
+	}
+
+	for _, idx := range byChr {
+		var chrPeaks []PeakIntersection
+
+		sm := make([]SmoothedStats, len(idx))
+		th := make([]Thresholds, len(idx))
+
+		for i, j := range idx {
+			sm[i] = smoothed[j]
+			th[i] = thresholds[j]
+		}
+
+		if hasBothBulks {
+			// Two-bulk statistics
+			statConfigs := []struct {
+				name    string
+				valueFn func(SmoothedStats) float64
+				p99     func(Thresholds) float64
+				p95     func(Thresholds) float64
+				tail    Tail
+				label   string
+			}{
+				{"Gstat", func(s SmoothedStats) float64 { return s.SmGstat }, func(t Thresholds) float64 { return t.TwoBulk.GstatP99 }, func(t Thresholds) float64 { return t.TwoBulk.GstatP95 }, UpperTail, "Gstat"},
+				{"DeltaSI+", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP99 }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP95 }, UpperTail, "DeltaSI+"},
+				{"DeltaSI-", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIMp99 }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIMp95 }, LowerTail, "DeltaSI-"},
+				{"ED4", func(s SmoothedStats) float64 { return s.SmED }, func(t Thresholds) float64 { return t.TwoBulk.ED4P99 }, func(t Thresholds) float64 { return t.TwoBulk.ED4P95 }, UpperTail, "ED4"},
+				{"LOD", func(s SmoothedStats) float64 { return s.SmLOD }, func(t Thresholds) float64 { return t.TwoBulk.LODP99 }, func(t Thresholds) float64 { return t.TwoBulk.LODP95 }, UpperTail, "LOD"},
+				{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP99 }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }, UpperTail, "BBLogBF"},
+			}
+
+			for _, cfg := range statConfigs {
+				foundPeaks := findPeaksWithFallback(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.p95, cfg.tail, cfg.label)
+				if foundPeaks != nil {
+					chrPeaks = append(chrPeaks, foundPeaks...)
+				}
+			}
+		}
+
+		if hasOneBulk {
+			// One-bulk statistics
+			oneBulkConfigs := []struct {
+				name    string
+				valueFn func(SmoothedStats) float64
+				p99     func(Thresholds) float64
+				p95     func(Thresholds) float64
+				tail    Tail
+				label   string
+			}{
+				{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }, UpperTail, "AFDev"},
+				{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp95 }, LowerTail, "AFDev-"},
+				{"OneBulkGstat", func(s SmoothedStats) float64 { return s.SmOneBulkG }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP95 }, UpperTail, "OneBulkGstat"},
+				{"OneBulkLOD", func(s SmoothedStats) float64 { return s.SmOneBulkLOD }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP95 }, UpperTail, "OneBulkLOD"},
+				{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }, UpperTail, "OneBulkBBLogBF"},
+			}
+
+			for _, cfg := range oneBulkConfigs {
+				foundPeaks := findPeaksWithFallback(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.p95, cfg.tail, cfg.label)
+				if foundPeaks != nil {
+					chrPeaks = append(chrPeaks, foundPeaks...)
+				}
+			}
+		}
+
+		peaks = append(peaks, chrPeaks...)
+		chrQTLs := ConsolidateQTLs(chrPeaks)
+		qtls = append(qtls, chrQTLs...)
+	}
+
+	return peaks, qtls
+}
+
+func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
+	if p.ThresholdLevel == "p99" {
+		q.Threshold = "p99"
+	} else if q.Threshold != "p99" && p.ThresholdLevel == "p95" {
+		q.Threshold = "p95"
+	}
+
+	peak := &Peak{
+		Pos:   p.PeakPos,
+		Value: p.PeakValue,
+	}
+
+	switch p.Stat {
+
+	case "DeltaSI+", "DeltaSI-":
+		q.DeltaSI = peak
+
+	case "Gstat":
+		q.Gstat = peak
+
+	case "ED", "ED4":
+		q.ED = peak
+
+	case "LOD":
+		q.LOD = peak
+
+	case "BBLogBF":
+		q.BBLogBF = peak
+
+	case "AFDev", "AFDev+", "AFDev-":
+		q.AFDev = peak
+
+	case "OneBulkGstat":
+		q.OneBulkG = peak
+
+	case "OneBulkLOD":
+		q.OneBulkLOD = peak
+
+	case "OneBulkBBLogBF":
+		q.OneBulkBBLogBF = peak
+	}
+}
+
+func bpOverlap(startA, endA, startB, endB float64) bool {
+	a0 := int64(math.Round(math.Min(startA, endA)))
+	a1 := int64(math.Round(math.Max(startA, endA)))
+	b0 := int64(math.Round(math.Min(startB, endB)))
+	b1 := int64(math.Round(math.Max(startB, endB)))
+	return b0 <= a1 && b1 >= a0
+}
+
+func peaksOverlap(a, b PeakIntersection) bool {
+	return a.Chrom == b.Chrom && bpOverlap(a.Start, a.End, b.Start, b.End)
+}
+
+func qtlOverlap(a, b ConsolidatedQTL) bool {
+	return a.Chrom == b.Chrom && bpOverlap(a.Start, a.End, b.Start, b.End)
+}
+
+func mergeConsolidatedQTL(a, b ConsolidatedQTL) ConsolidatedQTL {
+	if b.Start < a.Start {
+		a.Start = b.Start
+	}
+	if b.End > a.End {
+		a.End = b.End
+	}
+	if b.Threshold == "p99" {
+		a.Threshold = "p99"
+	} else if a.Threshold != "p99" && b.Threshold == "p95" {
+		a.Threshold = "p95"
+	}
+
+	mergePeak := func(dst **Peak, src *Peak) {
+		if *dst == nil {
+			*dst = src
+		}
+	}
+	mergePeak(&a.DeltaSI, b.DeltaSI)
+	mergePeak(&a.Gstat, b.Gstat)
+	mergePeak(&a.ED, b.ED)
+	mergePeak(&a.LOD, b.LOD)
+	mergePeak(&a.BBLogBF, b.BBLogBF)
+	mergePeak(&a.AFDev, b.AFDev)
+	mergePeak(&a.OneBulkG, b.OneBulkG)
+	mergePeak(&a.OneBulkLOD, b.OneBulkLOD)
+	mergePeak(&a.OneBulkBBLogBF, b.OneBulkBBLogBF)
+
+	return a
+}
+
+func mergeConsolidatedQTLPass(qtls []ConsolidatedQTL) ([]ConsolidatedQTL, bool) {
+	if len(qtls) <= 1 {
+		return qtls, false
+	}
+
+	sorted := append([]ConsolidatedQTL(nil), qtls...)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Chrom != sorted[j].Chrom {
+			return sorted[i].Chrom < sorted[j].Chrom
+		}
+		if sorted[i].Start != sorted[j].Start {
+			return sorted[i].Start < sorted[j].Start
+		}
+		return sorted[i].End > sorted[j].End
+	})
+
+	out := make([]ConsolidatedQTL, 0, len(sorted))
+	current := sorted[0]
+	changed := false
+
+	for i := 1; i < len(sorted); i++ {
+		next := sorted[i]
+		if qtlOverlap(current, next) {
+			current = mergeConsolidatedQTL(current, next)
+			changed = true
+			continue
+		}
+		out = append(out, current)
+		current = next
+	}
+	out = append(out, current)
+
+	if len(out) < len(qtls) {
+		changed = true
+	}
+	return out, changed
+}
+
+func ConsolidateQTLs(peaks []PeakIntersection) []ConsolidatedQTL {
+
+	if len(peaks) == 0 {
+		return nil
+	}
+
+	sorted := append([]PeakIntersection(nil), peaks...)
+	sort.Slice(sorted, func(i, j int) bool {
+
+		if sorted[i].Chrom != sorted[j].Chrom {
+			return sorted[i].Chrom < sorted[j].Chrom
+		}
+
+		if sorted[i].Start != sorted[j].Start {
+			return sorted[i].Start < sorted[j].Start
+		}
+
+		return sorted[i].End > sorted[j].End
+	})
+
+	var qtls []ConsolidatedQTL
+
+	var current ConsolidatedQTL
+
+	for i, p := range sorted {
+
+		if i == 0 {
+
+			current = ConsolidatedQTL{
+				Chrom: p.Chrom,
+				Start: p.Start,
+				End:   p.End,
+			}
+
+			addEvidence(&current, p)
+			continue
+		}
+
+		if peaksOverlap(p, PeakIntersection{Chrom: current.Chrom, Start: current.Start, End: current.End}) {
+
+			if p.Start < current.Start {
+				current.Start = p.Start
+			}
+
+			if p.End > current.End {
+				current.End = p.End
+			}
+
+			addEvidence(&current, p)
+
+			continue
+		}
+
+		qtls = append(qtls, current)
+
+		current = ConsolidatedQTL{
+			Chrom: p.Chrom,
+			Start: p.Start,
+			End:   p.End,
+		}
+
+		addEvidence(&current, p)
+	}
+
+	qtls = append(qtls, current)
+
+	for {
+		next, changed := mergeConsolidatedQTLPass(qtls)
+		qtls = next
+		if !changed {
+			break
+		}
+	}
+
+	return qtls
+}
+
+func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename string) error {
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	f := excelize.NewFile()
+
+	header := []interface{}{"Chrom", "Start", "End", "Threshold"}
+	if hasBothBulks {
+		header = append(header,
+			"DeltaSI_Pos", "DeltaSI_Value",
+			"Gstat_Pos", "Gstat_Value",
+			"ED_Pos", "ED_Value",
+			"LOD_Pos", "LOD_Value",
+			"BBLogBF_Pos", "BBLogBF_Value",
+		)
+	}
+	if hasOneBulk {
+		header = append(header,
+			"AFDev_Pos", "AFDev_Value",
+			"OneBulkG_Pos", "OneBulkG_Value",
+			"OneBulkLOD_Pos", "OneBulkLOD_Value",
+			"OneBulkBBLogBF_Pos", "OneBulkBBLogBF_Value",
+		)
+	}
+
+	f.SetSheetRow("Sheet1", "A1", &header)
+
+	addPeakData := func(rowData *[]interface{}, peak *Peak) {
+		if peak != nil {
+			*rowData = append(*rowData, peak.Pos, peak.Value)
+		} else {
+			*rowData = append(*rowData, "", "")
+		}
+	}
+
+	for rowIdx, qtl := range qtls {
+		row := rowIdx + 2
+
+		rowData := []interface{}{
+			qtl.Chrom,
+			qtl.Start,
+			qtl.End,
+			qtl.Threshold,
+		}
+
+		if hasBothBulks {
+			addPeakData(&rowData, qtl.DeltaSI)
+			addPeakData(&rowData, qtl.Gstat)
+			addPeakData(&rowData, qtl.ED)
+			addPeakData(&rowData, qtl.LOD)
+			addPeakData(&rowData, qtl.BBLogBF)
+		}
+		if hasOneBulk {
+			addPeakData(&rowData, qtl.AFDev)
+			addPeakData(&rowData, qtl.OneBulkG)
+			addPeakData(&rowData, qtl.OneBulkLOD)
+			addPeakData(&rowData, qtl.OneBulkBBLogBF)
+		}
+
+		cell, _ := excelize.CoordinatesToCellName(1, row)
+		f.SetSheetRow("Sheet1", cell, &rowData)
+	}
+
+	// Save the file
+	if err := f.SaveAs(filename); err != nil {
+		return fmt.Errorf("failed to save Excel file: %w", err)
+	}
+
+	return nil
+}
