@@ -1,425 +1,272 @@
 package stats
 
-import (
-	"bufio"
-	"fmt"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
-	"sync"
+import "fmt"
 
-	"github.com/gmaffy/GoBSAseq/utils"
-)
+// PeakIntersection describes one significant region where a smoothed statistic
+// exceeds its empirical p99 threshold.
+type PeakIntersection struct {
+	Stat string
 
-type QTL struct {
-	CHROM string
-	START float64
-	STOP  float64
-	PEAK  float64
+	Chrom string
+
+	// Region boundaries (interpolated crossing points)
+	Start float64
+	End   float64
+
+	// Peak within the region
+	PeakPos   int64
+	PeakValue float64
+	Threshold float64
+
+	// Useful indices into the original slices
+	StartIndex int
+	EndIndex   int
+	PeakIndex  int
 }
 
-func detectPeaks(chrom string, x []int64, stats []float64, threshData []float64) ([]QTL, error) {
-	if len(x) != len(stats) || len(x) != len(threshData) {
-		return nil, fmt.Errorf("detectPeaks: mismatched lengths x=%d stats=%d threshData=%d", len(x), len(stats), len(threshData))
-	}
-	if len(x) == 0 {
-		return nil, nil
-	}
+func FindPeakIntersections(
+	statName string,
+	smoothed []SmoothedStats,
+	thresholds []Thresholds,
+	valueFn func(SmoothedStats) float64,
+	threshFn func(Thresholds) float64,
+) []PeakIntersection {
 
-	var qtls []QTL
-	startIdx := -1
-	if stats[0] > threshData[0] {
-		startIdx = 0 // already inside a peak region at the start
+	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
+		return nil
 	}
 
-	for i := 1; i < len(x); i++ {
-		switch {
-		case stats[i-1] < threshData[i-1] && stats[i] > threshData[i]:
-			startIdx = i
+	// Calculate averaged threshold for the chromosome (to match plots behavior)
+	var threshSum float64
+	for _, t := range thresholds {
+		threshSum += threshFn(t)
+	}
+	avgThresh := threshSum / float64(len(thresholds))
 
-		case stats[i-1] > threshData[i-1] && stats[i] < threshData[i] && startIdx != -1:
-			stopIdx := i
-			peakIdx := startIdx
-			for j := startIdx; j <= stopIdx; j++ {
-				if stats[j] > stats[peakIdx] {
-					peakIdx = j
-				}
-			}
-			qtls = append(qtls, QTL{
-				CHROM: chrom,
-				START: float64(x[startIdx]),
-				STOP:  float64(x[stopIdx]),
-				PEAK:  float64(x[peakIdx]),
+	var peaks []PeakIntersection
+
+	inPeak := false
+
+	var (
+		startPos   float64
+		startIndex int
+
+		peakPos    int64
+		peakValue  float64
+		peakThresh float64
+		peakIndex  int
+	)
+
+	for i := 0; i < len(smoothed)-1; i++ {
+
+		y1 := valueFn(smoothed[i])
+		y2 := valueFn(smoothed[i+1])
+
+		t1 := avgThresh
+		t2 := avgThresh
+
+		d1 := y1 - t1
+		d2 := y2 - t2
+
+		//--------------------------------------------
+		// Enter peak
+		//--------------------------------------------
+		if !inPeak && d1 <= 0 && d2 > 0 {
+
+			f := d1 / (d1 - d2)
+
+			startPos = float64(smoothed[i].POS) +
+				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+
+			startIndex = i + 1
+
+			inPeak = true
+
+			peakPos = smoothed[i+1].POS
+			peakValue = y2
+			peakThresh = t2
+			peakIndex = i + 1
+
+			continue
+		}
+
+		if !inPeak {
+			continue
+		}
+
+		//--------------------------------------------
+		// Update peak maximum
+		//--------------------------------------------
+		if y2 > peakValue {
+			peakValue = y2
+			peakPos = smoothed[i+1].POS
+			peakThresh = t2
+			peakIndex = i + 1
+		}
+
+		//--------------------------------------------
+		// Leave peak
+		//--------------------------------------------
+		if d1 > 0 && d2 <= 0 {
+
+			f := d1 / (d1 - d2)
+
+			endPos := float64(smoothed[i].POS) +
+				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+
+			peaks = append(peaks, PeakIntersection{
+				Stat:  statName,
+				Chrom: smoothed[i].CHROM,
+
+				Start: startPos,
+				End:   endPos,
+
+				PeakPos:   peakPos,
+				PeakValue: peakValue,
+				Threshold: peakThresh,
+
+				StartIndex: startIndex,
+				EndIndex:   i,
+				PeakIndex:  peakIndex,
 			})
-			startIdx = -1
+
+			inPeak = false
 		}
 	}
 
-	if startIdx != -1 {
-		stopIdx := len(x) - 1
-		peakIdx := startIdx
-		for j := startIdx; j <= stopIdx; j++ {
-			if stats[j] > stats[peakIdx] {
-				peakIdx = j
-			}
-		}
-		qtls = append(qtls, QTL{
-			CHROM: chrom,
-			START: float64(x[startIdx]),
-			STOP:  float64(x[stopIdx]),
-			PEAK:  float64(x[peakIdx]),
+	// Peak continues to chromosome end.
+	if inPeak {
+
+		last := len(smoothed) - 1
+
+		peaks = append(peaks, PeakIntersection{
+			Stat:  statName,
+			Chrom: smoothed[last].CHROM,
+
+			Start: startPos,
+			End:   float64(smoothed[last].POS),
+
+			PeakPos:   peakPos,
+			PeakValue: peakValue,
+			Threshold: peakThresh,
+
+			StartIndex: startIndex,
+			EndIndex:   last,
+			PeakIndex:  peakIndex,
 		})
 	}
 
-	return qtls, nil
+	return peaks
 }
 
-func detectTroughs(chrom string, x []int64, stats []float64, threshData []float64) ([]QTL, bool) {
-	if len(x) != len(stats) || len(x) != len(threshData) {
-		return nil, false
-	}
-	if len(x) == 0 {
-		return nil, false
-	}
+func FindAllPeakIntersections(smoothed []SmoothedStats, thresholds []Thresholds, hasBothBulks bool, hasHighBulk bool,
+	hasLowBulk bool,
+	hasOneBulk bool,
+) []PeakIntersection {
 
-	var qtls []QTL
-	startIdx := -1
-	if stats[0] < threshData[0] {
-		startIdx = 0 // already inside a trough region at the start
+	var peaks []PeakIntersection
+	byChr := make(map[string][]int)
+
+	for i := range smoothed {
+		byChr[smoothed[i].CHROM] = append(byChr[smoothed[i].CHROM], i)
 	}
 
-	for i := 1; i < len(x); i++ {
-		switch {
-		case stats[i-1] > threshData[i-1] && stats[i] < threshData[i]:
-			startIdx = i
+	for _, idx := range byChr {
 
-		case stats[i-1] < threshData[i-1] && stats[i] > threshData[i] && startIdx != -1:
-			stopIdx := i
-			peakIdx := startIdx
-			for j := startIdx; j <= stopIdx; j++ {
-				if stats[j] < stats[peakIdx] {
-					peakIdx = j
-				}
-			}
-			qtls = append(qtls, QTL{
-				CHROM: chrom,
-				START: float64(x[startIdx]),
-				STOP:  float64(x[stopIdx]),
-				PEAK:  float64(x[peakIdx]),
-			})
-			startIdx = -1
+		sm := make([]SmoothedStats, len(idx))
+		th := make([]Thresholds, len(idx))
+
+		for i, j := range idx {
+			sm[i] = smoothed[j]
+			th[i] = thresholds[j]
+		}
+
+		if hasBothBulks {
+
+			chrPeaks := FindPeakIntersections(
+				"Gstat",
+				sm,
+				th,
+				func(s SmoothedStats) float64 { return s.SmGstat },
+				func(t Thresholds) float64 { return t.TwoBulk.GstatP99 },
+			)
+
+			fmt.Printf("%-10s %-10s : %2d peaks\n",
+				sm[0].CHROM,
+				"Gstat",
+				len(chrPeaks),
+			)
+
+			peaks = append(peaks, chrPeaks...)
+
+			//peaks = append(peaks,
+			//	FindPeakIntersections("HighSI", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmHighSI },
+			//		func(t Thresholds) float64 { return t.TwoBulk.HighSIP99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("LowSI", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmLowSI },
+			//		func(t Thresholds) float64 { return t.TwoBulk.LowSIP99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("DeltaSI", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmDeltaSI },
+			//		func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("Gstat", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmGstat },
+			//		func(t Thresholds) float64 { return t.TwoBulk.GstatP99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("ED", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmED },
+			//		func(t Thresholds) float64 { return t.TwoBulk.ED4P99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("LOD", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmLOD },
+			//		func(t Thresholds) float64 { return t.TwoBulk.LODP99 })...)
+			//
+			//peaks = append(peaks,
+			//	FindPeakIntersections("BBLogBF", sm, th,
+			//		func(s SmoothedStats) float64 { return s.SmBBLogBF },
+			//		func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP99 })...)
+		}
+
+		if hasHighBulk && !hasBothBulks {
+			peaks = append(peaks,
+				FindPeakIntersections("HighSI", sm, th,
+					func(s SmoothedStats) float64 { return s.SmHighSI },
+					func(t Thresholds) float64 { return t.TwoBulk.HighSIP99 })...)
+		}
+
+		if hasLowBulk && !hasBothBulks {
+			peaks = append(peaks,
+				FindPeakIntersections("LowSI", sm, th,
+					func(s SmoothedStats) float64 { return s.SmLowSI },
+					func(t Thresholds) float64 { return t.TwoBulk.LowSIP99 })...)
+		}
+
+		if hasOneBulk {
+
+			peaks = append(peaks,
+				FindPeakIntersections("AFDev", sm, th,
+					func(s SmoothedStats) float64 { return s.SmAFDev },
+					func(t Thresholds) float64 { return t.OneBulk.AFDevP99 })...)
+
+			peaks = append(peaks,
+				FindPeakIntersections("OneBulkG", sm, th,
+					func(s SmoothedStats) float64 { return s.SmOneBulkLOD },
+					func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP99 })...)
+
+			peaks = append(peaks,
+				FindPeakIntersections("OneBulkBB", sm, th,
+					func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF },
+					func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP99 })...)
 		}
 	}
 
-	if startIdx != -1 {
-		stopIdx := len(x) - 1
-		peakIdx := startIdx
-		for j := startIdx; j <= stopIdx; j++ {
-			if stats[j] < stats[peakIdx] {
-				peakIdx = j
-			}
-		}
-		qtls = append(qtls, QTL{
-			CHROM: chrom,
-			START: float64(x[startIdx]),
-			STOP:  float64(x[stopIdx]),
-			PEAK:  float64(x[peakIdx]),
-		})
-	}
-
-	return qtls, len(qtls) > 0
-}
-
-func DetectIndividualStatQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, cfg *utils.AnalysisConfig) ([]QTL, error) {
-	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
-
-	outDir := filepath.Join(cfg.OutputDir, "stats")
-	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
-	}
-	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.individual_stats_qtls.tsv", bsaType))
-
-	// Group smoothed stats by chromosome
-	chromToStats := make(map[string][]SmoothedStats)
-	for _, s := range smoothed {
-		chromToStats[s.CHROM] = append(chromToStats[s.CHROM], s)
-	}
-
-	// Build O(1) index: (CHROM, POS) → original slice index for threshold lookup.
-	type chromPos struct{ chrom string; pos int64 }
-	posToIdx := make(map[chromPos]int, len(smoothed))
-	for i, s := range smoothed {
-		posToIdx[chromPos{s.CHROM, s.POS}] = i
-	}
-
-	// Sorted chromosome list for deterministic output order.
-	chroms := make([]string, 0, len(chromToStats))
-	for c := range chromToStats {
-		chroms = append(chroms, c)
-	}
-	sort.Strings(chroms)
-
-	// Process chromosomes concurrently.
-	type chromResult struct {
-		qtls []QTL
-		err  error
-	}
-	results := make([]chromResult, len(chroms))
-	var wg sync.WaitGroup
-	wg.Add(len(chroms))
-
-	for ci, chrom := range chroms {
-		go func(ci int, chrom string) {
-			defer wg.Done()
-
-			chromStats := chromToStats[chrom]
-			sort.Slice(chromStats, func(i, j int) bool { return chromStats[i].POS < chromStats[j].POS })
-
-			// Build per-chromosome thresholds via the O(1) map.
-			chromThresholds := make([]Thresholds, len(chromStats))
-			for i, s := range chromStats {
-				chromThresholds[i] = thresholds[posToIdx[chromPos{s.CHROM, s.POS}]]
-			}
-
-			positions := make([]int64, len(chromStats))
-			var qtls []QTL
-
-			// Two-bulk stats
-			if hasBothBulks {
-				for _, sf := range []struct {
-					name      string
-					getVal    func(SmoothedStats) float64
-					getThresh func(Thresholds) float64
-				}{
-					{"DeltaSI", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP95 }},
-					{"Gstat", func(s SmoothedStats) float64 { return s.SmGstat }, func(t Thresholds) float64 { return t.TwoBulk.GstatP95 }},
-					{"ED", func(s SmoothedStats) float64 { return s.SmED }, func(t Thresholds) float64 { return t.TwoBulk.ED4P95 }},
-					{"LOD", func(s SmoothedStats) float64 { return s.SmLOD }, func(t Thresholds) float64 { return t.TwoBulk.LODP95 }},
-					{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }},
-				} {
-					for i, s := range chromStats {
-						positions[i] = s.POS
-					}
-					thresh := make([]float64, len(chromStats))
-					for i, t := range chromThresholds {
-						thresh[i] = sf.getThresh(t)
-					}
-					statVals := make([]float64, len(chromStats))
-					for i, s := range chromStats {
-						statVals[i] = sf.getVal(s)
-					}
-					q, err := detectPeaks(chrom, positions, statVals, thresh)
-					if err != nil {
-						results[ci] = chromResult{err: err}
-						return
-					}
-					qtls = append(qtls, q...)
-				}
-			}
-
-			// One-bulk stats
-			if hasOneBulk {
-				for _, sf := range []struct {
-					name      string
-					getVal    func(SmoothedStats) float64
-					getThresh func(Thresholds) float64
-				}{
-					{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }},
-					{"OneBulkG", func(s SmoothedStats) float64 { return s.SmOneBulkG }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP95 }},
-					{"OneBulkLOD", func(s SmoothedStats) float64 { return s.SmOneBulkLOD }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP95 }},
-					{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }},
-				} {
-					for i, s := range chromStats {
-						positions[i] = s.POS
-					}
-					thresh := make([]float64, len(chromStats))
-					for i, t := range chromThresholds {
-						thresh[i] = sf.getThresh(t)
-					}
-					statVals := make([]float64, len(chromStats))
-					for i, s := range chromStats {
-						statVals[i] = sf.getVal(s)
-					}
-					q, err := detectPeaks(chrom, positions, statVals, thresh)
-					if err != nil {
-						results[ci] = chromResult{err: err}
-						return
-					}
-					qtls = append(qtls, q...)
-				}
-			}
-
-			results[ci] = chromResult{qtls: qtls}
-		}(ci, chrom)
-	}
-	wg.Wait()
-
-	// Collect results in chromosome order.
-	var allQtls []QTL
-	for _, r := range results {
-		if r.err != nil {
-			return nil, r.err
-		}
-		allQtls = append(allQtls, r.qtls...)
-	}
-
-	// Write results
-	if err := writeQTLTSV(outPath, allQtls); err != nil {
-		return nil, err
-	}
-
-	return allQtls, nil
-}
-
-func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, cfg *utils.AnalysisConfig) ([]QTL, error) {
-	outDir := filepath.Join(cfg.OutputDir, "stats")
-	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
-	}
-	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.composite.qtls.tsv", bsaType))
-
-	var allQtls []QTL
-
-	// Group smoothed stats by chromosome
-	chromToStats := make(map[string][]SmoothedStats)
-	for _, s := range smoothed {
-		chromToStats[s.CHROM] = append(chromToStats[s.CHROM], s)
-	}
-
-	// Process each chromosome
-	for chrom, stats := range chromToStats {
-		// Sort by position
-		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
-
-		// Extract positions and CompositeZ values
-		positions := make([]int64, len(stats))
-		compositeZ := make([]float64, len(stats))
-		
-		// Get the thresholds for this chromosome
-		var chromThresholds []Thresholds
-		for _, s := range smoothed {
-			if s.CHROM == chrom {
-				// Find the index of this variant in the original smoothed slice
-				for i, orig := range smoothed {
-					if orig.CHROM == s.CHROM && orig.POS == s.POS {
-						chromThresholds = append(chromThresholds, thresholds[i])
-						break
-					}
-				}
-			}
-		}
-		
-		for i, s := range stats {
-			positions[i] = s.POS
-			compositeZ[i] = s.CompositeZ
-		}
-
-		// Use CompositeZ threshold
-		thresh := make([]float64, len(stats))
-		for i, t := range chromThresholds {
-			thresh[i] = t.Z.CompositeZP95
-		}
-
-		// Detect peaks in CompositeZ
-		qtls, err := detectPeaks(chrom, positions, compositeZ, thresh)
-		if err != nil {
-			return nil, err
-		}
-		allQtls = append(allQtls, qtls...)
-	}
-
-	// Write results
-	if err := writeQTLTSV(outPath, allQtls); err != nil {
-		return nil, err
-	}
-
-	return allQtls, nil
-}
-
-func FinalQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, cfg *utils.AnalysisConfig) ([]QTL, error) {
-	outDir := filepath.Join(cfg.OutputDir, "stats")
-	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
-	}
-	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.qtls.tsv", bsaType))
-
-	// Get QTLs from individual stats
-	individualQtls, err := DetectIndividualStatQTLs(smoothed, thresholds, bsaType, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get QTLs from composite Z
-	compositeQtls, err := DetectCompositeZQTLs(smoothed, thresholds, bsaType, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Combine and deduplicate QTLs
-	// Simple approach: merge overlapping QTLs and track supporting stats
-	allQtls := append(individualQtls, compositeQtls...)
-
-	// Sort by chromosome and start position
-	sort.Slice(allQtls, func(i, j int) bool {
-		if allQtls[i].CHROM != allQtls[j].CHROM {
-			return allQtls[i].CHROM < allQtls[j].CHROM
-		}
-		return allQtls[i].START < allQtls[j].START
-	})
-
-	// Merge overlapping QTLs
-	var finalQtls []QTL
-	if len(allQtls) > 0 {
-		current := allQtls[0]
-		for i := 1; i < len(allQtls); i++ {
-			next := allQtls[i]
-			// If overlapping or within merge distance, merge them
-			if next.CHROM == current.CHROM && next.START <= current.STOP {
-				// Extend the current QTL
-				if next.STOP > current.STOP {
-					current.STOP = next.STOP
-				}
-				if next.PEAK > current.PEAK {
-					current.PEAK = next.PEAK
-				}
-			} else {
-				finalQtls = append(finalQtls, current)
-				current = next
-			}
-		}
-		finalQtls = append(finalQtls, current)
-	}
-
-	// Write results
-	if err := writeQTLTSV(outPath, finalQtls); err != nil {
-		return nil, err
-	}
-
-	return finalQtls, nil
-}
-
-func writeQTLTSV(filename string, qtls []QTL) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	defer w.Flush()
-
-	header := []string{"CHROM", "START", "STOP", "PEAK"}
-	fmt.Fprintln(w, strings.Join(header, "\t"))
-
-	for _, q := range qtls {
-		row := []string{
-			q.CHROM,
-			fmt.Sprintf("%.0f", q.START),
-			fmt.Sprintf("%.0f", q.STOP),
-			fmt.Sprintf("%.0f", q.PEAK),
-		}
-		fmt.Fprintln(w, strings.Join(row, "\t"))
-	}
-	return nil
+	return peaks
 }

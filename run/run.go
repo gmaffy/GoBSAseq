@@ -304,11 +304,12 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 6/10: Detecting QTLs from individual statistics ...\n")
 
-	individualQTLs, err := stats.DetectIndividualStatQTLs(smoothedStats, thresholds, btype, cfg)
-	if err != nil {
-		return err
-	}
-	color.Green("Detected %d individual-stat QTLs", len(individualQTLs))
+	//individualQTLs, err := stats.DetectIndividualStatQTLs(smoothedStats, thresholds, btype, cfg)
+	//if err != nil {
+	//	return err
+	//}
+	peaks := stats.FindAllPeakIntersections(smoothedStats, thresholds, true, false, false, false)
+	color.Green("Detected %d individual-stat QTLs", len(peaks))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 

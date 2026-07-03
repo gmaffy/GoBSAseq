@@ -1,0 +1,401 @@
+package stats
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+
+	"github.com/gmaffy/GoBSAseq/utils"
+)
+
+type QTL struct {
+	CHROM string
+	START float64
+	STOP  float64
+	PEAK  float64
+}
+
+//func detectPeaks(chrom string, x []int64, stats []float64, threshData []float64) ([]QTL, bool) {
+//	if len(x) != len(stats) || len(x) != len(threshData) {
+//		fmt.Printf("detectPeaks: mismatched lengths x=%d stats=%d threshData=%d\n", len(x), len(stats), len(threshData))
+//		return nil, false
+//	}
+//	if len(x) == 0 {
+//		return nil, false
+//	}
+//
+//	var qtls []QTL
+//	startIdx := -1
+//	if stats[0] > threshData[0] {
+//		startIdx = 0 // already inside a peak region at the start
+//	}
+//
+//	for i := 1; i < len(x); i++ {
+//		switch {
+//		case stats[i-1] < threshData[i-1] && stats[i] > threshData[i]:
+//			startIdx = i
+//
+//		case stats[i-1] > threshData[i-1] && stats[i] < threshData[i] && startIdx != -1:
+//			stopIdx := i
+//			peakIdx := startIdx
+//			for j := startIdx; j <= stopIdx; j++ {
+//				if stats[j] > stats[peakIdx] {
+//					peakIdx = j
+//				}
+//			}
+//			qtls = append(qtls, QTL{
+//				CHROM: chrom,
+//				START: float64(x[startIdx]),
+//				STOP:  float64(x[stopIdx]),
+//				PEAK:  float64(x[peakIdx]),
+//			})
+//			startIdx = -1
+//		}
+//	}
+//
+//	if startIdx != -1 {
+//		stopIdx := len(x) - 1
+//		peakIdx := startIdx
+//		for j := startIdx; j <= stopIdx; j++ {
+//			if stats[j] > stats[peakIdx] {
+//				peakIdx = j
+//			}
+//		}
+//		qtls = append(qtls, QTL{
+//			CHROM: chrom,
+//			START: float64(x[startIdx]),
+//			STOP:  float64(x[stopIdx]),
+//			PEAK:  float64(x[peakIdx]),
+//		})
+//	}
+//
+//	return qtls, len(qtls) > 0
+//}
+
+func detectPeaks(chrom string, x []int64, stats []float64, threshData []float64) ([]QTL, bool) {
+	if len(x) != len(stats) || len(x) != len(threshData) {
+		fmt.Printf("detectPeaks: mismatched lengths x=%d stats=%d threshData=%d\n", len(x), len(stats), len(threshData))
+		return nil, false
+	}
+	if len(x) == 0 {
+		return nil, false
+	}
+
+	// above is decided once per index, in one place, so an exact tie
+	// (stats[i] == threshData[i]) can't hide a crossing between two
+	// strict-inequality checks on either side of it. Ties count as
+	// significant (>=) -- flip to > if your convention wants ties excluded.
+	above := func(i int) bool { return stats[i] >= threshData[i] }
+
+	var qtls []QTL
+	startIdx := -1
+	if above(0) {
+		startIdx = 0 // already inside a peak region at the start
+	}
+
+	closeRegion := func(stopIdx int) {
+		peakIdx := startIdx
+
+		for j := startIdx; j < stopIdx; j++ {
+			if stats[j] > stats[peakIdx] {
+				peakIdx = j
+			}
+		}
+		qtls = append(qtls, QTL{
+			CHROM: chrom,
+			START: float64(x[startIdx]),
+			STOP:  float64(x[stopIdx]),
+			PEAK:  stats[peakIdx],
+		})
+	}
+
+	for i := 1; i < len(x); i++ {
+		switch {
+		case above(i) && !above(i-1):
+			startIdx = i
+		case !above(i) && above(i-1) && startIdx != -1:
+			closeRegion(i)
+			startIdx = -1
+		}
+	}
+
+	if startIdx != -1 {
+		// Region runs off the end of the data with no closing crossing, so
+		// the last point itself is still significant and belongs in the
+		// peak search (unlike the mid-array case above).
+		peakIdx := startIdx
+		for j := startIdx; j < len(x); j++ {
+			if stats[j] > stats[peakIdx] {
+				peakIdx = j
+			}
+		}
+		qtls = append(qtls, QTL{
+			CHROM: chrom,
+			START: float64(x[startIdx]),
+			STOP:  float64(x[len(x)-1]),
+			PEAK:  stats[peakIdx],
+		})
+	}
+
+	return qtls, len(qtls) > 0
+}
+
+func detectTroughs(chrom string, x []int64, stats []float64, threshData []float64) ([]QTL, bool) {
+	if len(x) != len(stats) || len(x) != len(threshData) {
+		return nil, false
+	}
+	if len(x) == 0 {
+		return nil, false
+	}
+
+	var qtls []QTL
+	startIdx := -1
+	if stats[0] < threshData[0] {
+		startIdx = 0 // already inside a trough region at the start
+	}
+
+	for i := 1; i < len(x); i++ {
+		switch {
+		case stats[i-1] > threshData[i-1] && stats[i] < threshData[i]:
+			startIdx = i
+
+		case stats[i-1] < threshData[i-1] && stats[i] > threshData[i] && startIdx != -1:
+			stopIdx := i
+			peakIdx := startIdx
+			for j := startIdx; j <= stopIdx; j++ {
+				if stats[j] < stats[peakIdx] {
+					peakIdx = j
+				}
+			}
+			qtls = append(qtls, QTL{
+				CHROM: chrom,
+				START: float64(x[startIdx]),
+				STOP:  float64(x[stopIdx]),
+				PEAK:  stats[peakIdx],
+			})
+			startIdx = -1
+		}
+	}
+
+	if startIdx != -1 {
+		stopIdx := len(x) - 1
+		peakIdx := startIdx
+		for j := startIdx; j <= stopIdx; j++ {
+			if stats[j] < stats[peakIdx] {
+				peakIdx = j
+			}
+		}
+		qtls = append(qtls, QTL{
+			CHROM: chrom,
+			START: float64(x[startIdx]),
+			STOP:  float64(x[stopIdx]),
+			PEAK:  stats[peakIdx],
+		})
+	}
+
+	return qtls, len(qtls) > 0
+}
+
+func DetectIndividualStatQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, cfg *utils.AnalysisConfig) ([]QTL, error) {
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+
+	outDir := filepath.Join(cfg.OutputDir, "stats")
+	if err := os.MkdirAll(outDir, 0775); err != nil {
+		return nil, err
+	}
+	//outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.individual_stats_qtls.tsv", bsaType))
+
+	type indexedStat struct {
+		sm SmoothedStats
+		t  Thresholds
+	}
+	byChr := make(map[string][]indexedStat)
+	for i, s := range smoothed {
+		byChr[s.CHROM] = append(byChr[s.CHROM], indexedStat{s, thresholds[i]})
+	}
+	chroms := make([]string, 0, len(byChr))
+	for c := range byChr {
+		chroms = append(chroms, c)
+	}
+	sort.Strings(chroms)
+
+	var allQTLs []QTL
+
+	for _, chrom := range chroms {
+		entries := byChr[chrom]
+		if len(entries) == 0 {
+			continue
+		}
+
+		n := len(entries)
+		//chromBRM := brmByChr[chrom]
+
+		// Extract position arrays and per-variant threshold arrays.
+		x := make([]int64, n)
+
+		// Two-bulk smoothed values.
+		hi := make([]float64, n)
+		li := make([]float64, n)
+		dsi := make([]float64, n)
+		gs := make([]float64, n)
+		ed := make([]float64, n)
+		LOD := make([]float64, n)
+		bbl := make([]float64, n)
+
+		// One-bulk smoothed values.
+		afDev := make([]float64, n)
+		obG := make([]float64, n)
+		obLod := make([]float64, n)
+		obBB := make([]float64, n)
+
+		// Z-scores (all available for every bsaType).
+		hiZ := make([]float64, n)
+		liZ := make([]float64, n)
+		dsiZ := make([]float64, n)
+		gsZ := make([]float64, n)
+		edZ := make([]float64, n)
+		lodZ := make([]float64, n)
+		bblZ := make([]float64, n)
+		afDevZ := make([]float64, n)
+		obGZ := make([]float64, n)
+		obLodZ := make([]float64, n)
+		obBBZ := make([]float64, n)
+		compositeZ := make([]float64, n)
+		maxAbsZ := make([]float64, n)
+
+		// Per-variant threshold arrays for two-bulk individual charts.
+		hiT99, hiTM99 := make([]float64, n), make([]float64, n)
+		hiT95, hiTM95 := make([]float64, n), make([]float64, n)
+		liT99, liTM99 := make([]float64, n), make([]float64, n)
+		liT95, liTM95 := make([]float64, n), make([]float64, n)
+		dsiT99, dsiTM99 := make([]float64, n), make([]float64, n)
+		dsiT95, dsiTM95 := make([]float64, n), make([]float64, n)
+		gsT99, gsT95 := make([]float64, n), make([]float64, n)
+		edT99, edT95 := make([]float64, n), make([]float64, n)
+		lodT99, lodT95 := make([]float64, n), make([]float64, n)
+		bblT99, bblT95 := make([]float64, n), make([]float64, n)
+
+		// Per-variant threshold arrays for one-bulk individual charts.
+		afDevT99, afDevTM99 := make([]float64, n), make([]float64, n)
+		afDevT95, afDevTM95 := make([]float64, n), make([]float64, n)
+		obGT99, obGT95 := make([]float64, n), make([]float64, n)
+		obLodT99, obLodT95 := make([]float64, n), make([]float64, n)
+		obBBT99, obBBT95 := make([]float64, n), make([]float64, n)
+
+		for i, e := range entries {
+			s, t := e.sm, e.t
+			x[i] = s.POS
+
+			if hasBothBulks {
+				hi[i], li[i], dsi[i] = s.SmHighSI, s.SmLowSI, s.SmDeltaSI
+				gs[i], ed[i], LOD[i], bbl[i] = s.SmGstat, s.SmED, s.SmLOD, s.SmBBLogBF
+				hiZ[i], liZ[i], dsiZ[i] = s.ZHighSI, s.ZLowSI, s.ZDeltaSI
+				gsZ[i], edZ[i], lodZ[i], bblZ[i] = s.ZGstat, s.ZED, s.ZLOD, s.ZBBLogBF
+
+				tb := t.TwoBulk
+				hiT99[i], hiTM99[i] = tb.HighSIP99, tb.HighSIMp99
+				hiT95[i], hiTM95[i] = tb.HighSIP95, tb.HighSIMp95
+				liT99[i], liTM99[i] = tb.LowSIP99, tb.LowSIMp99
+				liT95[i], liTM95[i] = tb.LowSIP95, tb.LowSIMp95
+				dsiT99[i], dsiTM99[i] = tb.DeltaSIP99, tb.DeltaSIMp99
+				dsiT95[i], dsiTM95[i] = tb.DeltaSIP95, tb.DeltaSIMp95
+				gsT99[i], gsT95[i] = tb.GstatP99, tb.GstatP95
+				edT99[i], edT95[i] = tb.ED4P99, tb.ED4P95
+				lodT99[i], lodT95[i] = tb.LODP99, tb.LODP95
+				bblT99[i], bblT95[i] = tb.BBLogBFP99, tb.BBLogBFP95
+			}
+
+			//if hasHighBulk && !hasBothBulks {
+			//	// High-bulk-only: HighSI Z-score available.
+			//	hi[i] = s.SmHighSI
+			//	hiZ[i] = s.ZHighSI
+			//	hiT99[i], hiTM99[i] = t.TwoBulk.HighSIP99, t.TwoBulk.HighSIMp99
+			//	hiT95[i], hiTM95[i] = t.TwoBulk.HighSIP95, t.TwoBulk.HighSIMp95
+			//}
+			//if hasLowBulk && !hasBothBulks {
+			//	li[i] = s.SmLowSI
+			//	liZ[i] = s.ZLowSI
+			//	liT99[i], liTM99[i] = t.TwoBulk.LowSIP99, t.TwoBulk.LowSIMp99
+			//	liT95[i], liTM95[i] = t.TwoBulk.LowSIP95, t.TwoBulk.LowSIMp95
+			//}
+
+			if hasOneBulk {
+				afDev[i] = s.SmAFDev
+				obG[i] = s.SmOneBulkG
+				obLod[i] = s.SmOneBulkLOD
+				obBB[i] = s.SmOneBulkBBLogBF
+				afDevZ[i] = s.ZAFDev
+				obGZ[i] = s.ZOneBulkG
+				obLodZ[i] = s.ZOneBulkLOD
+				obBBZ[i] = s.ZOneBulkBBLogBF
+
+				ob := t.OneBulk
+				afDevT99[i], afDevTM99[i] = ob.AFDevP99, ob.AFDevMp99
+				afDevT95[i], afDevTM95[i] = ob.AFDevP95, ob.AFDevMp95
+				obGT99[i], obGT95[i] = ob.OneBulkGstatP99, ob.OneBulkGstatP95
+				obLodT99[i], obLodT95[i] = ob.OneBulkLODP99, ob.OneBulkLODP95
+				obBBT99[i], obBBT95[i] = ob.OneBulkBBLogBFP99, ob.OneBulkBBLogBFP95
+			}
+
+			compositeZ[i] = s.CompositeZ
+			maxAbsZ[i] = s.MaxAbsZ
+		}
+
+		// Detection must run after the entries loop above, once x/dsi/gs/ed/
+		// LOD/bbl and their threshold arrays are fully populated -- running
+		// it per-entry (as before) scanned mostly-zero, partially-filled
+		// slices and produced spurious results at every data point.
+		dsi99QTLs, _ := detectPeaks(chrom, x, dsi, dsiT99)
+		fmt.Printf("Detected %d QTLs for DeltaSI at 99%% threshold on chromosome %s\n", len(dsi99QTLs), chrom)
+		//if dsi99bool {
+		//	fmt.Printf("Detected %d QTLs for DeltaSI at 99%% threshold on chromosome %s\n", len(dsi99QTLs), chrom)
+		//	for _, qtl := range dsi99QTLs {
+		//		fmt.Printf("QTL: CHROM=%s START=%.0f STOP=%.0f PEAK=%.6f\n", qtl.CHROM, qtl.START, qtl.STOP, qtl.PEAK)
+		//	}
+		//	allQTLs = append(allQTLs, dsi99QTLs...)
+		//}
+
+		gs99QTLs, _ := detectPeaks(chrom, x, gs, gsT99)
+		fmt.Printf("Detected %d QTLs for Gstat at 99%% threshold on chromosome %s\n", len(gs99QTLs), chrom)
+		//if gs99bool {
+		//	fmt.Printf("Detected %d QTLs for Gstat at 99%% threshold on chromosome %s\n", len(gs99QTLs), chrom)
+		//	for _, qtl := range gs99QTLs {
+		//		fmt.Printf("QTL: CHROM=%s START=%.0f STOP=%.0f PEAK=%.6f\n", qtl.CHROM, qtl.START, qtl.STOP, qtl.PEAK)
+		//	}
+		//	allQTLs = append(allQTLs, gs99QTLs...)
+		//}
+
+		ed99QTLs, _ := detectPeaks(chrom, x, ed, edT99)
+		fmt.Printf("Detected %d QTLs for ED at 99%% threshold on chromosome %s\n", len(ed99QTLs), chrom)
+		//if ed99bool {
+		//	fmt.Printf("Detected %d QTLs for ED at 99%% threshold on chromosome %s\n", len(ed99QTLs), chrom)
+		//	for _, qtl := range ed99QTLs {
+		//		fmt.Printf("QTL: CHROM=%s START=%.0f STOP=%.0f PEAK=%.6f\n", qtl.CHROM, qtl.START, qtl.STOP, qtl.PEAK)
+		//	}
+		//	allQTLs = append(allQTLs, ed99QTLs...)
+		//}
+
+		lo99QTLs, _ := detectPeaks(chrom, x, LOD, lodT99)
+		fmt.Printf("Detected %d QTLs for LOD at 99%% threshold on chromosome %s\n", len(lo99QTLs), chrom)
+		//if lo99bool {
+		//	fmt.Printf("Detected %d QTLs for LOD at 99%% threshold on chromosome %s\n", len(lo99QTLs), chrom)
+		//	for _, qtl := range lo99QTLs {
+		//		fmt.Printf("QTL: CHROM=%s START=%.0f STOP=%.0f PEAK=%.6f\n", qtl.CHROM, qtl.START, qtl.STOP, qtl.PEAK)
+		//	}
+		//	allQTLs = append(allQTLs, lo99QTLs...)
+		//}
+
+		bbl99QTLs, _ := detectPeaks(chrom, x, bbl, bblT99)
+		fmt.Printf("Detected %d QTLs for BBLogBF at 99%% threshold on chromosome %s\n", len(bbl99QTLs), chrom)
+		//if bbl99bool {
+		//	fmt.Printf("Detected %d QTLs for BBLogBF at 99%% threshold on chromosome %s\n", len(bbl99QTLs), chrom)
+		//	for _, qtl := range bbl99QTLs {
+		//		fmt.Printf("QTL: CHROM=%s START=%.0f STOP=%.0f PEAK=%.6f\n", qtl.CHROM, qtl.START, qtl.STOP, qtl.PEAK)
+		//	}
+		//	allQTLs = append(allQTLs, bbl99QTLs...)
+		//}
+	}
+	return allQTLs, nil
+
+}
