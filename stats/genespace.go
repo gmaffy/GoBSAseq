@@ -11,29 +11,67 @@ import (
 	"github.com/gmaffy/genome-whisperer/genespace"
 )
 
-// GeneSpaceInterval is a genomic region to analyse — satisfied by both
-// QTLRecord and BRMBlock so callers can pass either type.
 type GeneSpaceInterval interface {
 	geneSpaceRegion() (chrom string, start, stop int)
-}
-
-func (q QTLRecord) geneSpaceRegion() (string, int, int) {
-	return q.Chrom, int(q.Start), int(q.Stop)
 }
 
 func (b BRMBlock) geneSpaceRegion() (string, int, int) {
 	return b.Chrom, int(b.Start), int(b.Stop)
 }
 
-// RunGeneSpace performs SnpEff annotation of the filtered VCF produced for
-// bsaType, then runs genespace.GeneSpace over every supplied interval.
-//
-// intervals accepts []QTLRecord, []BRMBlock, or any mix via the
-// GeneSpaceInterval interface.  Pass the merged slice from MergeQTLsAndBRM
-// (detect.go) for the most complete coverage.
-//
-// The function is a no-op (with a yellow warning) when any of the four
-// required config fields (SnpEffDB, GeneDesc, Prg, Gff) is absent.
+// gtCol returns the VariantsToTable genotype column name for a VCF sample.
+func gtCol(sample string) string {
+	if sample == "" || sample == "None" {
+		return ""
+	}
+	return sample + ".GT"
+}
+
+func nonEmptyGTCols(names ...string) []string {
+	var cols []string
+	for _, name := range names {
+		if col := gtCol(name); col != "" {
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}
+
+// geneSpaceGTLines maps the current BSA mode to resistant and susceptible
+// genotype columns in the annotated SuperVCF TSV. High-parent/high-bulk lines
+// are treated as resistant; low-parent/low-bulk as susceptible.
+func geneSpaceGTLines(cfg utils.AnalysisConfig, bsaType string) (res, sus []string) {
+	switch bsaType {
+	case "2p2b":
+		return nonEmptyGTCols(cfg.HighParentName, cfg.HighBulkName),
+			nonEmptyGTCols(cfg.LowParentName, cfg.LowBulkName)
+	case "2b":
+		return nonEmptyGTCols(cfg.HighBulkName), nonEmptyGTCols(cfg.LowBulkName)
+	case "2phb":
+		return nonEmptyGTCols(cfg.HighParentName, cfg.HighBulkName),
+			nonEmptyGTCols(cfg.LowParentName)
+	case "2plb":
+		return nonEmptyGTCols(cfg.HighParentName),
+			nonEmptyGTCols(cfg.LowParentName, cfg.LowBulkName)
+	case "hp2b":
+		return nonEmptyGTCols(cfg.HighParentName, cfg.HighBulkName),
+			nonEmptyGTCols(cfg.LowBulkName)
+	case "lp2b":
+		return nonEmptyGTCols(cfg.HighBulkName),
+			nonEmptyGTCols(cfg.LowParentName, cfg.LowBulkName)
+	case "hphb":
+		return nonEmptyGTCols(cfg.HighParentName, cfg.HighBulkName), nil
+	case "hplb":
+		return nonEmptyGTCols(cfg.HighParentName), nonEmptyGTCols(cfg.LowBulkName)
+	case "lphb":
+		return nonEmptyGTCols(cfg.HighBulkName), nonEmptyGTCols(cfg.LowParentName)
+	case "lplb":
+		return nonEmptyGTCols(cfg.LowParentName), nonEmptyGTCols(cfg.LowBulkName)
+	default:
+		return nil, nil
+	}
+}
+
 func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath string, intervals []GeneSpaceInterval) error {
 	color.Cyan("\n============================= Gene space analysis (%s) ==============================\n", bsaType)
 
@@ -49,20 +87,10 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 	}
 
 	outDir := filepath.Join(cfg.OutputDir, "gene_space")
-	err := os.MkdirAll(outDir, 0775)
-	if err != nil {
-		return err
-	}
-	//outDir = filepath.Join(outDir, bsaType,)
 	if err := os.MkdirAll(outDir, 0775); err != nil {
 		return fmt.Errorf("RunGeneSpace: create output dir: %w", err)
 	}
 
-	// ── Step 1: SnpEff annotation ─────────────────────────────────────────────
-	// Only annotate if the VCF does not already carry EFF annotations.  The
-	// legacy twoBulk.go inspected the live vcfgo reader header; here we check
-	// via cfg.Rdr when it is set, and skip the guard when it is nil so that
-	// callers that do not preserve the reader can still use this function.
 	if cfg.Rdr != nil {
 		if _, hasEFF := cfg.Rdr.Header.Infos["EFF"]; hasEFF {
 			color.Yellow("EFF column already present in VCF; skipping SnpEff annotation step.")
@@ -72,15 +100,10 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 	}
 
 	color.Green("Step 1: Annotating variants with SnpEff ...")
-	err, annotatedTsvFiles := annotation.CreateSuperVcf(
-		[]string{filteredVcfPath},
-		cfg.SnpEffDB,
-		true,
-		cfg.GeneDesc,
-		cfg.Prg,
-	)
-	if err != nil {
-		return fmt.Errorf("RunGeneSpace: SnpEff annotation failed: %w", err)
+	annotErr, annotatedTsvFiles := annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
+	
+	if annotErr != nil {
+		return fmt.Errorf("RunGeneSpace: SnpEff annotation failed: %w", annotErr)
 	}
 	if len(annotatedTsvFiles) == 0 {
 		color.Yellow("Skipping gene space analysis: SnpEff produced no annotated TSV files.")
@@ -89,6 +112,15 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 	color.Green("SnpEff annotation complete.  Annotated TSV: %v", annotatedTsvFiles)
 
 	annotatedTsv := annotatedTsvFiles[0]
+
+	resLines, susLines := geneSpaceGTLines(cfg, bsaType)
+	if len(resLines) == 0 || len(susLines) == 0 {
+		color.Yellow("Gene space SNP counts require both resistant and susceptible sample columns; got res=%v sus=%v",
+			resLines, susLines)
+	} else {
+		color.Blue("  Resistant GT columns: %v", resLines)
+		color.Blue("  Susceptible GT columns: %v", susLines)
+	}
 
 	// ── Step 2: GeneSpace per interval ───────────────────────────────────────
 	color.Cyan("Step 2: Running gene space analysis for %d interval(s) ...", len(intervals))
@@ -103,8 +135,8 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 			chrom,
 			start,
 			stop,
-			[]string{}, // included effect types  — empty = all
-			[]string{}, // excluded effect types  — empty = none
+			resLines,
+			susLines,
 			cfg.GeneDesc,
 			cfg.Prg,
 			outDir,
@@ -119,29 +151,7 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 	return nil
 }
 
-// GeneSpaceFromQTLs is a convenience wrapper that converts []QTLRecord to the
-// GeneSpaceInterval slice expected by RunGeneSpace.
-func GeneSpaceFromQTLs(
-	cfg utils.AnalysisConfig,
-	bsaType string,
-	filteredVcfPath string,
-	qtls []QTLRecord,
-) error {
-	ivs := make([]GeneSpaceInterval, len(qtls))
-	for i, q := range qtls {
-		ivs[i] = q
-	}
-	return RunGeneSpace(cfg, bsaType, filteredVcfPath, ivs)
-}
-
-// GeneSpaceFromBRM is a convenience wrapper that converts []BRMBlock to the
-// GeneSpaceInterval slice expected by RunGeneSpace.
-func GeneSpaceFromBRM(
-	cfg utils.AnalysisConfig,
-	bsaType string,
-	filteredVcfPath string,
-	blocks []BRMBlock,
-) error {
+func GeneSpaceFromBRM(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath string, blocks []BRMBlock) error {
 	ivs := make([]GeneSpaceInterval, len(blocks))
 	for i, b := range blocks {
 		ivs[i] = b
@@ -149,9 +159,6 @@ func GeneSpaceFromBRM(
 	return RunGeneSpace(cfg, bsaType, filteredVcfPath, ivs)
 }
 
-// GeneSpaceFromMerged is a convenience wrapper that accepts the MergedQTL
-// slice produced by MergeQTLsAndBRM (detect.go) and runs gene space analysis
-// over all merged intervals in one pass.
 func GeneSpaceFromMerged(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath string, merged []MergedQTL) error {
 	ivs := make([]GeneSpaceInterval, len(merged))
 	for i, m := range merged {

@@ -309,10 +309,6 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return fmt.Errorf("failed to create qtls directory: %w", err)
 	}
 
-	//individualQTLs, err := stats.DetectIndividualStatQTLs(smoothedStats, thresholds, btype, cfg)
-	//if err != nil {
-	//	return err
-	//}
 	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype)
 	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
@@ -357,12 +353,17 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Green("MC-based QTL detection completed\n\n")
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
-	color.Cyan("STEP 10/10: Gene space analysis ...")
+	color.Cyan("STEP 10/10: Gene space analysis ...\n")
 	// --------------------------------------------------- Gene Space ---------------------------------------------- //
-	//hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
-	//if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
-	//	color.Red("Gene space analysis error: %v", err)
-	//}
+	if len(missingGeneSpaceParams(cfg)) == 0 {
+		hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
+		if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
+			color.Red("Gene space analysis error: %v", err)
+			return err
+		}
+	} else {
+		color.Yellow("Skipping gene space analysis: required parameters not configured.")
+	}
 
 	return nil
 }
