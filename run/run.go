@@ -250,7 +250,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	fmt.Printf("Min High parent depth: %v\n", cfg.HighParentDepth)
 	fmt.Printf("Min Low parent depth: %v\n", cfg.LowParentDepth)
 	fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
-	fmt.Printf("Min Low bulk depth: %v\n", cfg.LowBulkDepth)
+	fmt.Printf("Min Low bulk depth: %v\n\n", cfg.LowBulkDepth)
 
 	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
