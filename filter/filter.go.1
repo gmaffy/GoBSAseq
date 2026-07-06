@@ -51,62 +51,6 @@ func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
 	return true
 }
 
-// sampleAllelesOKLenient checks that every non-missing allele in the
-// sample's genotype is either ref (0) or targetAlt, ignoring missing calls
-// ('.'). Unlike sampleHasOnlyRefOrAlt, a partially-missing genotype is not
-// an automatic failure — only a fully-missing one is, since there's no
-// signal left to use at all.
-func sampleAllelesOKLenient(v *vcfgo.Variant, idx, targetAlt int) bool {
-	if idx < 0 || idx >= len(v.Samples) {
-		return false
-	}
-	s := v.Samples[idx]
-	if s == nil || len(s.GT) == 0 {
-		return false
-	}
-	seenCall := false
-	for _, allele := range s.GT {
-		if allele < 0 {
-			continue // missing — tolerated
-		}
-		seenCall = true
-		if allele != 0 && allele != targetAlt {
-			return false
-		}
-	}
-	return seenCall
-}
-
-// parentAllele resolves which single allele (ref=0 or targetAlt) a parent
-// carries, tolerating missing calls within its own genotype (e.g. a diploid
-// call dropping to effectively haploid under low coverage). It fails if the
-// parent has no usable genotype at all, if its non-missing alleles disagree
-// with each other (i.e. it's genuinely heterozygous, not just partially
-// missing), or if a called allele is neither ref nor targetAlt.
-func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, ok bool) {
-	if idx < 0 || idx >= len(v.Samples) || v.Samples[idx] == nil {
-		return -1, false
-	}
-	resolved := -1
-	for _, a := range v.Samples[idx].GT {
-		if a < 0 {
-			continue // missing — tolerated
-		}
-		if a != 0 && a != targetAlt {
-			return -1, false
-		}
-		if resolved == -1 {
-			resolved = a
-		} else if a != resolved {
-			return -1, false // genuinely heterozygous
-		}
-	}
-	if resolved == -1 {
-		return -1, false // fully missing — can't determine
-	}
-	return resolved, true
-}
-
 func isHomozygous(gt []int) bool {
 	if len(gt) == 0 {
 		return false
@@ -210,142 +154,118 @@ func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bo
 		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "2p2b":
-		// bulks must be fully genotyped — no missing data tolerated
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+		// 2 parents 2 bulks filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
 				return false
 			}
 		}
 
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
-		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
-		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
-		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
-		}
-
 		hp := v.Samples[cfg.HighParentIdx]
 		lp := v.Samples[cfg.LowParentIdx]
+
+		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
+			return false
+		}
+		if hp.GT[0] == lp.GT[0] {
+			return false // same allele in both parents — not informative
+		}
 
 		return hp.DP >= cfg.HighParentDepth &&
 			lp.DP >= cfg.LowParentDepth &&
 			v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth &&
 			v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "2plb":
-		// bulk must be fully genotyped — no missing data tolerated
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
-
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
-		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
-		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
-		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
-		}
-
-		hp := v.Samples[cfg.HighParentIdx]
-		lp := v.Samples[cfg.LowParentIdx]
-
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
-	case "2phb":
-		// bulk must be fully genotyped — no missing data tolerated
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
-			return false
-		}
-
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
-		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
-		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
-		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
-		}
-
-		hp := v.Samples[cfg.HighParentIdx]
-		lp := v.Samples[cfg.LowParentIdx]
-
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
-	case "hp2b":
-		// high parent 2 bulks filter — bulks must be fully genotyped
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+		// 2 parents low bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
 				return false
 			}
 		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
 			return false
+		}
+		if hp.GT[0] == lp.GT[0] {
+			return false // same allele in both parents — not informative
+		}
+
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+	case "2phb":
+		// 2 parents high bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
+			return false
+		}
+		if hp.GT[0] == lp.GT[0] {
+			return false // same allele in both parents — not informative
+		}
+
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+	case "hp2b":
+		// high parent 2 bulks filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
 		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "lp2b":
-		// low parent 2 bulks filter — bulks must be fully genotyped
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+		// low parent  2 bulks filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
 			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
 				return false
 			}
-		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
-			return false
 		}
 		lp := v.Samples[cfg.LowParentIdx]
 		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "hphb":
-		// high parent high bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
-			return false
-		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
-			return false
+		// high parent high bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
 		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
 	case "hplb":
-		// high parent low bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
-			return false
+		// high parent low bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
 		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "lphb":
-		// low parent high bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
-			return false
-		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
-			return false
+		// low parent high bulk filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
 		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
 	case "lplb":
-		// low parent low bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
-		// parent may have partial missing data
-		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
-			return false
+		// low parent low bulk filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.LowBulkIdx} {
+			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+				return false
+			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
 		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth

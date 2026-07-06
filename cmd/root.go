@@ -220,6 +220,7 @@ var rootCmd = &cobra.Command{
 		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
 
+		lightFilter, _ := cmd.Flags().GetBool("light-filtering")
 		minQD_SNP, _ := cmd.Flags().GetFloat64("min-QD-SNP")
 		minQUAL_SNP, _ := cmd.Flags().GetFloat64("min-QUAL-SNP")
 		minSOR_SNP, _ := cmd.Flags().GetFloat64("min-SOR-SNP")
@@ -345,6 +346,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		hfConfig := utils.HardFilterConfig{
+			LightFilter:              lightFilter,
 			SNP_QD_Min:               qd_snp,
 			SNP_QUAL_Min:             qual_snp,
 			SNP_SOR_Max:              sor_snp,
@@ -461,6 +463,7 @@ func init() {
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
 
 	// ----------------------------------------------- Filtering ---------------------------------------------------- //
+	rootCmd.Flags().Bool("light-filtering", false, "Light filtering")
 	rootCmd.Flags().Float64("min-QD-SNP", 2.0, "QualByDepth SNPs") // SNP_QD_Min             float64 // default 2.0   – QualByDepth
 	rootCmd.Flags().Float64("min-QUAL-SNP", 30.0, "Variant quality SNPs")
 	rootCmd.Flags().Float64("min-SOR-SNP", 3.0, "StrandOddsRatio SNPs")

@@ -232,25 +232,30 @@ func getRunType(cfg *utils.AnalysisConfig) (string, error) {
 func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype string, idxs []int) error {
 	//--------------------------------------- Filter -----------------------------------------------------------------//
 
-	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v ...\n\n", cfg.VCF, btype)
-	fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
-	fmt.Printf("SNP_QD > %v\n", hfcfg.SNP_QD_Min)
-	fmt.Printf("SNP_QUAL > %v\n", hfcfg.SNP_QUAL_Min)
-	fmt.Printf("SNP_SOR < %v\n", hfcfg.SNP_SOR_Max)
-	fmt.Printf("SNP_FS < %v\n", hfcfg.SNP_FS_Max)
-	fmt.Printf("SNP_MQ > %v\n", hfcfg.SNP_MQ_Min)
-	fmt.Printf("SNP_MQRankSum > %v\n", hfcfg.SNP_MQRankSum_Min)
-	fmt.Printf("SNP_ReadPosRankSum > %v\n", hfcfg.SNP_ReadPosRankSum_Min)
-	fmt.Printf("INDEL_QD > %v\n", hfcfg.INDEL_QD_Min)
-	fmt.Printf("INDEL_QUAL > %v\n", hfcfg.INDEL_QUAL_Min)
-	fmt.Printf("INDEL_FS < %v\n", hfcfg.INDEL_FS_Max)
-	fmt.Printf("INDEL_ReadPosRankSum > %v\n", hfcfg.INDEL_ReadPosRankSum_Min)
-	fmt.Printf("INDEL_SOR < %v\n\n", hfcfg.INDEL_SOR_Max)
-
-	fmt.Printf("Min High parent depth: %v\n", cfg.HighParentDepth)
-	fmt.Printf("Min Low parent depth: %v\n", cfg.LowParentDepth)
-	fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
-	fmt.Printf("Min Low bulk depth: %v\n\n", cfg.LowBulkDepth)
+	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v and pop type %s ...\n\n", cfg.VCF, btype, cfg.Population)
+	if hfcfg.LightFilter {
+		fmt.Println("Light filtering is enabled ...")
+	} else {
+		fmt.Println("Hard filtering using GATK best practices ...")
+	}
+	//fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
+	//fmt.Printf("SNP_QD > %v\n", hfcfg.SNP_QD_Min)
+	//fmt.Printf("SNP_QUAL > %v\n", hfcfg.SNP_QUAL_Min)
+	//fmt.Printf("SNP_SOR < %v\n", hfcfg.SNP_SOR_Max)
+	//fmt.Printf("SNP_FS < %v\n", hfcfg.SNP_FS_Max)
+	//fmt.Printf("SNP_MQ > %v\n", hfcfg.SNP_MQ_Min)
+	//fmt.Printf("SNP_MQRankSum > %v\n", hfcfg.SNP_MQRankSum_Min)
+	//fmt.Printf("SNP_ReadPosRankSum > %v\n", hfcfg.SNP_ReadPosRankSum_Min)
+	//fmt.Printf("INDEL_QD > %v\n", hfcfg.INDEL_QD_Min)
+	//fmt.Printf("INDEL_QUAL > %v\n", hfcfg.INDEL_QUAL_Min)
+	//fmt.Printf("INDEL_FS < %v\n", hfcfg.INDEL_FS_Max)
+	//fmt.Printf("INDEL_ReadPosRankSum > %v\n", hfcfg.INDEL_ReadPosRankSum_Min)
+	//fmt.Printf("INDEL_SOR < %v\n\n", hfcfg.INDEL_SOR_Max)
+	//
+	//fmt.Printf("Min High parent depth: %v\n", cfg.HighParentDepth)
+	//fmt.Printf("Min Low parent depth: %v\n", cfg.LowParentDepth)
+	//fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
+	//fmt.Printf("Min Low bulk depth: %v\n\n", cfg.LowBulkDepth)
 
 	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
