@@ -234,9 +234,9 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v and pop type %s ...\n\n", cfg.VCF, btype, cfg.Population)
 	if hfcfg.LightFilter {
-		fmt.Println("Light filtering is enabled ...")
+		color.Yellow("Light filtering is enabled ...\n\n")
 	} else {
-		fmt.Println("Hard filtering using GATK best practices ...")
+		color.Yellow("Hard filtering using GATK best practices ...")
 	}
 	//fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
 	//fmt.Printf("SNP_QD > %v\n", hfcfg.SNP_QD_Min)
@@ -257,12 +257,12 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	//fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
 	//fmt.Printf("Min Low bulk depth: %v\n\n", cfg.LowBulkDepth)
 
-	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
+	passedVariants, _, _, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Original variants: %v\nFiltered Variants: %v\n\n", original, passed)
+	//fmt.Printf("Original variants: %v\nFiltered Variants: %v\n\n", original, passed)
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 

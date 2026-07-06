@@ -4,50 +4,119 @@
 
 GoBSAseq identifies genomic regions associated with phenotypic traits by applying hard filtering to VCF files, computing allele frequency statistics, performing Gaussian smoothing, and detecting QTL intervals using Z-score thresholding, Monte Carlo simulations, and Bayesian regression modeling (BRM).
 
-## Quick Start
+## Getting Started
+
+### Prerequisites
+
+- **Go 1.26+** — [download](https://go.dev/dl/)
+- A **multi-sample VCF** (`.vcf` or `.vcf.gz`) with `GT`, `AD`, `DP`, and GATK-style INFO fields (`QD`, `FS`, `SOR`, `MQ`, …), **or** bulk BAM/CRAM files plus a reference FASTA for variant calling
+
+### Install & build
 
 ```bash
-# Build
 git clone https://github.com/gmaffy/GoBSAseq.git
 cd GoBSAseq
-go build -o gobsaseq
+go build -o gobsaseq .
+```
 
-# Run (two-parent, two-bulk F2 example)
+### Run (VCF input)
+
+The simplest path is an existing multi-sample VCF. Assign samples with `-P` (parents) and `-B` (bulks); use `None` for a missing role (e.g. bulks-only: `-P None,None`).
+
+```bash
 ./gobsaseq \
   -V my_variants.vcf.gz \
-  -P parent1,parent2 \
+  -P parent_high,parent_low \
   -B bulk_high,bulk_low \
   -p 10,10 \
   -b 100,100 \
-  -S 500,500 \
+  -S 250,250 \
   -w 2000000 \
-  -s 100000 \
+  -m F2 \
   -o results
-
-# Check output
-ls results/goBSAseqResults/<timestamp>/
-# plots/  qtls/  stats/
 ```
 
-**Requirements**: Go 1.26.3+ ([download](https://go.dev/dl/)). Python 3 optional (for snpEff gene annotation).
+If `-P` / `-B` names are omitted or not found in the VCF header, GoBSAseq prompts you interactively to pick samples (enter `0` for **None**).
+
+Results are written to `<out>/goBSAseqResults/`:
+
+```
+stats/   # filtered VCF, raw & smoothed TSVs, BRM blocks
+qtls/    # individual, composite-Z, and merged QTL Excel files
+plots/   # interactive HTML genome plots
+```
 
 ---
 
 ## Usage
 
 ```bash
-gobsaseq -V <vcf> -P <parents> -B <bulks> [options]
-
-# Or with BAMs/reads instead of (or alongside) a VCF:
-gobsaseq -V <vcf> -P <parents> -B <bulks> \
-  --parents-bams hp.bam,lp.bam --bulks-bams hb.bam,lb.bam [options]
-
-gobsaseq -V <vcf> -P <parents> -B <bulks> \
-  --hp-reads fwd.fq,rev.fq --lp-reads fwd.fq,rev.fq \
-  --hb-reads fwd.fq,rev.fq --lb-reads fwd.fq,rev.fq [options]
+gobsaseq [options]
 ```
 
-### CLI Flags
+### Input modes
+
+Provide **one** input type only (they cannot be combined):
+
+| Mode | Flags | Notes |
+|------|-------|-------|
+| **VCF** | `-V file.vcf.gz` | Most common. No BAM or read flags. |
+| **BAM** | `--parents-bams hp.bam,lp.bam` and/or `--bulks-bams hb.bam,lb.bam` | Variant calling runs first; requires `-r` (reference) and `-o`. Parent BAMs are optional. |
+| **Reads** | `--hp-reads`, `--lp-reads`, `--hb-reads`, `--lb-reads` | Not yet implemented. |
+
+### Sample roles
+
+`-P` and `-B` take comma-separated names: `high,low`. Use `None` to skip a role.
+
+| Example | Mode | Description |
+|---------|------|-------------|
+| `-P a,b -B x,y` | `2p2b` | Two parents, two bulks |
+| `-P a,None -B x,y` | `hp2b` | High parent + both bulks |
+| `-P None,None -B x,y` | `2b` | Bulks only |
+
+Analysis mode is inferred automatically from which roles are set.
+
+### Essential flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-V` | — | Input VCF (VCF mode) |
+| `-P` | `,` | Parent sample names (`high,low`) |
+| `-B` | `,` | Bulk sample names (`high,low`) |
+| `-p` | `5,5` | Min depth in parents |
+| `-b` | `40,40` | Min depth in bulks |
+| `-S` | `20,20` | Individuals per bulk (for Monte Carlo thresholds) |
+| `-w` | `2000000` | Gaussian smoothing window (bp); σ = window / 2 |
+| `-m` | `F2` | Population: `F2`, `F3`, `RIL`, `BC1H`, `BC1L`, `BC2H`, `BC2L` |
+| `-o` | `.` | Output directory |
+| `-r` | — | Reference FASTA (required for BAM mode) |
+| `--rep` | `1000` | Monte Carlo simulations for thresholds |
+| `--light-filtering` | off | Skip GATK hard-filter thresholds |
+
+### BAM example
+
+```bash
+./gobsaseq \
+  --parents-bams parent_a.bam,parent_b.bam \
+  --bulks-bams bulk_high.bam,bulk_low.bam \
+  -r reference.fa \
+  -p 10,10 -b 100,100 -S 250,250 \
+  -w 2000000 -m F2 \
+  -o results
+```
+
+### Gene space (optional)
+
+Add annotation files to map QTLs to genes. If omitted, the pipeline skips gene-space analysis (or prompts to continue without it):
+
+```bash
+  --snpEffDB GRCh38.99 --gff genes.gff3 \
+  --gene-descriptions gene_desc.tsv --prg pangenome.prg
+```
+
+See [CLI Flags](#cli-flags) below for the full option list.
+
+---
 
 #### Input & Samples
 
@@ -76,8 +145,8 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel σ (bp); window = 2×σ |
-| `-s` / `--step-size` | int64 | `100000` | Sliding window step size (bp) |
+| `-w` / `--window-size` | int64 | `2000000` | Gaussian smoothing window (bp); σ = window / 2 |
+| `-s` / `--step-size` | int64 | `100000` | BRM sliding-window step size (bp) |
 | `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC1H`, `BC1L`, `BC2H`, `BC2L` |
 | `--brm-alpha` | float64 | `0.05` | BRM significance level |
 | `--rep` | int | `1000` | Number of simulations for thresholds |
@@ -156,13 +225,13 @@ GoBSAseq expects a **multi-sample VCF** (v4.1/4.2) with:
 chr1    1000 .   A    T    60    PASS    QD=20.0;FS=0.0;SOR=0.8;MQ=60  GT:AD:DP  0/0:50,0:50  1/1:0,45:45  0/1:25,25:50  0/1:30,14:44
 ```
 
-Use `None` for missing roles: `-P None -B bulk_high,bulk_low` for bulks-only analysis.
+Use `None` for missing roles: `-P None,None -B bulk_high,bulk_low` for bulks-only analysis.
 
 ---
 
 ## Output
 
-Results are written to `<out>/goBSAseqResults/<timestamp>/`:
+Results are written to `<out>/goBSAseqResults/`:
 
 ```
 stats/
@@ -172,9 +241,9 @@ stats/
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
   *.lowqual.vcf.gz                 # Variants failing hard filter
 qtls/
-  *.qtls.tsv                       # Z-score QTLs (|CompositeZ| ≥ 3.0) - **Primary output**
-  *.merged_qtls.tsv                # Union of Z-score + BRM intervals
-  *.mc_qtls.tsv                   # Monte Carlo threshold-based QTLs (optional)
+  *.individual.qtl.xlsx            # Per-statistic QTL peaks
+  *.compositez.qtl.xlsx            # CompositeZ QTL peaks
+  *.final.qtl.xlsx                 # Merged CompositeZ + BRM intervals
 plots/
   *.individual_plots.html          # Per-statistic charts with thresholds
   *.robust_z_overlay.html          # All Z-scores overlaid per chromosome
@@ -182,6 +251,8 @@ plots/
 genespace/  (if annotation enabled)
   *.genes_in_qtls.tsv              # Genes overlapping QTL regions
 ```
+
+Primary QTL output is `qtls/*.final.qtl.xlsx` (merged CompositeZ and BRM intervals).
 
 ### Key Columns
 

@@ -11,30 +11,15 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/schollz/progressbar/v3"
 )
 
 const minVariantsInKernel = 5
 
 const kernelCutoffSigmas = 3.0
 
-// compositeZStatCount is the number of Z-scores that consolidate() adds to the
-// czs slice for each bsaType mode.  It must equal what countZStats() in
-// thresholds.go returns; validateCompositeZStatCount() checks this at runtime.
-//
-// Two-bulk: ZDeltaSI + ZGstat + ZLOD = 3
-// One-bulk: ZAFDev + ZOneBulkG + ZOneBulkLOD = 3
 const compositeZStatCountPerMode = 3
 
-// validateCompositeZStatCount panics if the number of statistics that consolidate()
-// would place into CompositeZ for the given bsaType does not match the value
-// returned by countZStats().  This catches any future divergence between the two
-// functions at the earliest possible point in the pipeline rather than silently
-// producing wrong CompositeZ values and miscalibrated thresholds.
-//
-// countZStats is passed as a function argument to avoid an import cycle
-// (smoothing.go is in package stats; thresholds.go is also in package stats,
-// so direct reference is fine — but accepting it as a func keeps the coupling
-// explicit and testable).
 func validateCompositeZStatCount(bsaType string, countZStats func(string) int) {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
@@ -105,10 +90,6 @@ type SmoothedStats struct {
 }
 
 func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
-
-	// Fix 6: Verify that consolidate() and countZStats() agree on k before doing
-	// any work.  Panics immediately if they diverge (e.g. after editing one but
-	// not the other), preventing silently wrong CompositeZ values and thresholds.
 	validateCompositeZStatCount(bsaType, countZStats)
 
 	if len(rawStats) == 0 {
@@ -121,7 +102,7 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 	bw := float64(cfg.WindowSize) / 2.0
 
 	color.Cyan("\n============================ Smoothing & Normalising (%s) ============================\n\n", bsaType)
-	color.Cyan("Gaussian kernel σ = %.0f bp  (WindowSize=%d / 2)\n\n", bw, cfg.WindowSize)
+	//color.Cyan("Gaussian kernel σ = %.0f bp  (WindowSize=%d / 2)\n\n", bw, cfg.WindowSize)
 
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
@@ -177,6 +158,7 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 	})
 
 	out := make([]SmoothedStats, len(raw))
+	bar := progressbar.Default(int64(len(raw)), "Gaussian kernel smoothing of variants")
 
 	i := 0
 	for i < len(idx) {
@@ -195,35 +177,6 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 		for k, ci := range chromIdx {
 			pos[k] = float64(raw[ci].POS)
 			depth[k] = math.Max(float64(raw[ci].Depth), 1)
-		}
-
-		// smooth1 computes one depth-weighted Gaussian smoothed slice.
-		// The inner loop uses binary search to find the [lo, hi) range of
-		// variants within the cutoff, avoiding a full O(n) scan per query.
-		smooth1 := func(vals []float64) ([]float64, []int) {
-			smVals := make([]float64, n)
-			nContrib := make([]int, n) // number of variants with w > 0
-			for k := 0; k < n; k++ {
-				pK := pos[k]
-				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
-				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
-
-				wSum, wValSum := 0.0, 0.0
-				for m := lo; m < hi; m++ {
-					d := (pos[m] - pK) / bw
-					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
-					if w <= 0 {
-						continue
-					}
-					wSum += w
-					wValSum += w * vals[m]
-					nContrib[k]++
-				}
-				if wSum > 0 {
-					smVals[k] = wValSum / wSum
-				}
-			}
-			return smVals, nContrib
 		}
 
 		// Collect (raw values, setter) pairs for every active statistic.
@@ -268,17 +221,43 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			)
 		}
 
-		// Smooth each statistic and record the per-position contributor count
-		// from the first stat (all stats share the same position grid and depth
-		// weights, so counts are identical regardless of which stat is used).
-		smoothedVals := make([][]float64, len(pairs))
-		var nContrib []int
-		for p, sp := range pairs {
-			sv, nc := smooth1(sp.vals)
-			smoothedVals[p] = sv
-			if nContrib == nil {
-				nContrib = nc
+		// Single fused pass: compute shared kernel weights once per position,
+		// then accumulate all statistics together (avoids re-running binary
+		// search and exp() for every stat column).
+		nStats := len(pairs)
+		smoothedVals := make([][]float64, nStats)
+		for p := range smoothedVals {
+			smoothedVals[p] = make([]float64, n)
+		}
+		nContrib := make([]int, n)
+		wValSums := make([]float64, nStats)
+
+		for k := 0; k < n; k++ {
+			pK := pos[k]
+			lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
+			hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
+
+			wSum := 0.0
+			clear(wValSums)
+			for m := lo; m < hi; m++ {
+				d := (pos[m] - pK) / bw
+				w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
+				if w <= 0 {
+					continue
+				}
+				wSum += w
+				nContrib[k]++
+				for p := 0; p < nStats; p++ {
+					wValSums[p] += w * pairs[p].vals[m]
+				}
 			}
+			if wSum > 0 {
+				invWSum := 1.0 / wSum
+				for p := 0; p < nStats; p++ {
+					smoothedVals[p][k] = wValSums[p] * invWSum
+				}
+			}
+			_ = bar.Add(1)
 		}
 
 		// Assign to output; skip positions with insufficient kernel coverage.
@@ -306,6 +285,8 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 
 		i = j
 	}
+
+	_ = bar.Finish()
 
 	// Filter out sentinel (sparse) positions.
 	valid := out[:0]

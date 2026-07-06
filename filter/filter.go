@@ -13,6 +13,7 @@ import (
 	"github.com/biogo/hts/bgzf"
 	"github.com/biogo/hts/tabix"
 	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/schollz/progressbar/v3"
 )
@@ -201,154 +202,215 @@ func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bo
 
 	switch bsaType {
 	case "2b":
-		// bulks only
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
+		// bulks only — check depths only, genotype calls in bulks are ignored
+		if cfg.HighBulkIdx < 0 || cfg.HighBulkIdx >= len(v.Samples) || v.Samples[cfg.HighBulkIdx] == nil {
+			return false
+		}
+		if cfg.LowBulkIdx < 0 || cfg.LowBulkIdx >= len(v.Samples) || v.Samples[cfg.LowBulkIdx] == nil {
+			return false
 		}
 		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "2p2b":
-		// bulks must be fully genotyped — no missing data tolerated
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
-		}
-
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
+		// parents may have partial missing data. If one parent is completely missing,
+		// we infer/rescue its allele as the opposite of the resolved parent.
 		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
 		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
+		if !hpOK && !lpOK {
+			return false // both parents missing — cannot resolve
 		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
+
+		if hpOK && lpOK {
+			if hpAllele == lpAllele {
+				return false // same allele in both parents — not informative
+			}
+		} else {
+			// One parent is resolved, the other is missing.
+			// Infer the missing parent has the opposite allele since the site is biallelic.
+			if hpOK {
+				if hpAllele == 0 {
+					lpAllele = targetAlt
+				} else {
+					lpAllele = 0
+				}
+			} else {
+				if lpAllele == 0 {
+					hpAllele = targetAlt
+				} else {
+					hpAllele = 0
+				}
+			}
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
 		lp := v.Samples[cfg.LowParentIdx]
+		hb := v.Samples[cfg.HighBulkIdx]
+		lb := v.Samples[cfg.LowBulkIdx]
 
-		return hp.DP >= cfg.HighParentDepth &&
-			lp.DP >= cfg.LowParentDepth &&
-			v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth &&
-			v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		if hp == nil || lp == nil || hb == nil || lb == nil {
+			return false
+		}
+
+		// Enforce depth checks only on the parent that was actually resolved
+		hpDepthPass := !hpOK || hp.DP >= cfg.HighParentDepth
+		lpDepthPass := !lpOK || lp.DP >= cfg.LowParentDepth
+
+		return hpDepthPass && lpDepthPass && hb.DP >= cfg.HighBulkDepth && lb.DP >= cfg.LowBulkDepth
+
 	case "2plb":
-		// bulk must be fully genotyped — no missing data tolerated
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
-
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
 		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
 		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
-		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
-		}
-
-		hp := v.Samples[cfg.HighParentIdx]
-		lp := v.Samples[cfg.LowParentIdx]
-
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
-	case "2phb":
-		// bulk must be fully genotyped — no missing data tolerated
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
+		if !hpOK && !lpOK {
 			return false
 		}
 
-		// parents may have partial missing data, as long as we can still
-		// resolve which allele (ref or alt) each one carries
-		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
-		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
-		if !hpOK || !lpOK {
-			return false
-		}
-		if hpAllele == lpAllele {
-			return false // same allele in both parents — not informative
-		}
-
-		hp := v.Samples[cfg.HighParentIdx]
-		lp := v.Samples[cfg.LowParentIdx]
-
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
-	case "hp2b":
-		// high parent 2 bulks filter — bulks must be fully genotyped
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+		if hpOK && lpOK {
+			if hpAllele == lpAllele {
 				return false
 			}
+		} else {
+			if hpOK {
+				if hpAllele == 0 {
+					lpAllele = targetAlt
+				} else {
+					lpAllele = 0
+				}
+			} else {
+				if lpAllele == 0 {
+					hpAllele = targetAlt
+				} else {
+					hpAllele = 0
+				}
+			}
 		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+		lb := v.Samples[cfg.LowBulkIdx]
+
+		if hp == nil || lp == nil || lb == nil {
+			return false
+		}
+
+		hpDepthPass := !hpOK || hp.DP >= cfg.HighParentDepth
+		lpDepthPass := !lpOK || lp.DP >= cfg.LowParentDepth
+
+		return hpDepthPass && lpDepthPass && lb.DP >= cfg.LowBulkDepth
+
+	case "2phb":
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK && !lpOK {
+			return false
+		}
+
+		if hpOK && lpOK {
+			if hpAllele == lpAllele {
+				return false
+			}
+		} else {
+			if hpOK {
+				if hpAllele == 0 {
+					lpAllele = targetAlt
+				} else {
+					lpAllele = 0
+				}
+			} else {
+				if lpAllele == 0 {
+					hpAllele = targetAlt
+				} else {
+					hpAllele = 0
+				}
+			}
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+		hb := v.Samples[cfg.HighBulkIdx]
+
+		if hp == nil || lp == nil || hb == nil {
+			return false
+		}
+
+		hpDepthPass := !hpOK || hp.DP >= cfg.HighParentDepth
+		lpDepthPass := !lpOK || lp.DP >= cfg.LowParentDepth
+
+		return hpDepthPass && lpDepthPass && hb.DP >= cfg.HighBulkDepth
+
+	case "hp2b":
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
 			return false
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
-	case "lp2b":
-		// low parent 2 bulks filter — bulks must be fully genotyped
-		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
+		hb := v.Samples[cfg.HighBulkIdx]
+		lb := v.Samples[cfg.LowBulkIdx]
+		if hp == nil || hb == nil || lb == nil {
+			return false
 		}
+		return hp.DP >= cfg.HighParentDepth && hb.DP >= cfg.HighBulkDepth && lb.DP >= cfg.LowBulkDepth
+
+	case "lp2b":
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
 			return false
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		hb := v.Samples[cfg.HighBulkIdx]
+		lb := v.Samples[cfg.LowBulkIdx]
+		if lp == nil || hb == nil || lb == nil {
+			return false
+		}
+		return lp.DP >= cfg.LowParentDepth && hb.DP >= cfg.HighBulkDepth && lb.DP >= cfg.LowBulkDepth
 
 	case "hphb":
-		// high parent high bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
-			return false
-		}
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
 			return false
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		hb := v.Samples[cfg.HighBulkIdx]
+		if hp == nil || hb == nil {
+			return false
+		}
+		return hp.DP >= cfg.HighParentDepth && hb.DP >= cfg.HighBulkDepth
+
 	case "hplb":
-		// high parent low bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.HighParentIdx, targetAlt) {
 			return false
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		lb := v.Samples[cfg.LowBulkIdx]
+		if hp == nil || lb == nil {
+			return false
+		}
+		return hp.DP >= cfg.HighParentDepth && lb.DP >= cfg.LowBulkDepth
+
 	case "lphb":
-		// low parent high bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.HighBulkIdx, targetAlt) {
-			return false
-		}
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
 			return false
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		hb := v.Samples[cfg.HighBulkIdx]
+		if lp == nil || hb == nil {
+			return false
+		}
+		return lp.DP >= cfg.LowParentDepth && hb.DP >= cfg.HighBulkDepth
+
 	case "lplb":
-		// low parent low bulk filter — bulk must be fully genotyped
-		if !sampleHasOnlyRefOrAlt(v, cfg.LowBulkIdx, targetAlt) {
-			return false
-		}
 		// parent may have partial missing data
 		if !sampleAllelesOKLenient(v, cfg.LowParentIdx, targetAlt) {
 			return false
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		lb := v.Samples[cfg.LowBulkIdx]
+		if lp == nil || lb == nil {
+			return false
+		}
+		return lp.DP >= cfg.LowParentDepth && lb.DP >= cfg.LowBulkDepth
 
 	default:
 		return false
@@ -642,11 +704,10 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	}
 
 	original := int(originalCount.Load())
-	skipped := int(skippedCount.Load())
+	//skipped := int(skippedCount.Load())
 
-	fmt.Printf(
-		"Hard filtering complete: %d variant records read (%d gVCF ref blocks skipped) → %d passed, %d rejected\n",
-		original, skipped, passed, original-passed,
+	color.Blue("Hard filtering complete: %d variant records read  → %d passed, %d rejected\n",
+		original, passed, original-passed,
 	)
 
 	return passedVariants, original, passed, nil

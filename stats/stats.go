@@ -51,6 +51,25 @@ type BSAstats struct {
 	Depth int
 }
 
+func safeGetDepths(s *vcfgo.SampleGenotype) (refDepth int, altDepths []int) {
+	if s == nil || s.Fields == nil {
+		return 0, nil
+	}
+	adStr, ok := s.Fields["AD"]
+	if !ok || adStr == "" || adStr == "." {
+		return 0, nil
+	}
+	parts := strings.Split(adStr, ",")
+	if len(parts) > 0 {
+		refDepth, _ = strconv.Atoi(parts[0])
+		for i := 1; i < len(parts); i++ {
+			d, _ := strconv.Atoi(parts[i])
+			altDepths = append(altDepths, d)
+		}
+	}
+	return
+}
+
 func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []*vcfgo.Variant) ([]BSAstats, error) {
 	if len(idxs) == 0 {
 		return nil, fmt.Errorf("no sample indices supplied for %s raw stats", bsaType)
@@ -158,9 +177,11 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 				}
 
 				if highBulkIdx >= 0 {
-					refDepth, _ := v.Samples[highBulkIdx].RefDepth()
-					altDepths, _ := v.Samples[highBulkIdx].AltDepths()
-					altDepth := altDepths[altIdx]
+					refDepth, altDepths := safeGetDepths(v.Samples[highBulkIdx])
+					altDepth := 0
+					if altIdx >= 0 && altIdx < len(altDepths) {
+						altDepth = altDepths[altIdx]
+					}
 					s.HighBulkGT = v.Samples[highBulkIdx].GT
 					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
@@ -176,9 +197,11 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 				}
 
 				if lowBulkIdx >= 0 {
-					refDepth, _ := v.Samples[lowBulkIdx].RefDepth()
-					altDepths, _ := v.Samples[lowBulkIdx].AltDepths()
-					altDepth := altDepths[altIdx]
+					refDepth, altDepths := safeGetDepths(v.Samples[lowBulkIdx])
+					altDepth := 0
+					if altIdx >= 0 && altIdx < len(altDepths) {
+						altDepth = altDepths[altIdx]
+					}
 					s.LowBulkGT = v.Samples[lowBulkIdx].GT
 					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
