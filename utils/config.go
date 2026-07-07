@@ -3,6 +3,7 @@ package utils
 import "github.com/brentp/vcfgo"
 
 type HardFilterConfig struct {
+	LightFilter              bool
 	SNP_QD_Min               float64
 	SNP_QUAL_Min             float64
 	SNP_SOR_Max              float64

@@ -231,26 +231,31 @@ func getRunType(cfg *utils.AnalysisConfig) (string, error) {
 
 func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype string, idxs []int) error {
 	//--------------------------------------- Filter -----------------------------------------------------------------//
+	color.Cyan("=========================================== Options =========================================================\n")
+
+	color.Blue("High Parent: %s (Min depth :%v)\n", cfg.HighParentName, cfg.HighParentDepth)
+	color.Blue("Low Parent: %s (Min depth :%v)\n", cfg.LowParentName, cfg.LowParentDepth)
+	color.Blue("High Bulk: %s (Min depth :%v, Bulk size: %v)\n", cfg.HighBulkName, cfg.HighBulkDepth, cfg.HighBulkSize)
+	color.Blue("Low Bulk: %s (Min depth :%v, Bulk size: %v)\n", cfg.LowBulkName, cfg.LowBulkDepth, cfg.LowBulkSize)
+
+	color.Blue("VCF: %s\n", cfg.VCF)
+	color.Blue("Output directory: %s\n", cfg.OutputDir)
+	color.Blue("Population type: %s\n", cfg.Population)
+	color.Blue("Window size: %d\n", cfg.WindowSize)
 
 	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v ...\n\n", cfg.VCF, btype)
-	fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
-	fmt.Printf("SNP_QD > %v\n", hfcfg.SNP_QD_Min)
-	fmt.Printf("SNP_QUAL > %v\n", hfcfg.SNP_QUAL_Min)
-	fmt.Printf("SNP_SOR < %v\n", hfcfg.SNP_SOR_Max)
-	fmt.Printf("SNP_FS < %v\n", hfcfg.SNP_FS_Max)
-	fmt.Printf("SNP_MQ > %v\n", hfcfg.SNP_MQ_Min)
-	fmt.Printf("SNP_MQRankSum > %v\n", hfcfg.SNP_MQRankSum_Min)
-	fmt.Printf("SNP_ReadPosRankSum > %v\n", hfcfg.SNP_ReadPosRankSum_Min)
-	fmt.Printf("INDEL_QD > %v\n", hfcfg.INDEL_QD_Min)
-	fmt.Printf("INDEL_QUAL > %v\n", hfcfg.INDEL_QUAL_Min)
-	fmt.Printf("INDEL_FS < %v\n", hfcfg.INDEL_FS_Max)
-	fmt.Printf("INDEL_ReadPosRankSum > %v\n", hfcfg.INDEL_ReadPosRankSum_Min)
-	fmt.Printf("INDEL_SOR < %v\n\n", hfcfg.INDEL_SOR_Max)
 
-	fmt.Printf("Min High parent depth: %v\n", cfg.HighParentDepth)
-	fmt.Printf("Min Low parent depth: %v\n", cfg.LowParentDepth)
-	fmt.Printf("Min High bulk depth: %v\n", cfg.HighBulkDepth)
-	fmt.Printf("Min Low bulk depth: %v\n", cfg.LowBulkDepth)
+	fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
+
+	if hfcfg.LightFilter {
+		color.Yellow("Light filtering enabled")
+	} else {
+		color.Yellow("Light filtering disabled. Filtering using GATK best practices ...")
+		color.Blue("SNPs")
+		fmt.Printf("QD > %v, QUAL > %v, SOR > %v, FS < %v, MQ > %v, MQRankSum > %v, ReadPosRankSum > %v \n", hfcfg.SNP_QD_Min, hfcfg.SNP_QUAL_Min, hfcfg.SNP_SOR_Max, hfcfg.SNP_FS_Max, hfcfg.SNP_MQ_Min, hfcfg.SNP_MQRankSum_Min, hfcfg.SNP_ReadPosRankSum_Min)
+		color.Blue("Indels")
+		fmt.Printf("QD > %v, QUAL > %v, FS < %v, ReadPosRankSum > %v, SOR > %v \n\n", hfcfg.INDEL_QD_Min, hfcfg.INDEL_QUAL_Min, hfcfg.INDEL_FS_Max, hfcfg.INDEL_ReadPosRankSum_Min, hfcfg.INDEL_SOR_Max)
+	}
 
 	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
