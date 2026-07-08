@@ -18,20 +18,19 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// realAltIndices returns the 1-based allele indices of every "real" ALT at
-// a site (excluding spanning-deletion '*', missing '.', and symbolic <...>
-// alleles). Previously only sites with exactly one real ALT were kept and
-// everything else was discarded outright; but a BSA-seq cross typically only
-// segregates for one of several ALTs at a genuinely multi-allelic site, so
-// callers should try each candidate rather than rejecting the whole record.
-func realAltIndices(v *vcfgo.Variant) []int {
-	var idxs []int
+func singleRealAlt(v *vcfgo.Variant) int {
+	realIdx := -1
+	count := 0
 	for i, alt := range v.Alt() {
 		if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
-			idxs = append(idxs, i+1) // vcfgo uses 1-based allele numbering
+			realIdx = i
+			count++
 		}
 	}
-	return idxs
+	if count != 1 {
+		return -1
+	}
+	return realIdx + 1 // vcfgo uses 1-based allele numbering
 }
 
 func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
@@ -131,30 +130,6 @@ func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
 	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
 }
 
-// effectiveDP returns a sample's total depth for coverage-threshold checks,
-// falling back to AD-derived depth (ref + all alts) when FORMAT DP is
-// missing or zero. Without this, a sample whose caller only populates AD
-// (no DP) could pass the AD-based allele-signal check yet still be rejected
-// by a depth-threshold comparison that only looks at raw DP.
-func effectiveDP(s *vcfgo.SampleGenotype) int {
-	if s == nil {
-		return 0
-	}
-	if s.DP > 0 {
-		return s.DP
-	}
-	refDepth, errR := safeSampleRefDepth(s)
-	altDepths, errA := safeSampleAltDepths(s)
-	if errR != nil || errA != nil {
-		return 0
-	}
-	total := refDepth
-	for _, d := range altDepths {
-		total += d
-	}
-	return total
-}
-
 func isHomozygous(gt []int) bool {
 	if len(gt) == 0 {
 		return false
@@ -217,26 +192,17 @@ func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 	}
 
 	altDepth := altDepths[targetAlt-1]
-	other := 0
-	for i, d := range altDepths {
-		if i != targetAlt-1 {
-			other += d
-		}
-	}
-
-	// Use AD-derived total (ref + all alts) rather than raw FORMAT DP: DP
-	// often includes reads that never resolved to an allele call (low-qual,
-	// soft-clipped, multi-mapping), which would inflate "other" and fail
-	// otherwise-clean samples. Fall back to DP only if it accounts for more
-	// depth than AD does, and only for the denominator — it never
-	// contributes to the "other allele" numerator.
-	adTotal := refDepth + altDepth + other
-	total := adTotal
-	if s.DP > adTotal {
-		total = s.DP
+	total := s.DP
+	if total <= 0 {
+		total = refDepth + altDepth
 	}
 	if total <= 0 {
 		return false
+	}
+
+	other := total - refDepth - altDepth
+	if other < 0 {
+		other = 0
 	}
 	return float64(other)/float64(total) <= maxOtherAlleleFrac
 }
@@ -256,28 +222,14 @@ func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident b
 	refDepth, errR := safeSampleRefDepth(s)
 	altDepths, errA := safeSampleAltDepths(s)
 	if errR == nil && errA == nil && targetAlt-1 >= 0 && targetAlt-1 < len(altDepths) {
-		// Total includes reads supporting *any* allele, not just
-		// ref-vs-target-alt, so a parent with real off-target/contaminating
-		// reads is judged against its full read pool — matching how
-		// hasUsableAlleleSignal treats bulks.
-		total := refDepth
-		for _, d := range altDepths {
-			total += d
-		}
+		altDepth := altDepths[targetAlt-1]
+		total := refDepth + altDepth
 		if total > 0 {
 			refFrac := float64(refDepth) / float64(total)
-			nonRef := total - refDepth
 			switch {
-			// A single discordant read is tolerated regardless of the
-			// fraction it implies — but only when the other allele still
-			// clearly outnumbers it (guards against e.g. a lone alt read
-			// with zero ref support being misread as "ref-confident").
-			// At low parent depth (e.g. the default 5x), this stops one
-			// sequencing error from pushing a genuinely homozygous parent
-			// below the flat purity threshold.
-			case refFrac >= parentAllelePurity || (nonRef <= 1 && refDepth > nonRef):
+			case refFrac >= parentAllelePurity:
 				return 0, true
-			case refFrac <= 1-parentAllelePurity || (refDepth <= 1 && nonRef > refDepth):
+			case refFrac <= 1-parentAllelePurity:
 				return targetAlt, true
 			default:
 				return 0, false
@@ -403,18 +355,11 @@ func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
 }
 
 func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bool {
-	// Try each real ALT as a candidate target and keep the variant if any
-	// one of them shows a valid BSA-seq segregation pattern, instead of
-	// discarding multi-allelic sites outright.
-	for _, targetAlt := range realAltIndices(v) {
-		if bsaSeqFilterAllele(v, cfg, bsaType, targetAlt) {
-			return true
-		}
+	targetAlt := singleRealAlt(v)
+	if targetAlt < 0 {
+		return false
 	}
-	return false
-}
 
-func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string, targetAlt int) bool {
 	switch bsaType {
 	case "2b":
 		// bulks only
@@ -423,7 +368,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 				return false
 			}
 		}
-		return effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "2p2b":
 		// 2 parents 2 bulks filter
@@ -445,10 +390,10 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			return false // same predominant allele in both parents — not informative
 		}
 
-		return effectiveDP(hp) >= cfg.HighParentDepth &&
-			effectiveDP(lp) >= cfg.LowParentDepth &&
-			effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth &&
-			effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return hp.DP >= cfg.HighParentDepth &&
+			lp.DP >= cfg.LowParentDepth &&
+			v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth &&
+			v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "2plb":
 		// 2 parents low bulk filter
 		if !hasUsableAlleleSignal(v, cfg.LowBulkIdx, targetAlt) {
@@ -467,7 +412,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			return false // same predominant allele in both parents — not informative
 		}
 
-		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "2phb":
 		// 2 parents high bulk filter
 		if !hasUsableAlleleSignal(v, cfg.HighBulkIdx, targetAlt) {
@@ -486,7 +431,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			return false // same predominant allele in both parents — not informative
 		}
 
-		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
 	case "hp2b":
 		// high parent 2 bulks filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
@@ -496,7 +441,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
-		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "lp2b":
 		// low parent  2 bulks filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
@@ -505,7 +450,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	case "hphb":
 		// high parent high bulk filter
@@ -515,7 +460,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
 	case "hplb":
 		// high parent low bulk filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.LowBulkIdx} {
@@ -524,7 +469,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 	case "lphb":
 		// low parent high bulk filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx} {
@@ -533,7 +478,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
 	case "lplb":
 		// low parent low bulk filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.LowBulkIdx} {
@@ -542,7 +487,7 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
 
 	default:
 		return false

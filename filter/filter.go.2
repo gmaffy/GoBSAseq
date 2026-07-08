@@ -1,0 +1,681 @@
+package filter
+
+import (
+	"compress/gzip"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	"github.com/brentp/vcfgo"
+)
+
+// ============================================================================
+// Filter Thresholds (GATK Best Practices)
+// ============================================================================
+
+// SNPFilterThresholds implements GATK recommended hard filters for SNPs
+// Source: https://gatk.broadinstitute.org/hc/en-us/articles/360035531112
+type SNPFilterThresholds struct {
+	QD             float64 // Filter if QD < threshold (default: 2.0)
+	FS             float64 // Filter if FS > threshold (default: 60.0)
+	MQ             float64 // Filter if MQ < threshold (default: 40.0)
+	MQRankSum      float64 // Filter if MQRankSum < threshold (default: -12.5)
+	ReadPosRankSum float64 // Filter if ReadPosRankSum < threshold (default: -8.0)
+	SOR            float64 // Filter if SOR > threshold (default: 3.0)
+	MinQUAL        float64 // Filter if QUAL < threshold (default: 0, disabled)
+}
+
+// IndelFilterThresholds implements GATK recommended hard filters for indels
+type IndelFilterThresholds struct {
+	QD             float64 // Filter if QD < threshold (default: 2.0)
+	FS             float64 // Filter if FS > threshold (default: 200.0)
+	ReadPosRankSum float64 // Filter if ReadPosRankSum < threshold (default: -20.0)
+	SOR            float64 // Filter if SOR > threshold (default: 10.0)
+	MinQUAL        float64 // Filter if QUAL < threshold (default: 0, disabled)
+}
+
+// DefaultSNPThresholds returns GATK recommended SNP filter thresholds
+func DefaultSNPThresholds() SNPFilterThresholds {
+	return SNPFilterThresholds{
+		QD:             2.0,
+		FS:             60.0,
+		MQ:             40.0,
+		MQRankSum:      -12.5,
+		ReadPosRankSum: -8.0,
+		SOR:            3.0,
+		MinQUAL:        0,
+	}
+}
+
+// DefaultIndelThresholds returns GATK recommended indel filter thresholds
+func DefaultIndelThresholds() IndelFilterThresholds {
+	return IndelFilterThresholds{
+		QD:             2.0,
+		FS:             200.0,
+		ReadPosRankSum: -20.0,
+		SOR:            10.0,
+		MinQUAL:        0,
+	}
+}
+
+// ============================================================================
+// Filter Configuration
+// ============================================================================
+
+// FilterConfig holds all configuration options for VCF filtering
+type FilterConfig struct {
+	// Input/Output
+	InputFile  string
+	OutputFile string
+
+	// GATK Hard Filter Thresholds
+	SNPThresholds   SNPFilterThresholds
+	IndelThresholds IndelFilterThresholds
+
+	// BSAseq-specific options
+	BulkSampleNames []string // Sample names of bulk pools (checks these for missing data)
+	CheckAllSamples bool     // If true, check ALL samples for missing data (overrides BulkSampleNames)
+
+	// Optional: Minimum depth per bulk sample
+	MinDPPerBulk int // Filter if any bulk has DP < this (0 = disabled)
+
+	// Optional: Filter out variants in specific regions
+	ExcludeRegions []string // Format: "chr:start-end"
+
+	// Tabix path (for indexing)
+	TabixPath string // If empty, uses "tabix" from PATH
+}
+
+// ============================================================================
+// Filter Results
+// ============================================================================
+
+// FilterStats contains statistics about the filtering process
+type FilterStats struct {
+	TotalVariants       int
+	PassedVariants      int
+	FilteredByGATK      int
+	FilteredByMissing   int
+	FilteredByDepth     int
+	FilteredByRegion    int
+	GATKFilterBreakdown map[string]int // Count per filter reason
+}
+
+// FilterResult contains the filtered variants and statistics
+type FilterResult struct {
+	Variants []*vcfgo.Variant
+	Stats    FilterStats
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// getFloatInfo safely extracts a float64 from VCF INFO field
+func getFloatInfo(v *vcfgo.Variant, key string) (float64, bool) {
+	if v.Info == nil {
+		return 0, false
+	}
+
+	val, exists := v.Info[key]
+	if !exists {
+		return 0, false
+	}
+
+	switch typed := val.(type) {
+	case float64:
+		return typed, true
+	case []float64:
+		if len(typed) > 0 {
+			return typed[0], true
+		}
+	case int:
+		return float64(typed), true
+	case []int:
+		if len(typed) > 0 {
+			return float64(typed[0]), true
+		}
+	case string:
+		// Try to parse string as float
+		var f float64
+		_, err := fmt.Sscanf(typed, "%f", &f)
+		if err == nil {
+			return f, true
+		}
+	case []string:
+		if len(typed) > 0 {
+			var f float64
+			_, err := fmt.Sscanf(typed[0], "%f", &f)
+			if err == nil {
+				return f, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+func getIntInfo(v *vcfgo.Variant, key string) (int, bool) {
+	if v.Info == nil {
+		return 0, false
+	}
+
+	val, exists := v.Info[key]
+	if !exists {
+		return 0, false
+	}
+
+	switch typed := val.(type) {
+	case int:
+		return typed, true
+	case []int:
+		if len(typed) > 0 {
+			return typed[0], true
+		}
+	case float64:
+		return int(typed), true
+	case []float64:
+		if len(typed) > 0 {
+			return int(typed[0]), true
+		}
+	}
+
+	return 0, false
+}
+
+// isSNP determines if a variant is a SNP (single nucleotide polymorphism)
+// Returns false for indels, MNVs, or mixed variant types
+func isSNP(v *vcfgo.Variant) bool {
+	refLen := len(v.Ref)
+	if refLen != 1 {
+		return false
+	}
+
+	for _, alt := range v.Alt {
+		if len(alt) != 1 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isIndel determines if a variant is an insertion or deletion
+func isIndel(v *vcfgo.Variant) bool {
+	refLen := len(v.Ref)
+
+	for _, alt := range v.Alt {
+		if len(alt) != refLen {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isMissingGenotype checks if a genotype string indicates missing data
+func isMissingGenotype(gt string) bool {
+	if gt == "" || gt == "." || gt == "./." {
+		return true
+	}
+	// Check for any missing allele (handles both diploid "./." and haploid ".")
+	return strings.Contains(gt, ".")
+}
+
+// getSampleDP extracts the depth (DP) from a sample's genotype fields
+func getSampleDP(sample *vcfgo.SampleGenotype) (int, bool) {
+	if sample.DP != 0 {
+		return sample.DP, true
+	}
+
+	// Try to get from Fields map
+	if dpVal, ok := sample.Fields["DP"]; ok {
+		switch v := dpVal.(type) {
+		case int:
+			return v, true
+		case float64:
+			return int(v), true
+		case string:
+			var dp int
+			_, err := fmt.Sscanf(v, "%d", &dp)
+			if err == nil {
+				return dp, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// getSampleIndices converts sample names to indices in the VCF header
+func getSampleIndices(header *vcfgo.Header, sampleNames []string) ([]int, error) {
+	sampleMap := make(map[string]int)
+	for i, name := range header.SampleNames {
+		sampleMap[name] = i
+	}
+
+	indices := make([]int, 0, len(sampleNames))
+	for _, name := range sampleNames {
+		idx, found := sampleMap[name]
+		if !found {
+			return nil, fmt.Errorf("sample '%s' not found in VCF header", name)
+		}
+		indices = append(indices, idx)
+	}
+
+	return indices, nil
+}
+
+// ============================================================================
+// GATK Hard Filtering
+// ============================================================================
+
+// gatkFilterResult holds the result of GATK hard filtering
+type gatkFilterResult struct {
+	Passed  bool
+	Reasons []string
+}
+
+// applyGATKSNPFilters applies GATK recommended hard filters for SNPs
+func applyGATKSNPFilters(v *vcfgo.Variant, t SNPFilterThresholds) gatkFilterResult {
+	result := gatkFilterResult{Passed: true, Reasons: make([]string, 0)}
+
+	if qd, ok := getFloatInfo(v, "QD"); ok && qd < t.QD {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("QD=%.3f<%.1f", qd, t.QD))
+	}
+
+	if fs, ok := getFloatInfo(v, "FS"); ok && fs > t.FS {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("FS=%.3f>%.1f", fs, t.FS))
+	}
+
+	if mq, ok := getFloatInfo(v, "MQ"); ok && mq < t.MQ {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("MQ=%.3f<%.1f", mq, t.MQ))
+	}
+
+	if mqrs, ok := getFloatInfo(v, "MQRankSum"); ok && mqrs < t.MQRankSum {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("MQRankSum=%.3f<%.1f", mqrs, t.MQRankSum))
+	}
+
+	if rprs, ok := getFloatInfo(v, "ReadPosRankSum"); ok && rprs < t.ReadPosRankSum {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("ReadPosRankSum=%.3f<%.1f", rprs, t.ReadPosRankSum))
+	}
+
+	if sor, ok := getFloatInfo(v, "SOR"); ok && sor > t.SOR {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("SOR=%.3f>%.1f", sor, t.SOR))
+	}
+
+	if t.MinQUAL > 0 && v.Qual < t.MinQUAL {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("QUAL=%.1f<%.1f", v.Qual, t.MinQUAL))
+	}
+
+	return result
+}
+
+// applyGATKIndelFilters applies GATK recommended hard filters for indels
+func applyGATKIndelFilters(v *vcfgo.Variant, t IndelFilterThresholds) gatkFilterResult {
+	result := gatkFilterResult{Passed: true, Reasons: make([]string, 0)}
+
+	if qd, ok := getFloatInfo(v, "QD"); ok && qd < t.QD {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("QD=%.3f<%.1f", qd, t.QD))
+	}
+
+	if fs, ok := getFloatInfo(v, "FS"); ok && fs > t.FS {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("FS=%.3f>%.1f", fs, t.FS))
+	}
+
+	if rprs, ok := getFloatInfo(v, "ReadPosRankSum"); ok && rprs < t.ReadPosRankSum {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("ReadPosRankSum=%.3f<%.1f", rprs, t.ReadPosRankSum))
+	}
+
+	if sor, ok := getFloatInfo(v, "SOR"); ok && sor > t.SOR {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("SOR=%.3f>%.1f", sor, t.SOR))
+	}
+
+	if t.MinQUAL > 0 && v.Qual < t.MinQUAL {
+		result.Passed = false
+		result.Reasons = append(result.Reasons, fmt.Sprintf("QUAL=%.1f<%.1f", v.Qual, t.MinQUAL))
+	}
+
+	return result
+}
+
+// applyGATKHardFilters applies the appropriate GATK filters based on variant type
+func applyGATKHardFilters(v *vcfgo.Variant, snpT SNPFilterThresholds, indelT IndelFilterThresholds) gatkFilterResult {
+	if isSNP(v) {
+		return applyGATKSNPFilters(v, snpT)
+	} else if isIndel(v) {
+		return applyGATKIndelFilters(v, indelT)
+	}
+
+	// For complex variants (MNVs, etc.), apply SNP filters as a conservative approach
+	return applyGATKSNPFilters(v, snpT)
+}
+
+// ============================================================================
+// BSAseq-Specific Filtering
+// ============================================================================
+
+// bsaseqFilterResult holds the result of BSAseq filtering
+type bsaseqFilterResult struct {
+	Passed  bool
+	Reasons []string
+}
+
+// checkMissingData checks for missing genotypes in specified samples
+func checkMissingData(v *vcfgo.Variant, sampleIndices []int, sampleNames []string) bsaseqFilterResult {
+	result := bsaseqFilterResult{Passed: true, Reasons: make([]string, 0)}
+
+	for i, idx := range sampleIndices {
+		if idx >= len(v.Samples) {
+			result.Passed = false
+			name := "unknown"
+			if i < len(sampleNames) {
+				name = sampleNames[i]
+			}
+			result.Reasons = append(result.Reasons, fmt.Sprintf("missing_sample:%s", name))
+			continue
+		}
+
+		sample := v.Samples[idx]
+		if isMissingGenotype(sample.GT) {
+			result.Passed = false
+			name := "unknown"
+			if i < len(sampleNames) {
+				name = sampleNames[i]
+			}
+			result.Reasons = append(result.Reasons, fmt.Sprintf("missing_gt:%s(GT=%s)", name, sample.GT))
+		}
+	}
+
+	return result
+}
+
+// checkDepthPerSample checks that each specified sample meets minimum depth
+func checkDepthPerSample(v *vcfgo.Variant, sampleIndices []int, sampleNames []string, minDP int) bsaseqFilterResult {
+	result := bsaseqFilterResult{Passed: true, Reasons: make([]string, 0)}
+
+	if minDP <= 0 {
+		return result
+	}
+
+	for i, idx := range sampleIndices {
+		if idx >= len(v.Samples) {
+			continue
+		}
+
+		sample := v.Samples[idx]
+		dp, hasDP := getSampleDP(sample)
+		if !hasDP || dp < minDP {
+			result.Passed = false
+			name := "unknown"
+			if i < len(sampleNames) {
+				name = sampleNames[i]
+			}
+			if !hasDP {
+				result.Reasons = append(result.Reasons, fmt.Sprintf("no_dp:%s", name))
+			} else {
+				result.Reasons = append(result.Reasons, fmt.Sprintf("low_dp:%s(DP=%d<%d)", name, dp, minDP))
+			}
+		}
+	}
+
+	return result
+}
+
+// ============================================================================
+// Header Manipulation
+// ============================================================================
+
+// addFilterHeaders adds FILTER header lines to document applied filters
+func addFilterHeaders(header *vcfgo.Header, snpT SNPFilterThresholds, indelT IndelFilterThresholds) {
+	// SNP filters
+	header.AddFilter("LowQD_SNP",
+		fmt.Sprintf("QD < %.1f for SNPs", snpT.QD))
+	header.AddFilter("HighFS_SNP",
+		fmt.Sprintf("FS > %.1f for SNPs", snpT.FS))
+	header.AddFilter("LowMQ_SNP",
+		fmt.Sprintf("MQ < %.1f for SNPs", snpT.MQ))
+	header.AddFilter("LowMQRankSum_SNP",
+		fmt.Sprintf("MQRankSum < %.1f for SNPs", snpT.MQRankSum))
+	header.AddFilter("LowReadPosRankSum_SNP",
+		fmt.Sprintf("ReadPosRankSum < %.1f for SNPs", snpT.ReadPosRankSum))
+	header.AddFilter("HighSOR_SNP",
+		fmt.Sprintf("SOR > %.1f for SNPs", snpT.SOR))
+
+	// Indel filters
+	header.AddFilter("LowQD_INDEL",
+		fmt.Sprintf("QD < %.1f for indels", indelT.QD))
+	header.AddFilter("HighFS_INDEL",
+		fmt.Sprintf("FS > %.1f for indels", indelT.FS))
+	header.AddFilter("LowReadPosRankSum_INDEL",
+		fmt.Sprintf("ReadPosRankSum < %.1f for indels", indelT.ReadPosRankSum))
+	header.AddFilter("HighSOR_INDEL",
+		fmt.Sprintf("SOR > %.1f for indels", indelT.SOR))
+
+	// BSAseq filters
+	header.AddFilter("MissingData_BSA",
+		"Missing genotype data in one or more bulk samples")
+	header.AddFilter("LowDP_BSA",
+		"Insufficient depth in one or more bulk samples")
+}
+
+// ============================================================================
+// Main Filtering Function
+// ============================================================================
+
+// FilterVCF performs complete BSAseq VCF filtering
+// Returns filtered variants and statistics
+func FilterVCF(config FilterConfig) (*FilterResult, error) {
+	// Open input VCF
+	f, err := os.Open(config.InputFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open input VCF: %w", err)
+	}
+	defer f.Close()
+
+	vcfReader, err := vcfgo.NewReader(f, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VCF reader: %w", err)
+	}
+	defer vcfReader.Close()
+
+	// Determine which samples to check for BSAseq filters
+	var sampleIndices []int
+	var sampleNames []string
+
+	if config.CheckAllSamples {
+		// Check all samples
+		sampleIndices = make([]int, len(vcfReader.Header.SampleNames))
+		sampleNames = vcfReader.Header.SampleNames
+		for i := range sampleIndices {
+			sampleIndices[i] = i
+		}
+	} else if len(config.BulkSampleNames) > 0 {
+		// Check only specified bulk samples
+		var err error
+		sampleIndices, err = getSampleIndices(vcfReader.Header, config.BulkSampleNames)
+		if err != nil {
+			return nil, fmt.Errorf("error resolving bulk sample names: %w", err)
+		}
+		sampleNames = config.BulkSampleNames
+	}
+
+	// Add filter headers
+	addFilterHeaders(vcfReader.Header, config.SNPThresholds, config.IndelThresholds)
+
+	// Create output file
+	outFile, err := os.Create(config.OutputFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create output file: %w", err)
+	}
+	defer outFile.Close()
+
+	gzWriter := gzip.NewWriter(outFile)
+	defer gzWriter.Close()
+
+	vcfWriter, err := vcfgo.NewWriter(gzWriter, vcfReader.Header)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create VCF writer: %w", err)
+	}
+	defer vcfWriter.Close()
+
+	// Initialize results
+	result := &FilterResult{
+		Variants: make([]*vcfgo.Variant, 0),
+		Stats: FilterStats{
+			GATKFilterBreakdown: make(map[string]int),
+		},
+	}
+
+	// Process each variant
+	for {
+		variant := vcfReader.Read()
+		if variant == nil {
+			break
+		}
+
+		// Check for read errors
+		if vcfReader.Error() != nil {
+			return nil, fmt.Errorf("error reading VCF at %s:%d: %w",
+				variant.Chrom, variant.Pos, vcfReader.Error())
+		}
+
+		result.Stats.TotalVariants++
+
+		// ================================================================
+		// Step 1: GATK Hard Filtering
+		// ================================================================
+		gatkResult := applyGATKHardFilters(variant, config.SNPThresholds, config.IndelThresholds)
+
+		if !gatkResult.Passed {
+			result.Stats.FilteredByGATK++
+			for _, reason := range gatkResult.Reasons {
+				// Extract filter name (before the '=')
+				filterName := strings.Split(reason, "=")[0]
+				result.Stats.GATKFilterBreakdown[filterName]++
+			}
+			continue
+		}
+
+		// ================================================================
+		// Step 2: BSAseq-Specific Filtering
+		// ================================================================
+
+		// 2a: Check for missing data in bulks
+		if len(sampleIndices) > 0 {
+			missingResult := checkMissingData(variant, sampleIndices, sampleNames)
+			if !missingResult.Passed {
+				result.Stats.FilteredByMissing++
+				continue
+			}
+
+			// 2b: Check for minimum depth in bulks (optional)
+			if config.MinDPPerBulk > 0 {
+				depthResult := checkDepthPerSample(variant, sampleIndices, sampleNames, config.MinDPPerBulk)
+				if !depthResult.Passed {
+					result.Stats.FilteredByDepth++
+					continue
+				}
+			}
+		}
+
+		// ================================================================
+		// Variant passed all filters
+		// ================================================================
+		variant.Filter = "PASS"
+		result.Stats.PassedVariants++
+		result.Variants = append(result.Variants, variant)
+
+		// Write to output VCF
+		if err := vcfWriter.WriteVariant(variant); err != nil {
+			return nil, fmt.Errorf("failed to write variant %s:%d: %w",
+				variant.Chrom, variant.Pos, err)
+		}
+	}
+
+	// Ensure everything is flushed
+	if err := gzWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
+	}
+	outFile.Close()
+
+	// Create tabix index
+	if err := createTabixIndex(config.OutputFile, config.TabixPath); err != nil {
+		return nil, fmt.Errorf("failed to create tabix index: %w", err)
+	}
+
+	return result, nil
+}
+
+// ============================================================================
+// Tabix Indexing
+// ============================================================================
+
+// createTabixIndex creates a tabix index (.tbi) for the compressed VCF
+func createTabixIndex(vcfGzPath string, tabixPath string) error {
+	tabixBin := "tabix"
+	if tabixPath != "" {
+		tabixBin = tabixPath
+	}
+
+	cmd := exec.Command(tabixBin, "-p", "vcf", "-f", vcfGzPath)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("tabix command failed: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+// ============================================================================
+// Convenience Functions
+// ============================================================================
+
+// FilterVCFDefault creates a config with GATK defaults and runs filtering
+func FilterVCFDefault(inputFile, outputFile string, bulkSampleNames []string) (*FilterResult, error) {
+	config := FilterConfig{
+		InputFile:       inputFile,
+		OutputFile:      outputFile,
+		SNPThresholds:   DefaultSNPThresholds(),
+		IndelThresholds: DefaultIndelThresholds(),
+		BulkSampleNames: bulkSampleNames,
+		CheckAllSamples: len(bulkSampleNames) == 0,
+		MinDPPerBulk:    0, // Disabled by default
+	}
+
+	return FilterVCF(config)
+}
+
+// PrintStats prints filtering statistics to stdout
+func PrintStats(result *FilterResult) {
+	fmt.Println("========================================")
+	fmt.Println("VCF Filtering Statistics")
+	fmt.Println("========================================")
+	fmt.Printf("Total variants:        %d\n", result.Stats.TotalVariants)
+	fmt.Printf("Passed variants:       %d\n", result.Stats.PassedVariants)
+	fmt.Printf("Filtered by GATK:      %d\n", result.Stats.FilteredByGATK)
+	fmt.Printf("Filtered by missing:   %d\n", result.Stats.FilteredByMissing)
+	fmt.Printf("Filtered by depth:     %d\n", result.Stats.FilteredByDepth)
+	fmt.Printf("Pass rate:             %.2f%%\n",
+		float64(result.Stats.PassedVariants)/float64(result.Stats.TotalVariants)*100)
+
+	if len(result.Stats.GATKFilterBreakdown) > 0 {
+		fmt.Println("\nGATK Filter Breakdown:")
+		for filter, count := range result.Stats.GATKFilterBreakdown {
+			fmt.Printf("  %s: %d\n", filter, count)
+		}
+	}
+	fmt.Println("========================================")
+}

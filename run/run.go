@@ -241,7 +241,9 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Blue("VCF: %s\n", cfg.VCF)
 	color.Blue("Output directory: %s\n", cfg.OutputDir)
 	color.Blue("Population type: %s\n", cfg.Population)
-	color.Blue("Window size: %d\n", cfg.WindowSize)
+	color.Blue("Window size: %d\n\n", cfg.WindowSize)
+
+	color.Cyan("================================================================================================================\n\n")
 
 	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v ...\n\n", cfg.VCF, btype)
 
@@ -256,6 +258,8 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		color.Blue("Indels")
 		fmt.Printf("QD > %v, QUAL > %v, FS < %v, ReadPosRankSum > %v, SOR > %v \n\n", hfcfg.INDEL_QD_Min, hfcfg.INDEL_QUAL_Min, hfcfg.INDEL_FS_Max, hfcfg.INDEL_ReadPosRankSum_Min, hfcfg.INDEL_SOR_Max)
 	}
+
+	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
