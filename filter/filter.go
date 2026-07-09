@@ -14,6 +14,7 @@ import (
 	"github.com/biogo/hts/bgzf"
 	"github.com/biogo/hts/tabix"
 	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/schollz/progressbar/v3"
 )
@@ -841,11 +842,11 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	}
 
 	original := int(originalCount.Load())
-	skipped := int(skippedCount.Load())
+	//skipped := int(skippedCount.Load())
 
-	fmt.Printf(
-		"Hard filtering complete: %d variant records read (%d gVCF ref blocks skipped) → %d passed, %d rejected\n",
-		original, skipped, passed, original-passed,
+	color.Blue(
+		"Hard filtering complete:\n%d variant records read.\n%d passed.\n%d rejected\n",
+		original, passed, original-passed,
 	)
 
 	return passedVariants, original, passed, nil
