@@ -421,7 +421,8 @@ var rootCmd = &cobra.Command{
 
 		err = run.Run(&a_config, hfConfig)
 		if err != nil {
-			return
+			color.Red("Error: %v", err)
+			os.Exit(1)
 		}
 
 	},

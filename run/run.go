@@ -243,11 +243,11 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Blue("Population type: %s\n", cfg.Population)
 	color.Blue("Window size: %d\n\n", cfg.WindowSize)
 
-	color.Cyan("================================================================================================================\n\n")
+	color.Cyan("============================================================================================================\n\n")
 
 	color.Cyan("STEP 1/10: Filtering %s with bsaseq Type %v ...\n\n", cfg.VCF, btype)
 
-	fmt.Println("---------------------------------- Filtering parameters -------------------------------------------")
+	fmt.Println("---------------------------------- Filtering parameters -----------------------------------------")
 
 	if hfcfg.LightFilter {
 		color.Yellow("Light filtering enabled")
@@ -259,14 +259,15 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		fmt.Printf("QD > %v, QUAL > %v, FS < %v, ReadPosRankSum > %v, SOR > %v \n\n", hfcfg.INDEL_QD_Min, hfcfg.INDEL_QUAL_Min, hfcfg.INDEL_FS_Max, hfcfg.INDEL_ReadPosRankSum_Min, hfcfg.INDEL_SOR_Max)
 	}
 
-	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
+	fmt.Printf("--------------------------------------------------------------------------------------------\n\n")
 
-	passedVariants, original, passed, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
+	passedVariants, _, _, err := filter.HardFilterVcf(*cfg, *hfcfg, btype, idxs)
 
 	if err != nil {
+		fmt.Printf("Error filtering VCF: %v\n", err)
 		return err
 	}
-	fmt.Printf("Original variants: %v\nFiltered Variants: %v\n\n", original, passed)
+	//fmt.Printf("Original variants: %v\nFiltered Variants: %v\n\n", original, passed)
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,19 +18,20 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-func singleRealAlt(v *vcfgo.Variant) int {
-	realIdx := -1
-	count := 0
+// realAltIndices returns the 1-based allele indices of every "real" ALT at
+// a site (excluding spanning-deletion '*', missing '.', and symbolic <...>
+// alleles). Previously only sites with exactly one real ALT were kept and
+// everything else was discarded outright; but a BSA-seq cross typically only
+// segregates for one of several ALTs at a genuinely multi-allelic site, so
+// callers should try each candidate rather than rejecting the whole record.
+func realAltIndices(v *vcfgo.Variant) []int {
+	var idxs []int
 	for i, alt := range v.Alt() {
 		if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
-			realIdx = i
-			count++
+			idxs = append(idxs, i+1) // vcfgo uses 1-based allele numbering
 		}
 	}
-	if count != 1 {
-		return -1
-	}
-	return realIdx + 1 // vcfgo uses 1-based allele numbering
+	return idxs
 }
 
 func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
@@ -51,6 +53,108 @@ func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
 	return true
 }
 
+// safeSampleRefDepth parses REF depth for a sample without calling vcfgo's
+// RefDepth() directly. vcfgo can panic when AD exists but is malformed
+// (e.g. missing the comma separator). On parse failure it returns an error.
+func safeSampleRefDepth(s *vcfgo.SampleGenotype) (int, error) {
+	if s == nil {
+		return 0, fmt.Errorf("nil sample")
+	}
+
+	// Prefer AD when it is well-formed; if AD exists but lacks the comma,
+	// vcfgo would panic, so fall back to RO when available.
+	if ad, ok := s.Fields["AD"]; ok {
+		if comma := strings.Index(ad, ","); comma >= 0 {
+			refStr := ad[:comma]
+			if refStr == "" || refStr == "." {
+				return 0, fmt.Errorf("invalid AD ref depth %q", refStr)
+			}
+			return strconv.Atoi(refStr)
+		}
+	}
+
+	if ro, ok := s.Fields["RO"]; ok {
+		if ro == "" || ro == "." {
+			return 0, fmt.Errorf("invalid RO ref depth %q", ro)
+		}
+		return strconv.Atoi(ro)
+	}
+
+	return 0, fmt.Errorf("no ref depth field (AD/RO)")
+}
+
+// safeSampleAltDepths parses ALT depths for a sample without calling
+// vcfgo's AltDepths() directly. It avoids panics/incorrect parsing when AD is
+// malformed (e.g. missing the comma separator). On parse failure it returns
+// an error.
+func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
+	if s == nil {
+		return []int{}, fmt.Errorf("nil sample")
+	}
+
+	if ad, ok := s.Fields["AD"]; ok {
+		if comma := strings.Index(ad, ","); comma >= 0 {
+			altStr := ad[comma+1:]
+			parts := strings.Split(altStr, ",")
+			vals := make([]int, len(parts))
+			for i, p := range parts {
+				if p == "" || p == "." {
+					return []int{}, fmt.Errorf("invalid AD alt depth %q", p)
+				}
+				v, err := strconv.Atoi(p)
+				if err != nil {
+					return []int{}, err
+				}
+				vals[i] = v
+			}
+			return vals, nil
+		}
+		// If AD is present but malformed (no comma), fall through to AO.
+	}
+
+	if ao, ok := s.Fields["AO"]; ok {
+		parts := strings.Split(ao, ",")
+		vals := make([]int, len(parts))
+		for i, p := range parts {
+			if p == "" || p == "." {
+				return []int{}, fmt.Errorf("invalid AO alt depth %q", p)
+			}
+			v, err := strconv.Atoi(p)
+			if err != nil {
+				return []int{}, err
+			}
+			vals[i] = v
+		}
+		return vals, nil
+	}
+
+	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
+}
+
+// effectiveDP returns a sample's total depth for coverage-threshold checks,
+// falling back to AD-derived depth (ref + all alts) when FORMAT DP is
+// missing or zero. Without this, a sample whose caller only populates AD
+// (no DP) could pass the AD-based allele-signal check yet still be rejected
+// by a depth-threshold comparison that only looks at raw DP.
+func effectiveDP(s *vcfgo.SampleGenotype) int {
+	if s == nil {
+		return 0
+	}
+	if s.DP > 0 {
+		return s.DP
+	}
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR != nil || errA != nil {
+		return 0
+	}
+	total := refDepth
+	for _, d := range altDepths {
+		total += d
+	}
+	return total
+}
+
 func isHomozygous(gt []int) bool {
 	if len(gt) == 0 {
 		return false
@@ -67,25 +171,188 @@ func isHomozygous(gt []int) bool {
 	return true
 }
 
+const (
+	// maxOtherAlleleFrac bounds how much of a sample's total depth may come
+	// from alleles other than REF/target-ALT before the site is considered
+	// too messy to trust (contamination, paralogs, a genuinely
+	// multi-allelic site). This is intentionally loose: BSA-seq bulks are
+	// pools of many individuals, so some background from other alleles is
+	// expected and, on its own, is not a reason to discard an otherwise
+	// informative variant.
+	maxOtherAlleleFrac = 0.20
+
+	// parentAllelePurity is the minimum fraction of a parent's reads that
+	// must support one allele before that allele is treated as "the
+	// parent's allele". BSA-seq parents are ideally fully homozygous inbred
+	// lines, but residual heterozygosity, low-level contamination, and
+	// genotyping noise are common in practice. Requiring a strict
+	// homozygous GT call throws away many genuinely informative markers;
+	// tolerating up to (1 - parentAllelePurity) reads from the other allele
+	// keeps those markers while still rejecting parents that are
+	// genuinely segregating/heterozygous at a site (which would be
+	// uninformative for BSA-seq regardless of filtering strategy).
+	parentAllelePurity = 0.85
+)
+
+// hasUsableAlleleSignal reports whether a sample's allele-depth data at this
+// site is trustworthy enough to use, without requiring a confident discrete
+// genotype call. Pooled bulk samples are frequently emitted with a missing
+// or low-confidence GT by callers designed around single-diploid-sample
+// genotype likelihoods, even when read support itself is perfectly good —
+// gating on GT there discards real BSA-seq signal along with noise. Instead,
+// the sample is only rejected if there's no usable depth at all, or if a
+// large share of its reads support some allele other than REF/target-ALT.
+func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
+	if idx < 0 || idx >= len(v.Samples) {
+		return false
+	}
+	s := v.Samples[idx]
+
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR != nil || errA != nil || targetAlt-1 < 0 || targetAlt-1 >= len(altDepths) {
+		// No usable AD — fall back to the strict GT check rather than
+		// blindly accepting a site we can't actually interpret.
+		return sampleHasOnlyRefOrAlt(v, idx, targetAlt)
+	}
+
+	altDepth := altDepths[targetAlt-1]
+	other := 0
+	for i, d := range altDepths {
+		if i != targetAlt-1 {
+			other += d
+		}
+	}
+
+	// Use AD-derived total (ref + all alts) rather than raw FORMAT DP: DP
+	// often includes reads that never resolved to an allele call (low-qual,
+	// soft-clipped, multi-mapping), which would inflate "other" and fail
+	// otherwise-clean samples. Fall back to DP only if it accounts for more
+	// depth than AD does, and only for the denominator — it never
+	// contributes to the "other allele" numerator.
+	adTotal := refDepth + altDepth + other
+	total := adTotal
+	if s.DP > adTotal {
+		total = s.DP
+	}
+	if total <= 0 {
+		return false
+	}
+	return float64(other)/float64(total) <= maxOtherAlleleFrac
+}
+
+// parentAllele determines which allele (0 = ref, targetAlt = alt) predominates
+// in a parent sample using allele read depths, falling back to the genotype
+// call only when depth data isn't usable. confident is false when the
+// parent's reads are too evenly split between alleles to trust — i.e. the
+// parent looks genuinely heterozygous/segregating at this site, which makes
+// it uninformative for BSA-seq regardless of how strict the filter is.
+func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident bool) {
+	if idx < 0 || idx >= len(v.Samples) {
+		return 0, false
+	}
+	s := v.Samples[idx]
+
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR == nil && errA == nil && targetAlt-1 >= 0 && targetAlt-1 < len(altDepths) {
+		// Total includes reads supporting *any* allele, not just
+		// ref-vs-target-alt, so a parent with real off-target/contaminating
+		// reads is judged against its full read pool — matching how
+		// hasUsableAlleleSignal treats bulks.
+		total := refDepth
+		for _, d := range altDepths {
+			total += d
+		}
+		if total > 0 {
+			refFrac := float64(refDepth) / float64(total)
+			nonRef := total - refDepth
+			switch {
+			// A single discordant read is tolerated regardless of the
+			// fraction it implies — but only when the other allele still
+			// clearly outnumbers it (guards against e.g. a lone alt read
+			// with zero ref support being misread as "ref-confident").
+			// At low parent depth (e.g. the default 5x), this stops one
+			// sequencing error from pushing a genuinely homozygous parent
+			// below the flat purity threshold.
+			case refFrac >= parentAllelePurity || (nonRef <= 1 && refDepth > nonRef):
+				return 0, true
+			case refFrac <= 1-parentAllelePurity || (refDepth <= 1 && nonRef > refDepth):
+				return targetAlt, true
+			default:
+				return 0, false
+			}
+		}
+	}
+
+	// No usable AD — fall back to the genotype call.
+	if len(s.GT) > 0 && s.GT[0] >= 0 && isHomozygous(s.GT) {
+		return s.GT[0], true
+	}
+	return 0, false
+}
+
 func classifyVariant(v *vcfgo.Variant) (isSNP, isIndel bool) {
 	refLen := len(v.Ref())
-	isSNP = refLen == 1
+	sameLength := true
 	for _, alt := range v.Alt() {
 		if alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<') {
 			continue
 		}
-		if len(alt) != 1 {
-			isSNP = false
-		}
 		if len(alt) != refLen {
+			sameLength = false
 			isIndel = true
 		}
 	}
+	// A same-length substitution is a classic SNP when refLen == 1, and an
+	// MNP (multi-nucleotide substitution, e.g. AT>GC) when refLen > 1. MNPs
+	// carry the same annotations as SNPs and aren't indel alignment
+	// artifacts, so they should be filtered with SNP thresholds rather than
+	// falling into neither bucket, which previously caused every MNP to be
+	// silently discarded regardless of quality.
+	isSNP = sameLength
 	return
 }
 
 func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
 	isSNP, isIndel := classifyVariant(v)
+
+	if hfcfg.LightFilter {
+		// Light filtering: reject only variants with genuinely poor support.
+		// QUAL, QD (SNP/INDEL) and MQ (SNP) reflect absolute call confidence
+		// and read-mapping quality, and stay meaningful regardless of how
+		// the sample was pooled. FS, SOR, MQRankSum and ReadPosRankSum, by
+		// contrast, test whether ref- and alt-supporting reads look
+		// different from each other (strand, position, mapping quality) —
+		// in a bulk that is a pool of many individuals, ref/alt reads are
+		// *expected* to be present in a skewed, non-50/50 ratio by design,
+		// which these tests can easily mistake for bias/artifact. Skipping
+		// them here keeps real segregating BSA-seq variants that GATK's
+		// single-sample-tuned best-practice filters would otherwise discard.
+		switch {
+		case isSNP:
+			if float64(v.Quality) < hfcfg.SNP_QUAL_Min {
+				return false
+			}
+			if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.SNP_QD_Min {
+				return false
+			}
+			if mq, ok := utils.GetFloat(v, "MQ"); ok && mq < hfcfg.SNP_MQ_Min {
+				return false
+			}
+			return true
+		case isIndel:
+			if float64(v.Quality) < hfcfg.INDEL_QUAL_Min {
+				return false
+			}
+			if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.INDEL_QD_Min {
+				return false
+			}
+			return true
+		default:
+			return false
+		}
+	}
 
 	switch {
 	case isSNP:
@@ -136,25 +403,32 @@ func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
 }
 
 func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bool {
-	targetAlt := singleRealAlt(v)
-	if targetAlt < 0 {
-		return false
+	// Try each real ALT as a candidate target and keep the variant if any
+	// one of them shows a valid BSA-seq segregation pattern, instead of
+	// discarding multi-allelic sites outright.
+	for _, targetAlt := range realAltIndices(v) {
+		if bsaSeqFilterAllele(v, cfg, bsaType, targetAlt) {
+			return true
+		}
 	}
+	return false
+}
 
+func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string, targetAlt int) bool {
 	switch bsaType {
 	case "2b":
 		// bulks only
 		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
-		return v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 
 	case "2p2b":
 		// 2 parents 2 bulks filter
-		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
@@ -162,111 +436,113 @@ func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bo
 		hp := v.Samples[cfg.HighParentIdx]
 		lp := v.Samples[cfg.LowParentIdx]
 
-		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
-			return false
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
+			return false // parent allele too ambiguous/mixed to be informative
 		}
-		if hp.GT[0] == lp.GT[0] {
-			return false // same allele in both parents — not informative
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
 		}
 
-		return hp.DP >= cfg.HighParentDepth &&
-			lp.DP >= cfg.LowParentDepth &&
-			v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth &&
-			v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth &&
+			effectiveDP(lp) >= cfg.LowParentDepth &&
+			effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth &&
+			effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 	case "2plb":
 		// 2 parents low bulk filter
-		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
+		if !hasUsableAlleleSignal(v, cfg.LowBulkIdx, targetAlt) {
+			return false
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
 		lp := v.Samples[cfg.LowParentIdx]
 
-		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
 			return false
 		}
-		if hp.GT[0] == lp.GT[0] {
-			return false // same allele in both parents — not informative
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
 		}
 
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 	case "2phb":
 		// 2 parents high bulk filter
-		for _, idx := range []int{cfg.HighParentIdx, cfg.LowParentIdx, cfg.HighBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
-				return false
-			}
+		if !hasUsableAlleleSignal(v, cfg.HighBulkIdx, targetAlt) {
+			return false
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
 		lp := v.Samples[cfg.LowParentIdx]
 
-		if !isHomozygous(hp.GT) || !isHomozygous(lp.GT) {
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
 			return false
 		}
-		if hp.GT[0] == lp.GT[0] {
-			return false // same allele in both parents — not informative
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
 		}
 
-		return hp.DP >= cfg.HighParentDepth && lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
 	case "hp2b":
 		// high parent 2 bulks filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 	case "lp2b":
 		// low parent  2 bulks filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 
 	case "hphb":
 		// high parent high bulk filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
 	case "hplb":
 		// high parent low bulk filter
 		for _, idx := range []int{cfg.HighParentIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 		hp := v.Samples[cfg.HighParentIdx]
-		return hp.DP >= cfg.HighParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 	case "lphb":
 		// low parent high bulk filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.HighBulkIdx].DP >= cfg.HighBulkDepth
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
 	case "lplb":
 		// low parent low bulk filter
 		for _, idx := range []int{cfg.LowParentIdx, cfg.LowBulkIdx} {
-			if !sampleHasOnlyRefOrAlt(v, idx, targetAlt) {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
 				return false
 			}
 		}
 		lp := v.Samples[cfg.LowParentIdx]
-		return lp.DP >= cfg.LowParentDepth && v.Samples[cfg.LowBulkIdx].DP >= cfg.LowBulkDepth
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
 
 	default:
 		return false
@@ -279,8 +555,6 @@ type countingWriter struct {
 	n int64
 }
 
-// Write wraps the embedded Writer and counts bytes written so callers can
-// determine file offsets. Use atomic to be goroutine-safe.
 func (cw *countingWriter) Write(p []byte) (int, error) {
 	n, err := cw.Writer.Write(p)
 	if n > 0 {
@@ -435,7 +709,12 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 				break
 			}
 			if err := rdr.Error(); err != nil {
-				if strings.Contains(err.Error(), "bad sample string") {
+				if strings.Contains(err.Error(), "bad sample string") ||
+					strings.Contains(err.Error(), "strconv.ParseFloat") {
+					// vcfgo fails to treat "." (a valid VCF missing-value
+					// marker) as a numeric placeholder in some INFO/FORMAT
+					// fields. This is non-fatal - the field is simply left
+					// unset for this variant - so clear the error and continue.
 					rdr.Clear()
 				} else {
 					e := fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
@@ -453,7 +732,9 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 			filterCh <- v
 		}
 
-		if err := rdr.Error(); err != nil && !strings.Contains(err.Error(), "bad sample string") {
+		if err := rdr.Error(); err != nil &&
+			!strings.Contains(err.Error(), "bad sample string") &&
+			!strings.Contains(err.Error(), "strconv.ParseFloat") {
 			e := fmt.Errorf("VCF read error: %w", err)
 			readerErr.Store(&e)
 		}
