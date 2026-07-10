@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -72,7 +70,6 @@ type simParams struct {
 	highBulkSize int
 	lowBulkSize  int
 	oneBulkSize  int
-	population   string
 }
 
 // ── Module-level caches ──────────────────────────────────────────────────────
@@ -92,63 +89,13 @@ func nextSeed() int64 {
 	return globalSeedCounter.Add(1)
 }
 
-// samplePoolAF samples the allele frequency carried by a pool of individuals.
-// It models diploid genotype dosage, rather than treating each individual as a
-// single allele draw. F2/F3/F4 are successive selfing generations from an F1;
-// RIL is the fully fixed limit. BCnH/L are recurrent-parent backcrosses.
-func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) float64 {
-	if bulkSize <= 0 {
-		return p0
-	}
-	p := strings.ToUpper(strings.TrimSpace(population))
-	selfGenerations := map[string]int{"F2": 1, "F3": 2, "F4": 3}
-	if g, ok := selfGenerations[p]; ok || p == "RIL" {
-		het := 0.0
-		if p != "RIL" {
-			het = math.Pow(0.5, float64(g))
-		}
-		pHom := (1 - het) / 2
-		copies := 0
-		for range bulkSize {
-			u := rng.Float64()
-			switch {
-			case u < pHom:
-				copies += 0
-			case u < pHom+het:
-				copies++
-			default:
-				copies += 2
-			}
-		}
-		return float64(copies) / float64(2*bulkSize)
-	}
-	if strings.HasPrefix(p, "BC") {
-		suffix := p[2:]
-		isHigh := strings.HasSuffix(suffix, "H")
-		suffix = strings.TrimSuffix(strings.TrimSuffix(suffix, "H"), "L")
-		suffix = strings.TrimSuffix(suffix, "F2")
-		n, err := strconv.Atoi(suffix)
-		if err == nil && n >= 1 {
-			het := int(distuv.Binomial{N: float64(bulkSize), P: math.Pow(0.5, float64(n)), Src: rng}.Rand())
-			copies := het
-			if isHigh {
-				copies = 2*bulkSize - het
-			}
-			return float64(copies) / float64(2*bulkSize)
-		}
-	}
-	// Unknown structures are rejected by ExpectedAF before this point. Keep a
-	// conservative diploid fallback for callers that use this helper directly.
-	copies := int(distuv.Binomial{N: float64(2 * bulkSize), P: p0, Src: rng}.Rand())
-	return float64(copies) / float64(2*bulkSize)
-}
-
 // ── Two-bulk simulation ──────────────────────────────────────────────────────
 
 // simulateTwoBulk runs rep draws from a two-stage null model for both bulks:
-// Stage 1: Sample genotype dosage in each bulk population according to the
-// selected cross. This represents the realised allele frequency among the
-// actual diploid individuals in the bulk.
+// Stage 1: Sample the number of alt alleles in each bulk population
+//
+//	(Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//	among the actual individuals in the bulk.
 //
 // Stage 2: Sample the observed reads from that realized frequency
 //
@@ -183,9 +130,29 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
-		// Stage 1: realised diploid genotype dosage in each pool.
-		realizedHighAF := samplePoolAF(rng, p.population, highBulkSize, p.p0High)
-		realizedLowAF := samplePoolAF(rng, p.population, lowBulkSize, p.p0Low)
+		// Stage 1: Sample realized allele counts in the bulk populations
+		// High bulk: sample alt allele count among highBulkSize individuals
+		realizedHighAlt := 0
+		if p.p0High > 0 && p.p0High < 1 {
+			// Binomial: number of alt alleles among highBulkSize individuals
+			distPopHigh := distuv.Binomial{N: float64(highBulkSize), P: p.p0High, Src: rng}
+			realizedHighAlt = int(distPopHigh.Rand())
+		} else if p.p0High >= 1 {
+			realizedHighAlt = highBulkSize
+		} // else p0High == 0, realizedHighAlt = 0
+
+		// Low bulk: sample alt allele count among lowBulkSize individuals
+		realizedLowAlt := 0
+		if p.p0Low > 0 && p.p0Low < 1 {
+			distPopLow := distuv.Binomial{N: float64(lowBulkSize), P: p.p0Low, Src: rng}
+			realizedLowAlt = int(distPopLow.Rand())
+		} else if p.p0Low >= 1 {
+			realizedLowAlt = lowBulkSize
+		}
+
+		// Calculate realized allele frequencies in each bulk
+		realizedHighAF := float64(realizedHighAlt) / float64(highBulkSize)
+		realizedLowAF := float64(realizedLowAlt) / float64(lowBulkSize)
 
 		// Stage 2: Sample observed reads from the realized allele frequencies
 		// High bulk reads
@@ -241,9 +208,8 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 
 // twoBulkCacheKey builds a deterministic string key for the memo cache.
 func twoBulkCacheKey(p simParams) string {
-	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d_%s",
-		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize,
-		strings.ToUpper(strings.TrimSpace(p.population)))
+	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d",
+		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize)
 }
 
 // simulateTwoBulkCached returns cached results or runs the simulation once.
@@ -263,9 +229,10 @@ func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
 // ── One-bulk simulation ──────────────────────────────────────────────────────
 
 // simulateOneBulk runs rep draws from a two-stage null model for a single bulk:
-// Stage 1: Sample genotype dosage in the bulk population according to the
-// selected cross. This represents the realised allele frequency among the
-// actual diploid individuals in the bulk.
+// Stage 1: Sample the number of alt alleles in the bulk population
+//
+//	(Binomial(n=bulk_size, p=p0)) - this represents the realized allele count
+//	among the actual individuals in the bulk.
 //
 // Stage 2: Sample the observed reads from that realized frequency
 //
@@ -293,8 +260,19 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
-		// Stage 1: realised diploid genotype dosage in the pool.
-		realizedAF := samplePoolAF(rng, p.population, bulkSize, p.p0One)
+		// Stage 1: Sample realized allele count in the bulk population
+		realizedAlt := 0
+		if p.p0One > 0 && p.p0One < 1 {
+			// Binomial: number of alt alleles among bulkSize individuals
+			distPop := distuv.Binomial{N: float64(bulkSize), P: p.p0One, Src: rng}
+			realizedAlt = int(distPop.Rand())
+		} else if p.p0One >= 1 {
+			realizedAlt = bulkSize
+		}
+		// else p0One == 0, realizedAlt = 0 (already initialized)
+
+		// Calculate realized allele frequency
+		realizedAF := float64(realizedAlt) / float64(bulkSize)
 
 		// Stage 2: Sample observed reads from the realized allele frequency
 		distReads := distuv.Binomial{N: float64(p.highDepth), P: realizedAF, Src: rng}
@@ -355,7 +333,7 @@ func simulateOneBulkCached(p simParams) OneBulkThresholds {
 func empiricalZThresholds(bsaType string) ZThresholds {
 	numStats := countZStats(bsaType)
 	return ZThresholds{
-		ZP99: 2.576, ZP95: 1.960,
+		ZP99:          2.576, ZP95: 1.960,
 		CompositeZP99: 2.576, CompositeZP95: 1.960,
 		NumStats: numStats,
 	}
@@ -381,8 +359,7 @@ type compositeZSimParams struct {
 	// numStats is the number of Z-scores combined into CompositeZ (k).
 	numStats int
 	// rep is the number of Monte Carlo draws.
-	rep        int
-	population string
+	rep int
 }
 
 // medianOfAbsDeviations computes MAD (median absolute deviation from median).
@@ -433,12 +410,12 @@ func robustZNormCols(mat []float64, rep, k int) {
 // CompositeZ for two-bulk experiments by running the full pipeline null:
 //
 //  1. Stage 1 — population sampling:
-//     hAF ~ population-specific genotype sampling(highBulkSize)
-//     lAF ~ population-specific genotype sampling(lowBulkSize)
+//     hAlt ~ Binomial(highBulkSize, p0)   (alt alleles drawn from pool individuals)
+//     lAlt ~ Binomial(lowBulkSize,  p0)
 //
 //  2. Stage 2 — sequencing sampling:
-//     obs_hAlt ~ Binomial(repDepth, hAF)
-//     obs_lAlt ~ Binomial(repDepth, lAF)
+//     obs_hAlt ~ Binomial(repDepth, hAlt/highBulkSize)
+//     obs_lAlt ~ Binomial(repDepth, lAlt/lowBulkSize)
 //
 //  3. Compute the same raw statistics (ΔSI, G-stat, ED⁴, LOD, BB log-BF, HighSI,
 //     LowSI) that the real pipeline computes from the same counts.
@@ -460,10 +437,15 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 	k := p.numStats
 	mat := make([]float64, p.rep*k) // row-major: mat[i*k+j] = rep i, stat j
 
+	distPopH := distuv.Binomial{N: float64(p.highBulkSize), P: p.p0, Src: rng}
+	distPopL := distuv.Binomial{N: float64(p.lowBulkSize), P: p.p0, Src: rng}
+
 	for i := 0; i < p.rep; i++ {
 		// Stage 1: realised allele frequencies in the two pools.
-		realHAF := samplePoolAF(rng, p.population, p.highBulkSize, p.p0)
-		realLAF := samplePoolAF(rng, p.population, p.lowBulkSize, p.p0)
+		realHAlt := distPopH.Rand()
+		realLAlt := distPopL.Rand()
+		realHAF := realHAlt / float64(p.highBulkSize)
+		realLAF := realLAlt / float64(p.lowBulkSize)
 		// Guard boundary values so Stage 2 Binomial is valid.
 		if realHAF <= 0 {
 			realHAF = 0
@@ -539,9 +521,12 @@ func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 	k := p.numStats
 	mat := make([]float64, p.rep*k)
 
+	distPop := distuv.Binomial{N: float64(bulkSize), P: p.p0, Src: rng}
+
 	for i := 0; i < p.rep; i++ {
 		// Stage 1: realised allele frequency in the pool.
-		realAF := samplePoolAF(rng, p.population, bulkSize, p.p0)
+		realAlt := distPop.Rand()
+		realAF := realAlt / float64(bulkSize)
 		if realAF <= 0 {
 			realAF = 0
 		}
@@ -646,7 +631,6 @@ func calculateEmpiricalCompositeZThresholds(
 			lowBulkSize:  lowBulkSize,
 			oneBulkSize:  oneBulkSize,
 			p0:           p0,
-			population:   cfg.Population,
 			hasBothBulks: true,
 			hasOneBulk:   false,
 			numStats:     numStats,
@@ -660,7 +644,6 @@ func calculateEmpiricalCompositeZThresholds(
 			lowBulkSize:  lowBulkSize,
 			oneBulkSize:  oneBulkSize,
 			p0:           p0,
-			population:   cfg.Population,
 			hasBothBulks: false,
 			hasOneBulk:   true,
 			numStats:     numStats,
@@ -858,7 +841,6 @@ func CalculateThresholds(
 		highBulkSize: cfg.HighBulkSize,
 		lowBulkSize:  cfg.LowBulkSize,
 		oneBulkSize:  cfg.OneBulkSize,
-		population:   cfg.Population,
 	}
 
 	// Pre-populate the cache in parallel for every depth in the dataset.

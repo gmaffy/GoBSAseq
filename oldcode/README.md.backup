@@ -76,8 +76,8 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel width (bp); σ = width / 2 |
-| `-s` / `--step-size` | int64 | `100000` | Reserved for future regular-grid summaries; marker-centred smoothing does not currently use it |
+| `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel σ (bp); window = 2×σ |
+| `-s` / `--step-size` | int64 | `100000` | Sliding window step size (bp) |
 | `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC1H`, `BC1L`, `BC2H`, `BC2L` |
 | `--brm-alpha` | float64 | `0.05` | BRM significance level |
 | `--rep` | int | `1000` | Number of simulations for thresholds |
@@ -172,8 +172,9 @@ stats/
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
   *.lowqual.vcf.gz                 # Variants failing hard filter
 qtls/
-  *.compositez.qtl.xlsx            # CompositeZ QTL intervals (empirical threshold)
-  *.final.qtl.xlsx                 # Interval-level union of CompositeZ + BRM evidence
+  *.qtls.tsv                       # Z-score QTLs (|CompositeZ| ≥ 3.0) - **Primary output**
+  *.merged_qtls.tsv                # Union of Z-score + BRM intervals
+  *.mc_qtls.tsv                   # Monte Carlo threshold-based QTLs (optional)
 plots/
   *.individual_plots.html          # Per-statistic charts with thresholds
   *.robust_z_overlay.html          # All Z-scores overlaid per chromosome
@@ -200,8 +201,8 @@ genespace/  (if annotation enabled)
 3. Smooth & Normalise  → Gaussian kernel smoothing, robust Z-scores (MAD), Stouffer composite Z
 4. Thresholds          → **Two-stage Monte Carlo simulation** for empirical thresholds per depth + bulk size
 5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
-6. QTL Detection       → Regions exceeding the empirical CompositeZ threshold
-7. Individual QTLs     → Per-statistic intervals using depth-specific thresholds
+6. QTL Detection       → Regions with |CompositeZ| ≥ 3.0 (**primary method**)
+7. MC QTL Detection    → **QTLs using per-variant MC thresholds** (fully sound for deep sequencing)
 8. Merge               → Union of Z-score and BRM intervals
 9. Plots               → Interactive HTML charts (echarts) with all thresholds
 10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
@@ -239,9 +240,9 @@ genespace/  (if annotation enabled)
 
 For deeply sequenced datasets, GoBSAseq uses a **two-stage Monte Carlo null model** that properly accounts for the finite population of individuals in each bulk:
 
-**Stage 1**: Sample realised population-specific diploid genotype dosage in the bulk
+**Stage 1**: Sample the realized allele count in the bulk population
 ```
-Pool AF ~ cross-specific genotype sampling (F2/F3/F4/RIL/backcross)
+Alt Alleles ~ Binomial(n = bulk_size, p = p₀)
 ```
 
 **Stage 2**: Sample the observed reads from that realized frequency
@@ -259,11 +260,11 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 
 | Method | Threshold | Primary/Secondary | Output File |
 |--------|-----------|----------------|-------------|
-| **Composite Z-score** | Empirical Monte Carlo threshold | **Primary** | `*.compositez.qtl.xlsx` |
-| **Individual statistics** | Empirical depth-specific thresholds | **Secondary** | `*.individual.qtl.xlsx` |
+| **Composite Z-score** | |CompositeZ| ≥ 3.0 | **Primary** | `*.qtls.tsv` |
+| **Monte Carlo** | Empirical per-variant thresholds | **Secondary** | `*.mc_qtls.tsv` |
 | **BRM Blocks** | Analytical window-based | **Secondary** | `*.brm_blocks.tsv` |
 
-**CompositeZ and individual-statistic detection are run by default.** The threshold TSV records the exact threshold used for every retained marker.
+**Both CompositeZ ≥ 3.0 and Monte Carlo threshold-based detection are run by default.** CompositeZ is the primary method, while Monte Carlo detection provides a fully sound alternative for deep sequencing that uses the simulated thresholds directly.
 
 ---
 

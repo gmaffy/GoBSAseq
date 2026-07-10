@@ -42,11 +42,8 @@ type AnalysisConfig struct {
 	StepSize   int
 	Rep        int
 	BrmAlpha   float64
-	// Region calling controls. A zero value selects biologically conservative
-	// defaults derived from the Gaussian smoothing bandwidth.
-	MinQTLWidth   int64
-	MergeDistance int64
-	MinQTLMarkers int
+	//MinQTLWidth   int64
+	//MergeDistance int64
 	OutputDir string
 
 	HighParentIdx   int
@@ -91,16 +88,4 @@ type AnalysisConfig struct {
 	ModelType          string
 	Verbose            bool
 	Threads            int
-}
-
-// EffectiveMergeDistance returns the maximum bp gap bridged when merging adjacent
-// QTL intervals. Zero MergeDistance defaults to the Gaussian smoothing sigma.
-func (cfg AnalysisConfig) EffectiveMergeDistance() int64 {
-	if cfg.MergeDistance > 0 {
-		return cfg.MergeDistance
-	}
-	if cfg.WindowSize > 0 {
-		return int64(cfg.WindowSize / 2)
-	}
-	return 0
 }

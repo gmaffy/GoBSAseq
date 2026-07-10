@@ -213,6 +213,12 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		return nil
 	}
 
+	var threshSum float64
+	for _, t := range thresholds {
+		threshSum += threshFn(t)
+	}
+	avgThresh := threshSum / float64(len(thresholds))
+
 	var peaks []PeakIntersection
 
 	inPeak := false
@@ -231,9 +237,9 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	var d0 float64
 	switch tail {
 	case UpperTail:
-		d0 = y0 - threshFn(thresholds[0])
+		d0 = y0 - avgThresh
 	case LowerTail:
-		d0 = threshFn(thresholds[0]) - y0
+		d0 = avgThresh - y0
 	}
 
 	if d0 > 0 {
@@ -242,7 +248,7 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		startIndex = 0
 		peakPos = smoothed[0].POS
 		peakValue = y0
-		peakThresh = threshFn(thresholds[0])
+		peakThresh = avgThresh
 		peakIndex = 0
 	}
 
@@ -251,8 +257,8 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		y1 := valueFn(smoothed[i])
 		y2 := valueFn(smoothed[i+1])
 
-		t1 := threshFn(thresholds[i])
-		t2 := threshFn(thresholds[i+1])
+		t1 := avgThresh
+		t2 := avgThresh
 
 		var d1, d2 float64
 
@@ -468,16 +474,8 @@ func bpOverlap(startA, endA, startB, endB float64) bool {
 	return b0 <= a1 && b1 >= a0
 }
 
-// intervalsConnect reports whether two sorted intervals overlap, touch, or are
-// separated by at most gap base pairs.
-func intervalsConnect(startA, endA, startB, endB float64, gap int64) bool {
-	a1 := int64(math.Round(math.Max(startA, endA)))
-	b0 := int64(math.Round(math.Min(startB, endB)))
-	return b0 <= a1+gap
-}
-
-func qtlConnect(a, b ConsolidatedQTL, gap int64) bool {
-	return a.Chrom == b.Chrom && intervalsConnect(a.Start, a.End, b.Start, b.End, gap)
+func qtlOverlap(a, b ConsolidatedQTL) bool {
+	return a.Chrom == b.Chrom && bpOverlap(a.Start, a.End, b.Start, b.End)
 }
 
 func mergeConsolidatedQTL(a, b ConsolidatedQTL) ConsolidatedQTL {
@@ -511,7 +509,7 @@ func mergeConsolidatedQTL(a, b ConsolidatedQTL) ConsolidatedQTL {
 	return a
 }
 
-func mergeConsolidatedQTLPass(qtls []ConsolidatedQTL, gap int64) ([]ConsolidatedQTL, bool) {
+func mergeConsolidatedQTLPass(qtls []ConsolidatedQTL) ([]ConsolidatedQTL, bool) {
 	if len(qtls) <= 1 {
 		return qtls, false
 	}
@@ -533,7 +531,7 @@ func mergeConsolidatedQTLPass(qtls []ConsolidatedQTL, gap int64) ([]Consolidated
 
 	for i := 1; i < len(sorted); i++ {
 		next := sorted[i]
-		if qtlConnect(current, next, gap) {
+		if qtlOverlap(current, next) {
 			current = mergeConsolidatedQTL(current, next)
 			changed = true
 			continue
@@ -549,46 +547,7 @@ func mergeConsolidatedQTLPass(qtls []ConsolidatedQTL, gap int64) ([]Consolidated
 	return out, changed
 }
 
-func mergePeakIntersections(peaks []PeakIntersection, gap int64) []PeakIntersection {
-	if len(peaks) <= 1 {
-		return peaks
-	}
-	sorted := append([]PeakIntersection(nil), peaks...)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Chrom != sorted[j].Chrom {
-			return sorted[i].Chrom < sorted[j].Chrom
-		}
-		return sorted[i].Start < sorted[j].Start
-	})
-
-	out := make([]PeakIntersection, 0, len(sorted))
-	current := sorted[0]
-	for i := 1; i < len(sorted); i++ {
-		next := sorted[i]
-		if next.Chrom == current.Chrom && intervalsConnect(current.Start, current.End, next.Start, next.End, gap) {
-			if next.Start < current.Start {
-				current.Start = next.Start
-			}
-			if next.End > current.End {
-				current.End = next.End
-			}
-			if next.PeakValue > current.PeakValue {
-				current.PeakPos = next.PeakPos
-				current.PeakValue = next.PeakValue
-			}
-			if next.ThresholdLevel == "p99" {
-				current.ThresholdLevel = "p99"
-			}
-			continue
-		}
-		out = append(out, current)
-		current = next
-	}
-	out = append(out, current)
-	return out
-}
-
-func ConsolidateQTLs(peaks []PeakIntersection, gap int64) []ConsolidatedQTL {
+func ConsolidateQTLs(peaks []PeakIntersection) []ConsolidatedQTL {
 
 	if len(peaks) == 0 {
 		return nil
@@ -626,7 +585,7 @@ func ConsolidateQTLs(peaks []PeakIntersection, gap int64) []ConsolidatedQTL {
 			continue
 		}
 
-		if p.Chrom == current.Chrom && intervalsConnect(current.Start, current.End, p.Start, p.End, gap) {
+		if p.Chrom == current.Chrom && bpOverlap(p.Start, p.End, current.Start, current.End) {
 
 			if p.Start < current.Start {
 				current.Start = p.Start
@@ -655,7 +614,7 @@ func ConsolidateQTLs(peaks []PeakIntersection, gap int64) []ConsolidatedQTL {
 	qtls = append(qtls, current)
 
 	for {
-		next, changed := mergeConsolidatedQTLPass(qtls, gap)
+		next, changed := mergeConsolidatedQTLPass(qtls)
 		qtls = next
 		if !changed {
 			break
@@ -734,7 +693,7 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 	return nil
 }
 
-func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
+func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) ([]PeakIntersection, []ConsolidatedQTL) {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
 	var peaks []PeakIntersection
@@ -763,13 +722,13 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 		}
 
 		peaks = append(peaks, chrPeaks...)
-		qtls = append(qtls, ConsolidateQTLs(chrPeaks, mergeGap)...)
+		qtls = append(qtls, ConsolidateQTLs(chrPeaks)...)
 	}
 
 	return peaks, qtls
 }
 
-func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) []PeakIntersection {
+func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string) []PeakIntersection {
 	_ = bsaType
 
 	var peaks []PeakIntersection
@@ -798,7 +757,7 @@ func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 			UpperTail,
 			"CompositeZ",
 		); found != nil {
-			peaks = append(peaks, mergePeakIntersections(found, mergeGap)...)
+			peaks = append(peaks, found...)
 		}
 	}
 
@@ -883,72 +842,67 @@ func summarizeBRMByChrom(blocks []BRMBlock) map[string]brmChromSummary {
 	return out
 }
 
-func MergeCompositeBRM(compositePeaks []PeakIntersection, brmBlocks []BRMBlock, mergeGap int64) []MergedQTL {
-	type interval struct {
-		chrom      string
-		start, end int64
-		q          *PeakIntersection
-		b          *BRMBlock
-	}
-	intervals := make([]interval, 0, len(compositePeaks)+len(brmBlocks))
-	for i := range compositePeaks {
-		q := &compositePeaks[i]
-		intervals = append(intervals, interval{q.Chrom, int64(math.Round(q.Start)), int64(math.Round(q.End)), q, nil})
-	}
-	for i := range brmBlocks {
-		b := &brmBlocks[i]
-		intervals = append(intervals, interval{b.Chrom, b.Start, b.Stop, nil, b})
-	}
-	if len(intervals) == 0 {
-		return nil
-	}
-	sort.Slice(intervals, func(i, j int) bool {
-		if intervals[i].chrom != intervals[j].chrom {
-			return intervals[i].chrom < intervals[j].chrom
-		}
-		return intervals[i].start < intervals[j].start
-	})
+func MergeCompositeBRM(compositePeaks []PeakIntersection, brmBlocks []BRMBlock) []MergedQTL {
+	compositeByChrom := bestCompositePeakByChrom(compositePeaks)
+	brmByChrom := summarizeBRMByChrom(brmBlocks)
 
-	var merged []MergedQTL
-	for i := 0; i < len(intervals); {
-		first := intervals[i]
-		m := MergedQTL{Chrom: first.chrom, Start: first.start, Stop: first.end, BRMPeak: math.NaN(), BRMThreshold: math.NaN()}
-		hasQ, hasB := false, false
-		add := func(iv interval) {
-			if iv.start < m.Start {
-				m.Start = iv.start
-			}
-			if iv.end > m.Stop {
-				m.Stop = iv.end
-			}
-			if iv.q != nil && (!hasQ || iv.q.PeakValue > m.CompositeZPeak) {
-				hasQ = true
-				m.CompositeZPos = iv.q.PeakPos
-				m.CompositeZPeak = iv.q.PeakValue
-				m.Threshold = iv.q.ThresholdLevel
-			}
-			if iv.b != nil && (!hasB || math.Abs(iv.b.Peak) > math.Abs(m.BRMPeak)) {
-				hasB = true
-				m.BRMPeak = iv.b.Peak
-				m.BRMThreshold = iv.b.Threshold
-			}
+	chromSet := make(map[string]struct{}, len(compositeByChrom)+len(brmByChrom))
+	for chrom := range compositeByChrom {
+		chromSet[chrom] = struct{}{}
+	}
+	for chrom := range brmByChrom {
+		chromSet[chrom] = struct{}{}
+	}
+
+	chroms := make([]string, 0, len(chromSet))
+	for chrom := range chromSet {
+		chroms = append(chroms, chrom)
+	}
+	sort.Strings(chroms)
+
+	nan := math.NaN()
+	merged := make([]MergedQTL, 0, len(chroms))
+
+	for _, chrom := range chroms {
+		q, hasQ := compositeByChrom[chrom]
+		b, hasB := brmByChrom[chrom]
+
+		m := MergedQTL{
+			Chrom:        chrom,
+			BRMPeak:      nan,
+			BRMThreshold: nan,
 		}
-		add(first)
-		i++
-		for i < len(intervals) && intervals[i].chrom == m.Chrom && intervals[i].start <= m.Stop+mergeGap {
-			add(intervals[i])
-			i++
-		}
+
 		switch {
 		case hasQ && hasB:
+			m.Start = minI64(int64(math.Round(q.Start)), b.start)
+			m.Stop = maxI64(int64(math.Round(q.End)), b.stop)
+			m.Threshold = q.ThresholdLevel
+			m.CompositeZPos = q.PeakPos
+			m.CompositeZPeak = q.PeakValue
+			m.BRMPeak = b.peak
+			m.BRMThreshold = b.threshold
 			m.Source = "CompositeZ+BRM"
+
 		case hasQ:
+			m.Start = int64(math.Round(q.Start))
+			m.Stop = int64(math.Round(q.End))
+			m.Threshold = q.ThresholdLevel
+			m.CompositeZPos = q.PeakPos
+			m.CompositeZPeak = q.PeakValue
 			m.Source = "CompositeZ"
-		default:
+
+		case hasB:
+			m.Start = b.start
+			m.Stop = b.stop
+			m.BRMPeak = b.peak
+			m.BRMThreshold = b.threshold
 			m.Source = "BRM"
 		}
+
 		merged = append(merged, m)
 	}
+
 	return merged
 }
 

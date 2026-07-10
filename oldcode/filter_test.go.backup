@@ -104,10 +104,3 @@ func TestHardFilterPreservesInputOrder(t *testing.T) {
 		t.Fatal("hard-filtered VCF is not coordinate-sorted")
 	}
 }
-
-func TestHardFilterRejectsCallerFailedRecord(t *testing.T) {
-	_, variants := readVCF(t, "chr1\t100\t.\tA\tT\t60\tLowQual\t.\tGT:AD:DP\t0/1:10,10:20\t0/1:10,10:20\n")
-	if filter.PassesHardFilter(variants[0], utils.HardFilterConfig{LightFilter: true}) {
-		t.Fatal("explicitly failed VCF record passed the hard filter")
-	}
-}

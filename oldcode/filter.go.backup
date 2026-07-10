@@ -151,7 +151,10 @@ func isHomozygous(gt []int) bool {
 	return true
 }
 
-const parentAllelePurity = 0.85
+const (
+	maxOtherAlleleFrac = 0.20
+	parentAllelePurity = 0.85
+)
 
 func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 	if idx < 0 || idx >= len(v.Samples) {
@@ -180,11 +183,7 @@ func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 	if total <= 0 {
 		return false
 	}
-	// Statistics downstream are strictly biallelic (REF versus target ALT).
-	// Retaining appreciable support for a second ALT while omitting it from the
-	// denominator biases SNP indices, so only a genuinely biallelic signal is
-	// accepted here. Sites can be decomposed upstream when needed.
-	return other == 0
+	return float64(other)/float64(total) <= maxOtherAlleleFrac
 }
 
 func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident bool) {
@@ -245,11 +244,6 @@ func classifyVariant(v *vcfgo.Variant) (isSNP, isIndel bool) {
 }
 
 func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
-	// Do not resurrect records rejected by the variant caller. A missing FILTER
-	// field is tolerated for non-standard VCFs, but any explicit failure is not.
-	if v.Filter != "" && v.Filter != "." && v.Filter != "PASS" {
-		return false
-	}
 	isSNP, isIndel := classifyVariant(v)
 
 	if hfcfg.LightFilter {

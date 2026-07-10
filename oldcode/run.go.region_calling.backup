@@ -319,9 +319,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return fmt.Errorf("failed to create qtls directory: %w", err)
 	}
 
-	mergeGap := cfg.EffectiveMergeDistance()
-
-	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, mergeGap)
+	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype)
 	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing individual QTLs to Excel: %v\n", err)
@@ -333,7 +331,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
 
-	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype, mergeGap)
+	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype)
 	err = stats.WriteCompositeZQTLsToExcel(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing composite Z QTLs to Excel: %v\n", err)
@@ -345,7 +343,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 8/10: Merging QTLs and BRM blocks ...\n")
 
-	merged := stats.MergeCompositeBRM(compositePeaks, brmBlocks, mergeGap)
+	merged := stats.MergeCompositeBRM(compositePeaks, brmBlocks)
 	err = stats.WriteFinalQTLsToExcel(merged, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.final.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing final QTLs to Excel: %v\n", err)
@@ -362,7 +360,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		color.Red("Error generating plots: %v", err)
 		return err
 	}
-	//color.Green("MC-based QTL detection completed\n\n")
+	color.Green("MC-based QTL detection completed\n\n")
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 	color.Cyan("STEP 10/10: Gene space analysis ...\n")
