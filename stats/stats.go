@@ -14,6 +14,7 @@ import (
 
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/filter"
 	"github.com/gmaffy/GoBSAseq/utils"
 	"github.com/schollz/progressbar/v3"
 )
@@ -178,7 +179,7 @@ func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx i
 	return 0
 }
 
-func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []*vcfgo.Variant) ([]BSAstats, error) {
+func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []filter.FilteredVariant) ([]BSAstats, error) {
 	if len(idxs) == 0 {
 		return nil, fmt.Errorf("no sample indices supplied for %s raw stats", bsaType)
 	}
@@ -247,17 +248,11 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 					return
 				}
 
-				v := passedVariants[i]
-
-				// Find the single real alt index (0-based). Variants reaching here
-				// have already passed HardFilterVcf, but we still need the index to
-				// look up allele depths and to record the ALT allele string.
-				altIdx := -1
-				for j, alt := range v.Alt() {
-					if alt != "." && alt != "*" && !(len(alt) > 0 && alt[0] == '<') {
-						altIdx = j
-						break
-					}
+				filtered := passedVariants[i]
+				v := filtered.Variant
+				altIdx := filtered.TargetAlt - 1
+				if altIdx < 0 || altIdx >= len(v.Alt()) {
+					continue
 				}
 
 				s := BSAstats{

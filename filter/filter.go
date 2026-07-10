@@ -19,17 +19,11 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
-// realAltIndices returns the 1-based allele indices of every "real" ALT at
-// a site (excluding spanning-deletion '*', missing '.', and symbolic <...>
-// alleles). Previously only sites with exactly one real ALT were kept and
-// everything else was discarded outright; but a BSA-seq cross typically only
-// segregates for one of several ALTs at a genuinely multi-allelic site, so
-// callers should try each candidate rather than rejecting the whole record.
 func realAltIndices(v *vcfgo.Variant) []int {
 	var idxs []int
 	for i, alt := range v.Alt() {
 		if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
-			idxs = append(idxs, i+1) // vcfgo uses 1-based allele numbering
+			idxs = append(idxs, i+1)
 		}
 	}
 	return idxs
@@ -54,16 +48,11 @@ func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
 	return true
 }
 
-// safeSampleRefDepth parses REF depth for a sample without calling vcfgo's
-// RefDepth() directly. vcfgo can panic when AD exists but is malformed
-// (e.g. missing the comma separator). On parse failure it returns an error.
 func safeSampleRefDepth(s *vcfgo.SampleGenotype) (int, error) {
 	if s == nil {
 		return 0, fmt.Errorf("nil sample")
 	}
 
-	// Prefer AD when it is well-formed; if AD exists but lacks the comma,
-	// vcfgo would panic, so fall back to RO when available.
 	if ad, ok := s.Fields["AD"]; ok {
 		if comma := strings.Index(ad, ","); comma >= 0 {
 			refStr := ad[:comma]
@@ -84,10 +73,6 @@ func safeSampleRefDepth(s *vcfgo.SampleGenotype) (int, error) {
 	return 0, fmt.Errorf("no ref depth field (AD/RO)")
 }
 
-// safeSampleAltDepths parses ALT depths for a sample without calling
-// vcfgo's AltDepths() directly. It avoids panics/incorrect parsing when AD is
-// malformed (e.g. missing the comma separator). On parse failure it returns
-// an error.
 func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
 	if s == nil {
 		return []int{}, fmt.Errorf("nil sample")
@@ -110,7 +95,6 @@ func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
 			}
 			return vals, nil
 		}
-		// If AD is present but malformed (no comma), fall through to AO.
 	}
 
 	if ao, ok := s.Fields["AO"]; ok {
@@ -132,11 +116,6 @@ func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
 	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
 }
 
-// effectiveDP returns a sample's total depth for coverage-threshold checks,
-// falling back to AD-derived depth (ref + all alts) when FORMAT DP is
-// missing or zero. Without this, a sample whose caller only populates AD
-// (no DP) could pass the AD-based allele-signal check yet still be rejected
-// by a depth-threshold comparison that only looks at raw DP.
 func effectiveDP(s *vcfgo.SampleGenotype) int {
 	if s == nil {
 		return 0
@@ -173,47 +152,18 @@ func isHomozygous(gt []int) bool {
 }
 
 const (
-	// maxOtherAlleleFrac bounds how much of a sample's total depth may come
-	// from alleles other than REF/target-ALT before the site is considered
-	// too messy to trust (contamination, paralogs, a genuinely
-	// multi-allelic site). This is intentionally loose: BSA-seq bulks are
-	// pools of many individuals, so some background from other alleles is
-	// expected and, on its own, is not a reason to discard an otherwise
-	// informative variant.
 	maxOtherAlleleFrac = 0.20
-
-	// parentAllelePurity is the minimum fraction of a parent's reads that
-	// must support one allele before that allele is treated as "the
-	// parent's allele". BSA-seq parents are ideally fully homozygous inbred
-	// lines, but residual heterozygosity, low-level contamination, and
-	// genotyping noise are common in practice. Requiring a strict
-	// homozygous GT call throws away many genuinely informative markers;
-	// tolerating up to (1 - parentAllelePurity) reads from the other allele
-	// keeps those markers while still rejecting parents that are
-	// genuinely segregating/heterozygous at a site (which would be
-	// uninformative for BSA-seq regardless of filtering strategy).
 	parentAllelePurity = 0.85
 )
 
-// hasUsableAlleleSignal reports whether a sample's allele-depth data at this
-// site is trustworthy enough to use, without requiring a confident discrete
-// genotype call. Pooled bulk samples are frequently emitted with a missing
-// or low-confidence GT by callers designed around single-diploid-sample
-// genotype likelihoods, even when read support itself is perfectly good —
-// gating on GT there discards real BSA-seq signal along with noise. Instead,
-// the sample is only rejected if there's no usable depth at all, or if a
-// large share of its reads support some allele other than REF/target-ALT.
 func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 	if idx < 0 || idx >= len(v.Samples) {
 		return false
 	}
 	s := v.Samples[idx]
-
 	refDepth, errR := safeSampleRefDepth(s)
 	altDepths, errA := safeSampleAltDepths(s)
 	if errR != nil || errA != nil || targetAlt-1 < 0 || targetAlt-1 >= len(altDepths) {
-		// No usable AD — fall back to the strict GT check rather than
-		// blindly accepting a site we can't actually interpret.
 		return sampleHasOnlyRefOrAlt(v, idx, targetAlt)
 	}
 
@@ -225,12 +175,6 @@ func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 		}
 	}
 
-	// Use AD-derived total (ref + all alts) rather than raw FORMAT DP: DP
-	// often includes reads that never resolved to an allele call (low-qual,
-	// soft-clipped, multi-mapping), which would inflate "other" and fail
-	// otherwise-clean samples. Fall back to DP only if it accounts for more
-	// depth than AD does, and only for the denominator — it never
-	// contributes to the "other allele" numerator.
 	adTotal := refDepth + altDepth + other
 	total := adTotal
 	if s.DP > adTotal {
@@ -242,12 +186,6 @@ func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
 	return float64(other)/float64(total) <= maxOtherAlleleFrac
 }
 
-// parentAllele determines which allele (0 = ref, targetAlt = alt) predominates
-// in a parent sample using allele read depths, falling back to the genotype
-// call only when depth data isn't usable. confident is false when the
-// parent's reads are too evenly split between alleles to trust — i.e. the
-// parent looks genuinely heterozygous/segregating at this site, which makes
-// it uninformative for BSA-seq regardless of how strict the filter is.
 func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident bool) {
 	if idx < 0 || idx >= len(v.Samples) {
 		return 0, false
@@ -257,10 +195,7 @@ func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident b
 	refDepth, errR := safeSampleRefDepth(s)
 	altDepths, errA := safeSampleAltDepths(s)
 	if errR == nil && errA == nil && targetAlt-1 >= 0 && targetAlt-1 < len(altDepths) {
-		// Total includes reads supporting *any* allele, not just
-		// ref-vs-target-alt, so a parent with real off-target/contaminating
-		// reads is judged against its full read pool — matching how
-		// hasUsableAlleleSignal treats bulks.
+
 		total := refDepth
 		for _, d := range altDepths {
 			total += d
@@ -269,13 +204,7 @@ func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident b
 			refFrac := float64(refDepth) / float64(total)
 			nonRef := total - refDepth
 			switch {
-			// A single discordant read is tolerated regardless of the
-			// fraction it implies — but only when the other allele still
-			// clearly outnumbers it (guards against e.g. a lone alt read
-			// with zero ref support being misread as "ref-confident").
-			// At low parent depth (e.g. the default 5x), this stops one
-			// sequencing error from pushing a genuinely homozygous parent
-			// below the flat purity threshold.
+
 			case refFrac >= parentAllelePurity || (nonRef <= 1 && refDepth > nonRef):
 				return 0, true
 			case refFrac <= 1-parentAllelePurity || (refDepth <= 1 && nonRef > refDepth):
@@ -285,8 +214,7 @@ func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident b
 			}
 		}
 	}
-
-	// No usable AD — fall back to the genotype call.
+	
 	if len(s.GT) > 0 && s.GT[0] >= 0 && isHomozygous(s.GT) {
 		return s.GT[0], true
 	}
@@ -403,16 +331,24 @@ func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
 	}
 }
 
-func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bool {
+// BsaSeqTargetAlt returns the one-based ALT index that satisfies the BSA-seq
+// segregation filter, or zero when none does. The index must travel with the
+// variant because multi-allelic records can pass through an ALT other than the
+// first one.
+func BsaSeqTargetAlt(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) int {
 	// Try each real ALT as a candidate target and keep the variant if any
 	// one of them shows a valid BSA-seq segregation pattern, instead of
 	// discarding multi-allelic sites outright.
 	for _, targetAlt := range realAltIndices(v) {
 		if bsaSeqFilterAllele(v, cfg, bsaType, targetAlt) {
-			return true
+			return targetAlt
 		}
 	}
-	return false
+	return 0
+}
+
+func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bool {
+	return BsaSeqTargetAlt(v, cfg, bsaType) != 0
 }
 
 func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string, targetAlt int) bool {
@@ -580,6 +516,13 @@ type vcfRecord struct {
 	end   int // 0-based half-open
 }
 
+// FilteredVariant associates a passing VCF record with the ALT allele that
+// satisfied the BSA-seq filter. TargetAlt is one-based VCF allele numbering.
+type FilteredVariant struct {
+	Variant   *vcfgo.Variant
+	TargetAlt int
+}
+
 func (r vcfRecord) RefName() string { return r.chrom }
 func (r vcfRecord) Start() int      { return r.start }
 func (r vcfRecord) End() int        { return r.end }
@@ -613,7 +556,7 @@ func sanitizeVariant(v *vcfgo.Variant, keepIndices []int) {
 	v.Format = newFormat
 }
 
-func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsaseqType string, keepIndices []int) ([]*vcfgo.Variant, int, int, error) {
+func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsaseqType string, keepIndices []int) ([]FilteredVariant, int, int, error) {
 
 	err := os.MkdirAll(filepath.Join(cfg.OutputDir, "stats"), 0775)
 	if err != nil {
@@ -687,13 +630,19 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 
 	// ── Pipeline channels ─────────────────────────────────────────────────────
 	type variantResult struct {
-		v      *vcfgo.Variant
-		passed bool
+		seq       int
+		v         *vcfgo.Variant
+		targetAlt int
+		passed    bool
+	}
+	type queuedVariant struct {
+		seq int
+		v   *vcfgo.Variant
 	}
 
 	const chanBuf = 512
-	filterCh := make(chan *vcfgo.Variant, chanBuf) // reader  → filter workers
-	resultCh := make(chan variantResult, chanBuf)  // workers → writer
+	filterCh := make(chan queuedVariant, chanBuf) // reader  → filter workers
+	resultCh := make(chan variantResult, chanBuf) // workers → writer
 	var readerErr atomic.Pointer[error]
 
 	// ── Stage 1: Reader goroutine ─────────────────────────────────────────────
@@ -704,6 +653,7 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 
 	go func() {
 		defer close(filterCh)
+		seq := 0
 		for {
 			v := rdr.Read()
 			if v == nil {
@@ -730,7 +680,10 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 			}
 			originalCount.Add(1)
 			_ = bar.Add(1)
-			filterCh <- v
+			// Keep source order so the writer can produce a valid coordinate-sorted
+			// VCF even though filtering completes concurrently.
+			filterCh <- queuedVariant{seq: seq, v: v}
+			seq++
 		}
 
 		if err := rdr.Error(); err != nil &&
@@ -751,9 +704,15 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			defer wg.Done()
-			for v := range filterCh {
-				passed := PassesHardFilter(v, hfcfg) && BsaSeqFilter(v, cfg, bsaseqType)
-				resultCh <- variantResult{v: v, passed: passed}
+			for queued := range filterCh {
+				v := queued.v
+				targetAlt := 0
+				passed := PassesHardFilter(v, hfcfg)
+				if passed {
+					targetAlt = BsaSeqTargetAlt(v, cfg, bsaseqType)
+					passed = targetAlt != 0
+				}
+				resultCh <- variantResult{seq: queued.seq, v: v, targetAlt: targetAlt, passed: passed}
 			}
 		}()
 	}
@@ -767,18 +726,18 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	// ── Stage 3: Writer goroutine (single, preserves order not required) ──────
 	// NOTE: bgzf / vcfgo writers are NOT goroutine-safe; keep all writes here.
 	var (
-		passedVariants []*vcfgo.Variant
+		passedVariants []FilteredVariant
 		passed         int
 		writerErr      error
 	)
 
-	for res := range resultCh {
+	writeResult := func(res variantResult) error {
 		// Sanitize variant (subset samples and clean format)
 		sanitizeVariant(res.v, keepIndices)
 
 		if !res.passed {
 			badWriter.WriteVariant(res.v)
-			continue
+			return nil
 		}
 
 		blockOffset, _ := hfBgzf.Next()
@@ -790,12 +749,35 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
 
 		if err := addTabixRecord(hfIdx, res.v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
-			writerErr = fmt.Errorf("tabix add variant at %s:%d: %w", res.v.Chromosome, res.v.Pos, err)
-			break
+			return fmt.Errorf("tabix add variant at %s:%d: %w", res.v.Chromosome, res.v.Pos, err)
 		}
 
-		passedVariants = append(passedVariants, res.v)
+		passedVariants = append(passedVariants, FilteredVariant{Variant: res.v, TargetAlt: res.targetAlt})
 		passed++
+		return nil
+	}
+
+	// Workers complete out of order. Buffer their results until the next source
+	// record arrives so VCF output and tabix chunks remain coordinate-sorted.
+	pending := make(map[int]variantResult)
+	nextSeq := 0
+	for res := range resultCh {
+		pending[res.seq] = res
+		for {
+			next, ok := pending[nextSeq]
+			if !ok {
+				break
+			}
+			delete(pending, nextSeq)
+			if err := writeResult(next); err != nil {
+				writerErr = err
+				break
+			}
+			nextSeq++
+		}
+		if writerErr != nil {
+			break
+		}
 	}
 
 	// Drain resultCh if writer broke early, so workers can unblock and exit.
