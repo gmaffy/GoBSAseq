@@ -68,6 +68,145 @@ const (
 	LowerTail
 )
 
+//func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds []Thresholds, valueFn func(SmoothedStats) float64, threshFn func(Thresholds) float64, tail Tail) []PeakIntersection {
+//
+//	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
+//		return nil
+//	}
+//
+//	var threshSum float64
+//	for _, t := range thresholds {
+//		threshSum += threshFn(t)
+//	}
+//	avgThresh := threshSum / float64(len(thresholds))
+//
+//	var peaks []PeakIntersection
+//
+//	inPeak := false
+//
+//	var (
+//		startPos   float64
+//		startIndex int
+//		peakPos    int64
+//		peakValue  float64
+//		peakThresh float64
+//		peakIndex  int
+//	)
+//
+//	for i := 0; i < len(smoothed)-1; i++ {
+//
+//		y1 := valueFn(smoothed[i])
+//		y2 := valueFn(smoothed[i+1])
+//
+//		t1 := avgThresh
+//		t2 := avgThresh
+//
+//		var d1, d2 float64
+//
+//		switch tail {
+//		case UpperTail:
+//			d1 = y1 - t1
+//			d2 = y2 - t2
+//
+//		case LowerTail:
+//			d1 = t1 - y1
+//			d2 = t2 - y2
+//		}
+//
+//		// Enter region
+//		if !inPeak && d1 <= 0 && d2 > 0 {
+//
+//			f := d1 / (d1 - d2)
+//
+//			startPos = float64(smoothed[i].POS) +
+//				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+//
+//			startIndex = i + 1
+//
+//			inPeak = true
+//			peakPos = smoothed[i+1].POS
+//			peakValue = y2
+//			peakThresh = t2
+//			peakIndex = i + 1
+//
+//			continue
+//		}
+//
+//		if !inPeak {
+//			continue
+//		}
+//
+//		// Update best point
+//		better := false
+//
+//		switch tail {
+//		case UpperTail:
+//			better = y2 > peakValue
+//
+//		case LowerTail:
+//			better = y2 < peakValue
+//		}
+//
+//		if better {
+//			peakValue = y2
+//			peakPos = smoothed[i+1].POS
+//			peakThresh = t2
+//			peakIndex = i + 1
+//		}
+//
+//		// Leave region
+//		if d1 > 0 && d2 <= 0 {
+//
+//			f := d1 / (d1 - d2)
+//
+//			endPos := float64(smoothed[i].POS) +
+//				f*float64(smoothed[i+1].POS-smoothed[i].POS)
+//
+//			peaks = append(peaks, PeakIntersection{
+//				Stat:  statName,
+//				Chrom: smoothed[i].CHROM,
+//
+//				Start: startPos,
+//				End:   endPos,
+//
+//				PeakPos:   peakPos,
+//				PeakValue: peakValue,
+//				Threshold: peakThresh,
+//
+//				StartIndex: startIndex,
+//				EndIndex:   i,
+//				PeakIndex:  peakIndex,
+//			})
+//
+//			inPeak = false
+//		}
+//	}
+//
+//	// Region continues to chromosome end
+//	if inPeak {
+//
+//		last := len(smoothed) - 1
+//
+//		peaks = append(peaks, PeakIntersection{
+//			Stat:  statName,
+//			Chrom: smoothed[last].CHROM,
+//
+//			Start: startPos,
+//			End:   float64(smoothed[last].POS),
+//
+//			PeakPos:   peakPos,
+//			PeakValue: peakValue,
+//			Threshold: peakThresh,
+//
+//			StartIndex: startIndex,
+//			EndIndex:   last,
+//			PeakIndex:  peakIndex,
+//		})
+//	}
+//
+//	return peaks
+//}
+
 func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds []Thresholds, valueFn func(SmoothedStats) float64, threshFn func(Thresholds) float64, tail Tail) []PeakIntersection {
 
 	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
@@ -92,6 +231,26 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		peakThresh float64
 		peakIndex  int
 	)
+
+	// Catch peaks that start at the very beginning of the chromosome
+	y0 := valueFn(smoothed[0])
+	var d0 float64
+	switch tail {
+	case UpperTail:
+		d0 = y0 - avgThresh
+	case LowerTail:
+		d0 = avgThresh - y0
+	}
+
+	if d0 > 0 {
+		inPeak = true
+		startPos = float64(smoothed[0].POS)
+		startIndex = 0
+		peakPos = smoothed[0].POS
+		peakValue = y0
+		peakThresh = avgThresh
+		peakIndex = 0
+	}
 
 	for i := 0; i < len(smoothed)-1; i++ {
 

@@ -37,14 +37,14 @@ type AnalysisConfig struct {
 	LowBulkBam  string
 
 	// Parameters for the analysis
-	Population    string
-	WindowSize    int
-	StepSize      int
-	Rep           int
-	BrmAlpha      float64
-	MinQTLWidth   int64
-	MergeDistance int64
-	OutputDir     string
+	Population string
+	WindowSize int
+	StepSize   int
+	Rep        int
+	BrmAlpha   float64
+	//MinQTLWidth   int64
+	//MergeDistance int64
+	OutputDir string
 
 	HighParentIdx   int
 	HighParentName  string

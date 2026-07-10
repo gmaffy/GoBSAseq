@@ -621,7 +621,7 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	}
 
 	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", bsaseqType))
-	badVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.lowqaul.vcf.gz", bsaseqType))
+	badVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.lowqual.vcf.gz", bsaseqType))
 
 	rdr := cfg.Rdr
 	origSampleNames := rdr.Header.SampleNames

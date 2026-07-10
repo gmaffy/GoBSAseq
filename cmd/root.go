@@ -83,10 +83,6 @@ var rootCmd = &cobra.Command{
 					ref = value
 				case "gff":
 					gff = value
-				case cds:
-					cds = value
-				case "proteins":
-					protein = value
 				case "gene-descriptions":
 					geneDescriptions = value
 				case "prg":
@@ -216,8 +212,8 @@ var rootCmd = &cobra.Command{
 		population, _ := cmd.Flags().GetString("population")
 		rep, _ := cmd.Flags().GetInt("rep")
 		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
-		minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
-		mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
+		//minQTL, _ := cmd.Flags().GetInt64("min-qtl-length")
+		//mergeDist, _ := cmd.Flags().GetInt64("merge-distance")
 		outputDir, _ := cmd.Flags().GetString("out")
 
 		lightFiltering, _ := cmd.Flags().GetBool("light-filtering")
@@ -379,14 +375,14 @@ var rootCmd = &cobra.Command{
 			HighBulkBam: hbBam,
 			LowBulkBam:  lbBam,
 
-			Population:    population,
-			WindowSize:    winSize,
-			StepSize:      step,
-			Rep:           rep,
-			BrmAlpha:      brmAlpha,
-			MinQTLWidth:   minQTL,
-			MergeDistance: mergeDist,
-			OutputDir:     resultsDir,
+			Population: population,
+			WindowSize: winSize,
+			StepSize:   step,
+			Rep:        rep,
+			BrmAlpha:   brmAlpha,
+			//MinQTLWidth:   minQTL,
+			//MergeDistance: mergeDist,
+			OutputDir: resultsDir,
 
 			HighParentName:  highParentName,
 			HighParentDepth: highParentDepth,
