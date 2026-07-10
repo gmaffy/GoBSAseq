@@ -214,7 +214,7 @@ func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident b
 			}
 		}
 	}
-	
+
 	if len(s.GT) > 0 && s.GT[0] >= 0 && isHomozygous(s.GT) {
 		return s.GT[0], true
 	}
