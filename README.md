@@ -78,7 +78,7 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 |------|------|---------|-------------|
 | `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel width (bp); σ = width / 2 |
 | `-s` / `--step-size` | int64 | `100000` | Reserved for future regular-grid summaries; marker-centred smoothing does not currently use it |
-| `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC1H`, `BC1L`, `BC2H`, `BC2L` |
+| `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC{n}H`, `BC{n}L`, `BC{n}F2H`, `BC{n}F2L` |
 | `--brm-alpha` | float64 | `0.05` | BRM significance level |
 | `--rep` | int | `1000` | Number of simulations for thresholds |
 
