@@ -42,34 +42,49 @@ type AnalysisConfig struct {
 	StepSize   int
 	Rep        int
 	BrmAlpha   float64
+	// MinGQ is the minimum genotype quality (FORMAT/GQ) required of the parent
+	// samples at a site. Zero disables the check and is applied only when GQ is
+	// present (e.g. DeepVariant VCFs). It is deliberately NOT applied to bulks:
+	// in a pool, GQ reflects confidence in a diploid genotype call that is a
+	// fiction for a bulk and is lowest at intermediate allele fractions, so a
+	// bulk GQ floor would be an allele-frequency-correlated filter that biases
+	// the SNP-index. Parents are real genotypes, so GQ is meaningful there.
+	MinGQ int
+	// SplitMultiallelic decomposes multi-allelic records into biallelic ones
+	// before filtering (bcftools norm -m- equivalent). Enabled by default.
+	SplitMultiallelic bool
 	// Region calling controls. A zero value selects biologically conservative
 	// defaults derived from the Gaussian smoothing bandwidth.
 	MinQTLWidth   int64
 	MergeDistance int64
 	MinQTLMarkers int
-	OutputDir string
+	OutputDir     string
 
-	HighParentIdx   int
-	HighParentName  string
-	HighParentDepth int
+	HighParentIdx      int
+	HighParentName     string
+	HighParentDepth    int
+	HighParentMaxDepth int
 
-	LowParentIdx   int
-	LowParentName  string
-	LowParentDepth int
+	LowParentIdx      int
+	LowParentName     string
+	LowParentDepth    int
+	LowParentMaxDepth int
 
 	OneParentIdx   int
 	OneParentName  string
 	OneParentDepth int
 
-	HighBulkIdx   int
-	HighBulkName  string
-	HighBulkDepth int
-	HighBulkSize  int
+	HighBulkIdx      int
+	HighBulkName     string
+	HighBulkDepth    int
+	HighBulkMaxDepth int
+	HighBulkSize     int
 
-	LowBulkIdx   int
-	LowBulkName  string
-	LowBulkDepth int
-	LowBulkSize  int
+	LowBulkIdx      int
+	LowBulkName     string
+	LowBulkDepth    int
+	LowBulkMaxDepth int
+	LowBulkSize     int
 
 	OneBulkIdx   int
 	OneBulkName  string

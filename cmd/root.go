@@ -206,15 +206,19 @@ var rootCmd = &cobra.Command{
 
 		parentsDepth, _ := cmd.Flags().GetString("parents-depth")
 		bulksDepth, _ := cmd.Flags().GetString("bulks-depth")
+		bulksMaxDepth, _ := cmd.Flags().GetString("bulks-max-depth")
+		parentsMaxDepth, _ := cmd.Flags().GetString("parents-max-depth")
+		minGQ, _ := cmd.Flags().GetInt("min-GQ")
+		noSplitMultiallelic, _ := cmd.Flags().GetBool("no-split-multiallelic")
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
 		rep, _ := cmd.Flags().GetInt("rep")
-			brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
-			minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
-			mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
-			minQTLMarkers, _ := cmd.Flags().GetInt("min-qtl-markers")
+		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
+		minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
+		mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
+		minQTLMarkers, _ := cmd.Flags().GetInt("min-qtl-markers")
 		outputDir, _ := cmd.Flags().GetString("out")
 
 		lightFiltering, _ := cmd.Flags().GetBool("light-filtering")
@@ -316,6 +320,38 @@ var rootCmd = &cobra.Command{
 
 		}
 
+		// ===================================== Get Max Depth caps (optional) ====================================== //
+		highBulkMaxDepth := 0
+		lowBulkMaxDepth := 0
+		highParentMaxDepth := 0
+		lowParentMaxDepth := 0
+
+		parsePair := func(name, raw string) (int, int, bool) {
+			if strings.TrimSpace(raw) == "" {
+				return 0, 0, true // empty = disabled
+			}
+			parts := strings.Split(raw, ",")
+			if len(parts) != 2 {
+				color.Red("%s is supposed to be in the form a,b (where a and b are integers)", name)
+				return 0, 0, false
+			}
+			a, errA := strconv.Atoi(strings.TrimSpace(parts[0]))
+			b, errB := strconv.Atoi(strings.TrimSpace(parts[1]))
+			if errA != nil || errB != nil {
+				color.Red("%s is supposed to be in the form a,b (where a and b are integers)", name)
+				return 0, 0, false
+			}
+			return a, b, true
+		}
+
+		var okPair bool
+		if highBulkMaxDepth, lowBulkMaxDepth, okPair = parsePair("bulks-max-depth", bulksMaxDepth); !okPair {
+			return
+		}
+		if highParentMaxDepth, lowParentMaxDepth, okPair = parsePair("parents-max-depth", parentsMaxDepth); !okPair {
+			return
+		}
+
 		// ============================================== window size ================================================//
 		winSize = int(windowSize)
 		step := int(stepSize)
@@ -376,29 +412,35 @@ var rootCmd = &cobra.Command{
 			HighBulkBam: hbBam,
 			LowBulkBam:  lbBam,
 
-			Population: population,
-			WindowSize: winSize,
-			StepSize:   step,
-				Rep:        rep,
-				BrmAlpha:   brmAlpha,
-				MinQTLWidth:   minQTLWidth,
-				MergeDistance: mergeDistance,
-				MinQTLMarkers: minQTLMarkers,
-			OutputDir: resultsDir,
+			Population:        population,
+			WindowSize:        winSize,
+			StepSize:          step,
+			Rep:               rep,
+			BrmAlpha:          brmAlpha,
+			MinQTLWidth:       minQTLWidth,
+			MergeDistance:     mergeDistance,
+			MinQTLMarkers:     minQTLMarkers,
+			MinGQ:             minGQ,
+			SplitMultiallelic: !noSplitMultiallelic,
+			OutputDir:         resultsDir,
 
-			HighParentName:  highParentName,
-			HighParentDepth: highParentDepth,
+			HighParentName:     highParentName,
+			HighParentDepth:    highParentDepth,
+			HighParentMaxDepth: highParentMaxDepth,
 
-			LowParentName:  lowParentName,
-			LowParentDepth: lowParentDepth,
+			LowParentName:     lowParentName,
+			LowParentDepth:    lowParentDepth,
+			LowParentMaxDepth: lowParentMaxDepth,
 
-			HighBulkName:  highBulkName,
-			HighBulkDepth: highBulkDepth,
-			HighBulkSize:  highBulkSize,
+			HighBulkName:     highBulkName,
+			HighBulkDepth:    highBulkDepth,
+			HighBulkMaxDepth: highBulkMaxDepth,
+			HighBulkSize:     highBulkSize,
 
-			LowBulkName:  lowBulkName,
-			LowBulkDepth: lowBulkDepth,
-			LowBulkSize:  lowBulkSize,
+			LowBulkName:     lowBulkName,
+			LowBulkDepth:    lowBulkDepth,
+			LowBulkMaxDepth: lowBulkMaxDepth,
+			LowBulkSize:     lowBulkSize,
 
 			SnpEffDB: snpEffDB,
 			Ref:      ref,
@@ -448,9 +490,13 @@ func init() {
 
 	// ================================================ Parameters ================================================== //
 	// -------------------------------------------------- Inputs ---------------------------------------------------- //
-	rootCmd.Flags().StringP("parents-depth", "p", "5,5", "Parents Min Depth")
-	rootCmd.Flags().StringP("bulks-depth", "b", "40,40", "Low Parent Min Depth")
-	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "High Bulk Min Depth")
+	rootCmd.Flags().StringP("parents-depth", "p", "5,5", "Parents min depth (hp,lp)")
+	rootCmd.Flags().StringP("bulks-depth", "b", "40,40", "Bulks min depth (hb,lb)")
+	rootCmd.Flags().StringP("bulk-sizes", "S", "20,20", "Bulk sizes (hb,lb)")
+	rootCmd.Flags().String("bulks-max-depth", "", "Bulks max-depth cap hb,lb to drop coverage outliers (empty = disabled)")
+	rootCmd.Flags().String("parents-max-depth", "", "Parents max-depth cap hp,lp to drop coverage outliers (empty = disabled)")
+	rootCmd.Flags().Int("min-GQ", 0, "Minimum genotype quality (GQ) for PARENT samples; 0 = disabled, applied only when GQ present (not applied to bulks, to avoid AF-correlated bias)")
+	rootCmd.Flags().Bool("no-split-multiallelic", false, "Do not decompose multi-allelic records into biallelic records before filtering")
 
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")

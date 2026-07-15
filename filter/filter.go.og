@@ -1,0 +1,841 @@
+package filter
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/biogo/hts/bgzf"
+	"github.com/biogo/hts/tabix"
+	"github.com/brentp/vcfgo"
+	"github.com/fatih/color"
+	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/schollz/progressbar/v3"
+)
+
+func realAltIndices(v *vcfgo.Variant) []int {
+	var idxs []int
+	for i, alt := range v.Alt() {
+		if !(alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<')) {
+			idxs = append(idxs, i+1)
+		}
+	}
+	return idxs
+}
+
+func sampleHasOnlyRefOrAlt(v *vcfgo.Variant, idx, targetAlt int) bool {
+	if idx < 0 || idx >= len(v.Samples) {
+		return false
+	}
+	s := v.Samples[idx]
+	if s == nil || len(s.GT) == 0 {
+		return false
+	}
+	for _, allele := range s.GT {
+		if allele < 0 { // missing ('.')
+			return false
+		}
+		if allele != 0 && allele != targetAlt {
+			return false
+		}
+	}
+	return true
+}
+
+func safeSampleRefDepth(s *vcfgo.SampleGenotype) (int, error) {
+	if s == nil {
+		return 0, fmt.Errorf("nil sample")
+	}
+
+	if ad, ok := s.Fields["AD"]; ok {
+		if comma := strings.Index(ad, ","); comma >= 0 {
+			refStr := ad[:comma]
+			if refStr == "" || refStr == "." {
+				return 0, fmt.Errorf("invalid AD ref depth %q", refStr)
+			}
+			return strconv.Atoi(refStr)
+		}
+	}
+
+	if ro, ok := s.Fields["RO"]; ok {
+		if ro == "" || ro == "." {
+			return 0, fmt.Errorf("invalid RO ref depth %q", ro)
+		}
+		return strconv.Atoi(ro)
+	}
+
+	return 0, fmt.Errorf("no ref depth field (AD/RO)")
+}
+
+func safeSampleAltDepths(s *vcfgo.SampleGenotype) ([]int, error) {
+	if s == nil {
+		return []int{}, fmt.Errorf("nil sample")
+	}
+
+	if ad, ok := s.Fields["AD"]; ok {
+		if comma := strings.Index(ad, ","); comma >= 0 {
+			altStr := ad[comma+1:]
+			parts := strings.Split(altStr, ",")
+			vals := make([]int, len(parts))
+			for i, p := range parts {
+				if p == "" || p == "." {
+					return []int{}, fmt.Errorf("invalid AD alt depth %q", p)
+				}
+				v, err := strconv.Atoi(p)
+				if err != nil {
+					return []int{}, err
+				}
+				vals[i] = v
+			}
+			return vals, nil
+		}
+	}
+
+	if ao, ok := s.Fields["AO"]; ok {
+		parts := strings.Split(ao, ",")
+		vals := make([]int, len(parts))
+		for i, p := range parts {
+			if p == "" || p == "." {
+				return []int{}, fmt.Errorf("invalid AO alt depth %q", p)
+			}
+			v, err := strconv.Atoi(p)
+			if err != nil {
+				return []int{}, err
+			}
+			vals[i] = v
+		}
+		return vals, nil
+	}
+
+	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
+}
+
+func effectiveDP(s *vcfgo.SampleGenotype) int {
+	if s == nil {
+		return 0
+	}
+	if s.DP > 0 {
+		return s.DP
+	}
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR != nil || errA != nil {
+		return 0
+	}
+	total := refDepth
+	for _, d := range altDepths {
+		total += d
+	}
+	return total
+}
+
+func isHomozygous(gt []int) bool {
+	if len(gt) == 0 {
+		return false
+	}
+	first := gt[0]
+	if first < 0 {
+		return false
+	}
+	for _, a := range gt[1:] {
+		if a < 0 || a != first {
+			return false
+		}
+	}
+	return true
+}
+
+const parentAllelePurity = 0.85
+
+func hasUsableAlleleSignal(v *vcfgo.Variant, idx, targetAlt int) bool {
+	if idx < 0 || idx >= len(v.Samples) {
+		return false
+	}
+	s := v.Samples[idx]
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR != nil || errA != nil || targetAlt-1 < 0 || targetAlt-1 >= len(altDepths) {
+		return sampleHasOnlyRefOrAlt(v, idx, targetAlt)
+	}
+
+	altDepth := altDepths[targetAlt-1]
+	other := 0
+	for i, d := range altDepths {
+		if i != targetAlt-1 {
+			other += d
+		}
+	}
+
+	adTotal := refDepth + altDepth + other
+	total := adTotal
+	if s.DP > adTotal {
+		total = s.DP
+	}
+	if total <= 0 {
+		return false
+	}
+	// Statistics downstream are strictly biallelic (REF versus target ALT).
+	// Retaining appreciable support for a second ALT while omitting it from the
+	// denominator biases SNP indices, so only a genuinely biallelic signal is
+	// accepted here. Sites can be decomposed upstream when needed.
+	return other == 0
+}
+
+func parentAllele(v *vcfgo.Variant, idx, targetAlt int) (allele int, confident bool) {
+	if idx < 0 || idx >= len(v.Samples) {
+		return 0, false
+	}
+	s := v.Samples[idx]
+
+	refDepth, errR := safeSampleRefDepth(s)
+	altDepths, errA := safeSampleAltDepths(s)
+	if errR == nil && errA == nil && targetAlt-1 >= 0 && targetAlt-1 < len(altDepths) {
+
+		total := refDepth
+		for _, d := range altDepths {
+			total += d
+		}
+		if total > 0 {
+			refFrac := float64(refDepth) / float64(total)
+			nonRef := total - refDepth
+			switch {
+
+			case refFrac >= parentAllelePurity || (nonRef <= 1 && refDepth > nonRef):
+				return 0, true
+			case refFrac <= 1-parentAllelePurity || (refDepth <= 1 && nonRef > refDepth):
+				return targetAlt, true
+			default:
+				return 0, false
+			}
+		}
+	}
+
+	if len(s.GT) > 0 && s.GT[0] >= 0 && isHomozygous(s.GT) {
+		return s.GT[0], true
+	}
+	return 0, false
+}
+
+func classifyVariant(v *vcfgo.Variant) (isSNP, isIndel bool) {
+	refLen := len(v.Ref())
+	sameLength := true
+	for _, alt := range v.Alt() {
+		if alt == "." || alt == "*" || (len(alt) > 0 && alt[0] == '<') {
+			continue
+		}
+		if len(alt) != refLen {
+			sameLength = false
+			isIndel = true
+		}
+	}
+	// A same-length substitution is a classic SNP when refLen == 1, and an
+	// MNP (multi-nucleotide substitution, e.g. AT>GC) when refLen > 1. MNPs
+	// carry the same annotations as SNPs and aren't indel alignment
+	// artifacts, so they should be filtered with SNP thresholds rather than
+	// falling into neither bucket, which previously caused every MNP to be
+	// silently discarded regardless of quality.
+	isSNP = sameLength
+	return
+}
+
+func PassesHardFilter(v *vcfgo.Variant, hfcfg utils.HardFilterConfig) bool {
+	// Do not resurrect records rejected by the variant caller. A missing FILTER
+	// field is tolerated for non-standard VCFs, but any explicit failure is not.
+	if v.Filter != "" && v.Filter != "." && v.Filter != "PASS" {
+		return false
+	}
+	isSNP, isIndel := classifyVariant(v)
+
+	if hfcfg.LightFilter {
+		// Light filtering: reject only variants with genuinely poor support.
+		// QUAL, QD (SNP/INDEL) and MQ (SNP) reflect absolute call confidence
+		// and read-mapping quality, and stay meaningful regardless of how
+		// the sample was pooled. FS, SOR, MQRankSum and ReadPosRankSum, by
+		// contrast, test whether ref- and alt-supporting reads look
+		// different from each other (strand, position, mapping quality) —
+		// in a bulk that is a pool of many individuals, ref/alt reads are
+		// *expected* to be present in a skewed, non-50/50 ratio by design,
+		// which these tests can easily mistake for bias/artifact. Skipping
+		// them here keeps real segregating BSA-seq variants that GATK's
+		// single-sample-tuned best-practice filters would otherwise discard.
+		switch {
+		case isSNP:
+			if float64(v.Quality) < hfcfg.SNP_QUAL_Min {
+				return false
+			}
+			if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.SNP_QD_Min {
+				return false
+			}
+			if mq, ok := utils.GetFloat(v, "MQ"); ok && mq < hfcfg.SNP_MQ_Min {
+				return false
+			}
+			return true
+		case isIndel:
+			if float64(v.Quality) < hfcfg.INDEL_QUAL_Min {
+				return false
+			}
+			if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.INDEL_QD_Min {
+				return false
+			}
+			return true
+		default:
+			return false
+		}
+	}
+
+	switch {
+	case isSNP:
+		if float64(v.Quality) < hfcfg.SNP_QUAL_Min {
+			return false
+		}
+		if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.SNP_QD_Min {
+			return false
+		}
+		if fs, ok := utils.GetFloat(v, "FS"); ok && fs > hfcfg.SNP_FS_Max {
+			return false
+		}
+		if sor, ok := utils.GetFloat(v, "SOR"); ok && sor > hfcfg.SNP_SOR_Max {
+			return false
+		}
+		if mq, ok := utils.GetFloat(v, "MQ"); ok && mq < hfcfg.SNP_MQ_Min {
+			return false
+		}
+		if mqrs, ok := utils.GetFloat(v, "MQRankSum"); ok && mqrs < hfcfg.SNP_MQRankSum_Min {
+			return false
+		}
+		if rprs, ok := utils.GetFloat(v, "ReadPosRankSum"); ok && rprs < hfcfg.SNP_ReadPosRankSum_Min {
+			return false
+		}
+		return true
+
+	case isIndel:
+		if float64(v.Quality) < hfcfg.INDEL_QUAL_Min {
+			return false
+		}
+		if qd, ok := utils.GetFloat(v, "QD"); ok && qd < hfcfg.INDEL_QD_Min {
+			return false
+		}
+		if fs, ok := utils.GetFloat(v, "FS"); ok && fs > hfcfg.INDEL_FS_Max {
+			return false
+		}
+		if sor, ok := utils.GetFloat(v, "SOR"); ok && sor > hfcfg.INDEL_SOR_Max {
+			return false
+		}
+		if rprs, ok := utils.GetFloat(v, "ReadPosRankSum"); ok && rprs < hfcfg.INDEL_ReadPosRankSum_Min {
+			return false
+		}
+		return true
+
+	default:
+		return false
+	}
+}
+
+// BsaSeqTargetAlt returns the one-based ALT index that satisfies the BSA-seq
+// segregation filter, or zero when none does. The index must travel with the
+// variant because multi-allelic records can pass through an ALT other than the
+// first one.
+func BsaSeqTargetAlt(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) int {
+	// Try each real ALT as a candidate target and keep the variant if any
+	// one of them shows a valid BSA-seq segregation pattern, instead of
+	// discarding multi-allelic sites outright.
+	for _, targetAlt := range realAltIndices(v) {
+		if bsaSeqFilterAllele(v, cfg, bsaType, targetAlt) {
+			return targetAlt
+		}
+	}
+	return 0
+}
+
+func BsaSeqFilter(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string) bool {
+	return BsaSeqTargetAlt(v, cfg, bsaType) != 0
+}
+
+func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType string, targetAlt int) bool {
+	switch bsaType {
+	case "2b":
+		// bulks only
+		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		return effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+
+	case "2p2b":
+		// 2 parents 2 bulks filter
+		for _, idx := range []int{cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
+			return false // parent allele too ambiguous/mixed to be informative
+		}
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
+		}
+
+		return effectiveDP(hp) >= cfg.HighParentDepth &&
+			effectiveDP(lp) >= cfg.LowParentDepth &&
+			effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth &&
+			effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+	case "2plb":
+		// 2 parents low bulk filter
+		if !hasUsableAlleleSignal(v, cfg.LowBulkIdx, targetAlt) {
+			return false
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
+			return false
+		}
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
+		}
+
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+	case "2phb":
+		// 2 parents high bulk filter
+		if !hasUsableAlleleSignal(v, cfg.HighBulkIdx, targetAlt) {
+			return false
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		lp := v.Samples[cfg.LowParentIdx]
+
+		hpAllele, hpOK := parentAllele(v, cfg.HighParentIdx, targetAlt)
+		lpAllele, lpOK := parentAllele(v, cfg.LowParentIdx, targetAlt)
+		if !hpOK || !lpOK {
+			return false
+		}
+		if hpAllele == lpAllele {
+			return false // same predominant allele in both parents — not informative
+		}
+
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+	case "hp2b":
+		// high parent 2 bulks filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+
+		hp := v.Samples[cfg.HighParentIdx]
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+	case "lp2b":
+		// low parent  2 bulks filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		lp := v.Samples[cfg.LowParentIdx]
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+
+	case "hphb":
+		// high parent high bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.HighBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		hp := v.Samples[cfg.HighParentIdx]
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+	case "hplb":
+		// high parent low bulk filter
+		for _, idx := range []int{cfg.HighParentIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		hp := v.Samples[cfg.HighParentIdx]
+		return effectiveDP(hp) >= cfg.HighParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+	case "lphb":
+		// low parent high bulk filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.HighBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		lp := v.Samples[cfg.LowParentIdx]
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.HighBulkIdx]) >= cfg.HighBulkDepth
+	case "lplb":
+		// low parent low bulk filter
+		for _, idx := range []int{cfg.LowParentIdx, cfg.LowBulkIdx} {
+			if !hasUsableAlleleSignal(v, idx, targetAlt) {
+				return false
+			}
+		}
+		lp := v.Samples[cfg.LowParentIdx]
+		return effectiveDP(lp) >= cfg.LowParentDepth && effectiveDP(v.Samples[cfg.LowBulkIdx]) >= cfg.LowBulkDepth
+
+	default:
+		return false
+	}
+
+}
+
+type countingWriter struct {
+	io.Writer
+	n int64
+}
+
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.Writer.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&cw.n, int64(n))
+	}
+	return n, err
+}
+
+func newTabixIndex() *tabix.Index {
+	idx := tabix.New()
+	idx.Format = 2 // VCF
+	idx.NameColumn = 1
+	idx.BeginColumn = 2
+	idx.EndColumn = 0
+	idx.MetaChar = '#'
+	return idx
+}
+
+type vcfRecord struct {
+	chrom string
+	start int // 0-based
+	end   int // 0-based half-open
+}
+
+// FilteredVariant associates a passing VCF record with the ALT allele that
+// satisfied the BSA-seq filter. TargetAlt is one-based VCF allele numbering.
+type FilteredVariant struct {
+	Variant   *vcfgo.Variant
+	TargetAlt int
+}
+
+func (r vcfRecord) RefName() string { return r.chrom }
+func (r vcfRecord) Start() int      { return r.start }
+func (r vcfRecord) End() int        { return r.end }
+
+func addTabixRecord(idx *tabix.Index, v *vcfgo.Variant, chunk bgzf.Chunk) error {
+	rec := vcfRecord{
+		chrom: v.Chromosome,
+		start: int(v.Pos) - 1,
+		end:   int(v.Pos) - 1 + len(v.Ref()),
+	}
+	return idx.Add(rec, chunk, true, true)
+}
+
+func sanitizeVariant(v *vcfgo.Variant, keepIndices []int) {
+	// Subset samples
+	newSamples := make([]*vcfgo.SampleGenotype, len(keepIndices))
+	for i, idx := range keepIndices {
+		if idx < len(v.Samples) {
+			newSamples[i] = v.Samples[idx]
+		}
+	}
+	v.Samples = newSamples
+
+	// Clean Format string - remove PGT, PID which are being deleted from header
+	newFormat := make([]string, 0, len(v.Format))
+	for _, f := range v.Format {
+		if f != "PGT" && f != "PID" {
+			newFormat = append(newFormat, f)
+		}
+	}
+	v.Format = newFormat
+}
+
+func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsaseqType string, keepIndices []int) ([]FilteredVariant, int, int, error) {
+
+	err := os.MkdirAll(filepath.Join(cfg.OutputDir, "stats"), 0775)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", bsaseqType))
+	badVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.lowqual.vcf.gz", bsaseqType))
+
+	rdr := cfg.Rdr
+	origSampleNames := rdr.Header.SampleNames
+
+	var newSampleNames []string
+	for _, idx := range keepIndices {
+		if idx >= 0 && idx < len(origSampleNames) {
+			newSampleNames = append(newSampleNames, origSampleNames[idx])
+		}
+	}
+
+	writerHeader := vcfgo.Header{
+		SampleNames:   newSampleNames,
+		Infos:         rdr.Header.Infos,
+		SampleFormats: make(map[string]*vcfgo.SampleFormat, len(rdr.Header.SampleFormats)),
+		Filters:       rdr.Header.Filters,
+		Extras:        rdr.Header.Extras,
+		FileFormat:    rdr.Header.FileFormat,
+		Contigs:       rdr.Header.Contigs,
+		Samples:       rdr.Header.Samples,
+		Pedigrees:     rdr.Header.Pedigrees,
+	}
+	for id, format := range rdr.Header.SampleFormats {
+		writerHeader.SampleFormats[id] = format
+	}
+
+	for _, id := range []string{"PGT", "PID"} {
+		delete(writerHeader.SampleFormats, id)
+	}
+
+	// ── Open output files ─────────────────────────────────────────────────────
+	hfFile, err := os.Create(hardFilteredVcfPath)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF: %w", err)
+	}
+	defer hfFile.Close()
+
+	hfCounting := &countingWriter{Writer: hfFile}
+	hfBgzf := bgzf.NewWriter(hfCounting, 1)
+	hfWriter, err := vcfgo.NewWriter(hfBgzf, &writerHeader)
+	if err != nil {
+		hfBgzf.Close()
+		return nil, 0, 0, fmt.Errorf("create hard-filtered VCF writer: %w", err)
+	}
+
+	badFile, err := os.Create(badVcfPath)
+	if err != nil {
+		hfBgzf.Close()
+		return nil, 0, 0, fmt.Errorf("create rejected VCF: %w", err)
+	}
+	defer badFile.Close()
+
+	badBgzf := bgzf.NewWriter(badFile, 1)
+	badWriter, err := vcfgo.NewWriter(badBgzf, &writerHeader)
+	if err != nil {
+		hfBgzf.Close()
+		badBgzf.Close()
+		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
+	}
+
+	hfIdx := newTabixIndex()
+	bar := progressbar.Default(-1, "Hard filtering variants")
+
+	// ── Pipeline channels ─────────────────────────────────────────────────────
+	type variantResult struct {
+		seq       int
+		v         *vcfgo.Variant
+		targetAlt int
+		passed    bool
+	}
+	type queuedVariant struct {
+		seq int
+		v   *vcfgo.Variant
+	}
+
+	const chanBuf = 512
+	filterCh := make(chan queuedVariant, chanBuf) // reader  → filter workers
+	resultCh := make(chan variantResult, chanBuf) // workers → writer
+	var readerErr atomic.Pointer[error]
+
+	// ── Stage 1: Reader goroutine ─────────────────────────────────────────────
+	var (
+		originalCount atomic.Int64
+		skippedCount  atomic.Int64
+	)
+
+	go func() {
+		defer close(filterCh)
+		seq := 0
+		for {
+			v := rdr.Read()
+			if v == nil {
+				break
+			}
+			if err := rdr.Error(); err != nil {
+				if strings.Contains(err.Error(), "bad sample string") ||
+					strings.Contains(err.Error(), "strconv.ParseFloat") {
+					// vcfgo fails to treat "." (a valid VCF missing-value
+					// marker) as a numeric placeholder in some INFO/FORMAT
+					// fields. This is non-fatal - the field is simply left
+					// unset for this variant - so clear the error and continue.
+					rdr.Clear()
+				} else {
+					e := fmt.Errorf("VCF parse error at line %d: %w", v.LineNumber, err)
+					readerErr.Store(&e)
+					return
+				}
+			}
+			alts := v.Alt()
+			if len(alts) == 0 || (len(alts) == 1 && (alts[0] == "<NON_REF>" || alts[0] == ".")) {
+				skippedCount.Add(1)
+				continue
+			}
+			originalCount.Add(1)
+			_ = bar.Add(1)
+			// Keep source order so the writer can produce a valid coordinate-sorted
+			// VCF even though filtering completes concurrently.
+			filterCh <- queuedVariant{seq: seq, v: v}
+			seq++
+		}
+
+		if err := rdr.Error(); err != nil &&
+			!strings.Contains(err.Error(), "bad sample string") &&
+			!strings.Contains(err.Error(), "strconv.ParseFloat") {
+			e := fmt.Errorf("VCF read error: %w", err)
+			readerErr.Store(&e)
+		}
+	}()
+
+	// ── Stage 2: Filter worker pool ───────────────────────────────────────────
+	// Filtering is CPU-bound (no shared state); run one worker per core.
+	// vcfgo.Variant fields accessed here are read-only after Read() returns,
+	// so no mutex is needed inside the workers.
+	numWorkers := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			for queued := range filterCh {
+				v := queued.v
+				targetAlt := 0
+				passed := PassesHardFilter(v, hfcfg)
+				if passed {
+					targetAlt = BsaSeqTargetAlt(v, cfg, bsaseqType)
+					passed = targetAlt != 0
+				}
+				resultCh <- variantResult{seq: queued.seq, v: v, targetAlt: targetAlt, passed: passed}
+			}
+		}()
+	}
+
+	// Close resultCh once all workers are done.
+	go func() {
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	// ── Stage 3: Writer goroutine (single, preserves order not required) ──────
+	// NOTE: bgzf / vcfgo writers are NOT goroutine-safe; keep all writes here.
+	var (
+		passedVariants []FilteredVariant
+		passed         int
+		writerErr      error
+	)
+
+	writeResult := func(res variantResult) error {
+		// Sanitize variant (subset samples and clean format)
+		sanitizeVariant(res.v, keepIndices)
+
+		if !res.passed {
+			badWriter.WriteVariant(res.v)
+			return nil
+		}
+
+		blockOffset, _ := hfBgzf.Next()
+		startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
+
+		hfWriter.WriteVariant(res.v)
+
+		blockOffsetEnd, _ := hfBgzf.Next()
+		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
+
+		if err := addTabixRecord(hfIdx, res.v, bgzf.Chunk{Begin: startOffset, End: endOffset}); err != nil {
+			return fmt.Errorf("tabix add variant at %s:%d: %w", res.v.Chromosome, res.v.Pos, err)
+		}
+
+		passedVariants = append(passedVariants, FilteredVariant{Variant: res.v, TargetAlt: res.targetAlt})
+		passed++
+		return nil
+	}
+
+	// Workers complete out of order. Buffer their results until the next source
+	// record arrives so VCF output and tabix chunks remain coordinate-sorted.
+	pending := make(map[int]variantResult)
+	nextSeq := 0
+	for res := range resultCh {
+		pending[res.seq] = res
+		for {
+			next, ok := pending[nextSeq]
+			if !ok {
+				break
+			}
+			delete(pending, nextSeq)
+			if err := writeResult(next); err != nil {
+				writerErr = err
+				break
+			}
+			nextSeq++
+		}
+		if writerErr != nil {
+			break
+		}
+	}
+
+	// Drain resultCh if writer broke early, so workers can unblock and exit.
+	for range resultCh {
+	}
+
+	// ── Check errors ──────────────────────────────────────────────────────────
+	if ep := readerErr.Load(); ep != nil {
+		hfBgzf.Close()
+		badBgzf.Close()
+		return nil, 0, 0, *ep
+	}
+	if writerErr != nil {
+		hfBgzf.Close()
+		badBgzf.Close()
+		return nil, 0, 0, writerErr
+	}
+
+	_ = bar.Finish()
+
+	// ── Flush and close bgzf streams ──────────────────────────────────────────
+	if err = hfBgzf.Close(); err != nil {
+		badBgzf.Close()
+		return nil, 0, 0, fmt.Errorf("close hard-filtered bgzf: %w", err)
+	}
+	if err = badBgzf.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("close rejected bgzf: %w", err)
+	}
+
+	// ── Write tabix index ─────────────────────────────────────────────────────
+	tbiFile, err := os.Create(hardFilteredVcfPath + ".tbi")
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("create tbi file: %w", err)
+	}
+	defer tbiFile.Close()
+
+	tbiGz := bgzf.NewWriter(tbiFile, 1)
+	if err := tabix.WriteTo(tbiGz, hfIdx); err != nil {
+		tbiGz.Close()
+		return nil, 0, 0, fmt.Errorf("write tabix index: %w", err)
+	}
+	if err := tbiGz.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
+	}
+
+	original := int(originalCount.Load())
+	//skipped := int(skippedCount.Load())
+
+	color.Blue(
+		"Hard filtering complete:\n%d variant records read.\n%d passed.\n%d rejected\n",
+		original, passed, original-passed,
+	)
+
+	return passedVariants, original, passed, nil
+}
