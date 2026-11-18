@@ -6,8 +6,10 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -197,35 +199,6 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			depth[k] = math.Max(float64(raw[ci].Depth), 1)
 		}
 
-		// smooth1 computes one depth-weighted Gaussian smoothed slice.
-		// The inner loop uses binary search to find the [lo, hi) range of
-		// variants within the cutoff, avoiding a full O(n) scan per query.
-		smooth1 := func(vals []float64) ([]float64, []int) {
-			smVals := make([]float64, n)
-			nContrib := make([]int, n) // number of variants with w > 0
-			for k := 0; k < n; k++ {
-				pK := pos[k]
-				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
-				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
-
-				wSum, wValSum := 0.0, 0.0
-				for m := lo; m < hi; m++ {
-					d := (pos[m] - pK) / bw
-					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
-					if w <= 0 {
-						continue
-					}
-					wSum += w
-					wValSum += w * vals[m]
-					nContrib[k]++
-				}
-				if wSum > 0 {
-					smVals[k] = wValSum / wSum
-				}
-			}
-			return smVals, nContrib
-		}
-
 		// Collect (raw values, setter) pairs for every active statistic.
 		type statPair struct {
 			vals   []float64
@@ -268,18 +241,16 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			)
 		}
 
-		// Smooth each statistic and record the per-position contributor count
-		// from the first stat (all stats share the same position grid and depth
-		// weights, so counts are identical regardless of which stat is used).
-		smoothedVals := make([][]float64, len(pairs))
-		var nContrib []int
+		// Smooth every statistic in one pass: the Gaussian × depth weight of
+		// each (query, neighbour) pair is computed once and applied to all
+		// statistics, and query positions are split across all cores. Each
+		// statistic accumulates in the same order as a per-statistic pass would,
+		// so results are bit-for-bit identical to smoothing them one at a time.
+		vals := make([][]float64, len(pairs))
 		for p, sp := range pairs {
-			sv, nc := smooth1(sp.vals)
-			smoothedVals[p] = sv
-			if nContrib == nil {
-				nContrib = nc
-			}
+			vals[p] = sp.vals
 		}
+		smoothedVals, nContrib := smoothAll(pos, depth, vals, bw, cutoff)
 
 		// Assign to output; skip positions with insufficient kernel coverage.
 		for k, ci := range chromIdx {
@@ -319,6 +290,63 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 		len(valid), len(out)-len(valid), minVariantsInKernel)
 
 	return valid, nil
+}
+
+// smoothAll computes depth-weighted Gaussian smoothed values of every series
+// in vals at every position in pos (sorted). It returns the smoothed series
+// and, per position, the number of contributing neighbours within cutoff.
+func smoothAll(pos, depth []float64, vals [][]float64, bw, cutoff float64) ([][]float64, []int) {
+	n := len(pos)
+	nv := len(vals)
+	out := make([][]float64, nv)
+	for p := range out {
+		out[p] = make([]float64, n)
+	}
+	nContrib := make([]int, n)
+
+	workers := runtime.GOMAXPROCS(0)
+	chunk := (n + workers - 1) / workers
+	if chunk < 256 {
+		chunk = 256
+	}
+	var wg sync.WaitGroup
+	for start := 0; start < n; start += chunk {
+		end := min(start+chunk, n)
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			wv := make([]float64, nv)
+			for k := start; k < end; k++ {
+				pK := pos[k]
+				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
+				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
+
+				for p := range wv {
+					wv[p] = 0
+				}
+				wSum := 0.0
+				for m := lo; m < hi; m++ {
+					d := (pos[m] - pK) / bw
+					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
+					if w <= 0 {
+						continue
+					}
+					wSum += w
+					for p := range wv {
+						wv[p] += w * vals[p][m]
+					}
+					nContrib[k]++
+				}
+				if wSum > 0 {
+					for p := range wv {
+						out[p][k] = wv[p] / wSum
+					}
+				}
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	return out, nContrib
 }
 
 // extractFloat builds a float64 slice for the variants referenced by chromIdx.
@@ -523,11 +551,7 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 			continue
 		}
 
-		sum := 0.0
-		for _, z := range czs {
-			sum += z
-		}
-		s.CompositeZ = math.Round((sum/math.Sqrt(float64(len(czs))))*1e6) / 1e6
+		s.CompositeZ = stoufferSum(czs)
 
 		maxAbs := 0.0
 		for _, z := range allZs {
@@ -537,6 +561,23 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 		}
 		s.MaxAbsZ = math.Round(maxAbs*1e6) / 1e6
 	}
+}
+
+// compositeZ is the CompositeZ of one marker from its signed-difference
+// Z-score (ZDeltaSI or ZAFDev) and its two magnitude Z-scores (G and LOD).
+// The null simulation (nullsim.go) calls this so the simulated statistic is
+// computed by exactly the same formula as the observed one.
+func compositeZ(zSigned, zG, zLOD float64) float64 {
+	return stoufferSum([]float64{math.Abs(zSigned), zG, zLOD})
+}
+
+// stoufferSum returns Σz/√k rounded to 6 decimals.
+func stoufferSum(czs []float64) float64 {
+	sum := 0.0
+	for _, z := range czs {
+		sum += z
+	}
+	return math.Round((sum/math.Sqrt(float64(len(czs))))*1e6) / 1e6
 }
 
 // ─── TSV output ────────────────────────────────────────────────────────────────

@@ -215,6 +215,7 @@ var rootCmd = &cobra.Command{
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
 		rep, _ := cmd.Flags().GetInt("rep")
+		seed, _ := cmd.Flags().GetInt64("seed")
 		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
 		minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
 		mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
@@ -416,6 +417,7 @@ var rootCmd = &cobra.Command{
 			WindowSize:        winSize,
 			StepSize:          step,
 			Rep:               rep,
+			Seed:              seed,
 			BrmAlpha:          brmAlpha,
 			MinQTLWidth:       minQTLWidth,
 			MergeDistance:     mergeDistance,
@@ -506,9 +508,10 @@ func init() {
 	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum significant markers supporting a QTL")
 
 	// ------------------------------------------------- Threshold -------------------------------------------------- //
-	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
+	rootCmd.Flags().Float64("brm-alpha", 0.01, "BRM genome-wide significance level: chance that a genome with no QTL gets any BRM block (0.01 matches the P99 used for the other statistics)")
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, RIL, BC1H, BC1L, BC2H, BC2L, ...)")
 	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
+	rootCmd.Flags().Int64("seed", 1, "Random seed for threshold simulations (same seed + same input = identical thresholds)")
 
 	// ----------------------------------------------- Filtering ---------------------------------------------------- //
 	rootCmd.Flags().Bool("light-filtering", false, "Enable light filtering")

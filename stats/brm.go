@@ -21,45 +21,62 @@ type BRMBlock struct {
 	PeakPos   int64
 	Peak      float64
 	Threshold float64
+	Support   SupportInterval
 }
 
-// inverseNormalCDF implements an approximation of the inverse standard normal CDF
-// using the algorithm by Peter J. Acklam. Accurate enough for typical alpha values.
-func inverseNormalCDF(p float64) float64 {
-	if p <= 0 || p >= 1 {
-		if p <= 0 {
-			return math.Inf(-1)
-		}
-		return math.Inf(1)
-	}
-	// Coefficients in rational approximations
-	// Implementation adapted from https://web.archive.org/web/20150910023224/http://home.online.no/~pjacklam/notes/invnorm/
-	var a = []float64{-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-		1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00}
-	var b = []float64{-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-		6.680131188771972e+01, -1.328068155288572e+01}
-	var c = []float64{-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-		-2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00}
-	var d = []float64{7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00}
+// BRM significance
+//
+// BRM tests the smoothed allele-frequency difference between bulks (ΔSI; for
+// one bulk, the deviation from the expected frequency) against u·σ, where σ
+// is the standard deviation of that difference caused by which plants ended
+// up in each bulk (pool sampling, "drift"):
+//
+//	σ² = af(1−af)·[1/(V·n1) + 1/(V·n2)]   two bulks
+//	σ² = p0(1−p0)/(V·n)                   one bulk
+//
+// with V the population variance scale (PopulationVarianceScale). Read
+// sampling noise is not part of σ: the tested value is a Gaussian-smoothed
+// average over many markers, which removes it almost entirely, and using a
+// single marker's depth made the threshold jump from marker to marker.
+//
+// u is genome-wide: the null-genome simulation (nullsim.go) records, for each
+// simulated genome, the largest |ΔSI|/σ anywhere, and u is its (1−α)
+// quantile (α = --brm-alpha). So α is the probability that a genome with no
+// QTL produces any BRM block, at the cross, bulk sizes, marker density and
+// depths of the real data; whatever read noise survives smoothing is
+// included through the simulation.
 
-	// Define break-points.
-	pLow := 0.02425
-	pHigh := 1 - pLow
-	var q, r, x float64
-	if p < pLow {
-		q = math.Sqrt(-2 * math.Log(p))
-		x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q + c[5]) / (((d[0]*q+d[1])*q+d[2])*q + d[3])
-		return -x
+// brmSigmaTwoBulk is σ for two bulks at pooled allele frequency af.
+func brmSigmaTwoBulk(af float64, n1, n2 int, popScale float64) float64 {
+	af = math.Min(math.Max(af, 0.05), 0.95)
+	v := af * (1 - af) / popScale
+	return math.Sqrt(v/float64(n1) + v/float64(n2))
+}
+
+// brmSigmaOneBulk is σ for one bulk of n individuals with expected frequency p0.
+func brmSigmaOneBulk(p0 float64, n int, popScale float64) float64 {
+	if math.IsNaN(p0) || p0 <= 0 || p0 >= 1 {
+		p0 = 0.5
 	}
-	if p > pHigh {
-		q = math.Sqrt(-2 * math.Log(1-p))
-		x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q + c[5]) / (((d[0]*q+d[1])*q+d[2])*q + d[3])
-		return x
+	p0 = math.Min(math.Max(p0, 0.05), 0.95)
+	return math.Sqrt(p0 * (1 - p0) / (popScale * float64(n)))
+}
+
+// bulkSizes returns the bulk sizes used for a run: high and low bulk, and the
+// single bulk for one-bulk designs (OneBulkSize, else the size of the bulk
+// that is present). Shared by the null simulation and BRM so both use the
+// same numbers.
+func bulkSizes(cfg utils.AnalysisConfig, bsaType string) (high, low, one int) {
+	hasHigh, _, _, hasOne := BulkFlags(bsaType)
+	high, low, one = cfg.HighBulkSize, cfg.LowBulkSize, cfg.OneBulkSize
+	if hasOne && one <= 0 {
+		if hasHigh {
+			one = high
+		} else {
+			one = low
+		}
 	}
-	q = p - 0.5
-	r = q * q
-	x = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r + a[5]) * q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r + 1)
-	return x
+	return high, low, one
 }
 
 // PopulationVarianceScale returns the exact scaling factor for segregation variance
@@ -101,23 +118,15 @@ func PopulationVarianceScale(pop string) float64 {
 	return 1.0 // Default to RIL-like (most conservative)
 }
 
-// calculateBRMBlocksTwoBulk applies BRM block detection for two-bulk smoothed windows.
-// uAlpha should be the standard-normal quantile corresponding to 1 - alpha/2.
-//
-// The threshold is calculated based on the expected variance of the allele frequency
-// deviation between two bulks in the given population:
-//
-//	σ² = [(n1 + n2) / (V_scale * n1 * n2)] * p * (1-p)
-//
-// where V_scale is the population variance scale (e.g., 2.0 for F2) and p is the
-// average allele frequency across bulks.
+// calculateBRMBlocksTwoBulk applies BRM block detection for two-bulk smoothed
+// windows: a marker is significant when |ΔSI| ≥ u·σ (see "BRM significance"),
+// with σ = brmSigmaTwoBulk at the smoothed pooled frequency and u the
+// genome-wide multiplier from the null simulation.
 func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize, lowBulkSize int, popScale, uAlpha float64) []BRMBlock {
 	if len(stats) == 0 || highBulkSize <= 0 || lowBulkSize <= 0 || uAlpha <= 0 {
 		return nil
 	}
 
-	n1 := float64(highBulkSize)
-	n2 := float64(lowBulkSize)
 	var blocks []BRMBlock
 	inBlock := false
 	startIdx := 0
@@ -142,20 +151,7 @@ func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize
 
 	for i, s := range stats {
 		af := (s.SmHighSI + s.SmLowSI) / 2
-		if af < 0.05 {
-			af = 0.05
-		}
-		if af > 0.95 {
-			af = 0.95
-		}
-		// Law of total variance: pool sampling variance is attenuated by
-		// sequencing, then binomial read sampling is added back. Depth is the
-		// conservative minimum of the two bulk depths carried by SmoothedStats.
-		d := math.Max(float64(s.Depth), 1)
-		poolH := af * (1 - af) / (popScale * n1)
-		poolL := af * (1 - af) / (popScale * n2)
-		variance := poolH*(1-1/d) + af*(1-af)/d + poolL*(1-1/d) + af*(1-af)/d
-		threshold := uAlpha * math.Sqrt(variance)
+		threshold := uAlpha * brmSigmaTwoBulk(af, highBulkSize, lowBulkSize, popScale)
 		significant := threshold > 0 && math.Abs(s.SmDeltaSI) >= threshold
 
 		if significant {
@@ -189,30 +185,13 @@ func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize
 	return blocks
 }
 
-// calculateBRMBlocksOneBulk mirrors the one-bulk BRM logic (testing SI vs expectedSI).
-//
-// The threshold is calculated based on the expected variance of the allele frequency
-// in a single bulk relative to the expected null frequency (p0):
-//
-//	σ² = (p0 * (1-p0)) / (V_scale * n)
-//
-// where V_scale is the population variance scale and n is the bulk size.
+// calculateBRMBlocksOneBulk is the one-bulk version: a marker is significant
+// when |SI − p0| ≥ u·σ with σ = brmSigmaOneBulk (see "BRM significance").
 func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int, popScale, expectedSI, uAlpha float64) []BRMBlock {
 	if len(stats) == 0 || bulkSize <= 0 || uAlpha <= 0 {
 		return nil
 	}
-	p0 := expectedSI
-	if math.IsNaN(p0) || p0 <= 0 || p0 >= 1 {
-		p0 = 0.5
-	}
-	if p0 < 0.05 {
-		p0 = 0.05
-	}
-	if p0 > 0.95 {
-		p0 = 0.95
-	}
-
-	n := float64(bulkSize)
+	threshold := uAlpha * brmSigmaOneBulk(expectedSI, bulkSize, popScale)
 
 	var blocks []BRMBlock
 	inBlock := false
@@ -237,10 +216,6 @@ func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int
 	}
 
 	for i, s := range stats {
-		d := math.Max(float64(s.Depth), 1)
-		poolVar := p0 * (1 - p0) / (popScale * n)
-		variance := poolVar*(1-1/d) + p0*(1-p0)/d
-		threshold := uAlpha * math.Sqrt(variance)
 		if !(threshold > 0) {
 			continue
 		}
@@ -282,8 +257,10 @@ func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int
 	return blocks
 }
 
-// RunBRM runs BRM block detection across chromosomes and writes a TSV of blocks.
-func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRMBlock, error) {
+// RunBRM runs BRM block detection across chromosomes and writes a TSV of
+// blocks. u is the genome-wide multiplier from CalculateThresholds
+// (Thresholds.BRM.U).
+func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, u float64) ([]BRMBlock, error) {
 
 	color.Cyan("===================================== Running BRM block detection =========================================")
 	if len(sm) == 0 {
@@ -292,7 +269,11 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 
 	_, _, hasBoth, hasOne := BulkFlags(bsaType)
 	popScale := PopulationVarianceScale(cfg.Population)
-	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
+	if !(u > 0) {
+		return nil, fmt.Errorf("BRM: genome-wide threshold multiplier not available (u=%v)", u)
+	}
+	uAlpha := u
+	highSize, lowSize, oneSize := bulkSizes(cfg, bsaType)
 
 	// group by chrom
 	byChrom := make(map[string][]SmoothedStats)
@@ -300,35 +281,27 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 		byChrom[s.CHROM] = append(byChrom[s.CHROM], s)
 	}
 
+	lodFn := supportLOD(bsaType)
 	var allBlocks []BRMBlock
 	for chrom, stats := range byChrom {
 		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
 		var blocks []BRMBlock
 		if hasBoth {
-			blocks = calculateBRMBlocksTwoBulk(chrom, stats, cfg.HighBulkSize, cfg.LowBulkSize, popScale, uAlpha)
+			blocks = calculateBRMBlocksTwoBulk(chrom, stats, highSize, lowSize, popScale, uAlpha)
 		} else if hasOne {
 			// expectedSI: use expectedHighAlleleP0 if available, else 0.5
 			expectedSI, _ := ExpectedAF(cfg.Population)
 			if expectedSI == 0 {
 				expectedSI = 0.5
 			}
-			// Determine bulk size: try OneBulkSize first, then HighBulkSize/LowBulkSize, then default
-			bulkSize := cfg.OneBulkSize
-			if bulkSize <= 0 {
-				if cfg.HighBulkSize > 0 {
-					bulkSize = cfg.HighBulkSize
-				} else if cfg.LowBulkSize > 0 {
-					bulkSize = cfg.LowBulkSize
-				} else {
-					// Default to a reasonable bulk size if none specified
-					// This handles cases where only depth is available
-					bulkSize = 100
-				}
-			}
-			blocks = calculateBRMBlocksOneBulk(chrom, stats, bulkSize, popScale, expectedSI, uAlpha)
+			blocks = calculateBRMBlocksOneBulk(chrom, stats, oneSize, popScale, expectedSI, uAlpha)
 		}
 		if len(blocks) > 0 {
-			allBlocks = append(allBlocks, mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance())...)
+			merged := mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance())
+			for i := range merged {
+				merged[i].Support = supportInChrom(stats, lodFn, float64(merged[i].Start), float64(merged[i].Stop), SupportLODDrop)
+			}
+			allBlocks = append(allBlocks, merged...)
 		}
 	}
 
@@ -343,9 +316,12 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 		return nil, err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK\tTHRESHOLD")
+	// SUPPORT_* (appended so existing column positions are unchanged) is the
+	// LOD-drop interval that localises the QTL; START/STOP is the whole block.
+	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK\tTHRESHOLD\tSUPPORT_START\tSUPPORT_END\tSUPPORT_PEAK_POS\tSUPPORT_PEAK_LOD")
 	for _, b := range allBlocks {
-		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.6f\t%.6f\n", b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.Threshold)
+		s := b.Support
+		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.6f\t%.6f\t%d\t%d\t%d\t%.6f\n", b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.Threshold, s.Start, s.End, s.PeakPos, s.PeakLOD)
 	}
 	color.Green("BRM blocks written to %s", outPath)
 	return allBlocks, nil

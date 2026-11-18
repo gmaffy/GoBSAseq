@@ -11,7 +11,6 @@ require (
 	github.com/schollz/progressbar/v3 v3.19.1
 	github.com/spf13/cobra v1.10.2
 	github.com/xuri/excelize/v2 v2.11.0
-	golang.org/x/sync v0.21.0
 	gonum.org/v1/gonum v0.17.0
 )
 

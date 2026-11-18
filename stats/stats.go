@@ -12,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -52,75 +51,6 @@ type BSAstats struct {
 	Depth int
 }
 
-// safeRefDepthSample parses REF depth for a sample directly from the AD/RO
-// FORMAT fields instead of calling vcfgo's RefDepth(), which can panic when
-// AD is present but malformed (e.g. missing the comma separator). On parse
-// failure it returns an error so callers can fall back gracefully.
-func safeRefDepthSample(s *vcfgo.SampleGenotype) (int, error) {
-	if s == nil {
-		return 0, fmt.Errorf("nil sample")
-	}
-	if ad, ok := s.Fields["AD"]; ok {
-		if comma := strings.Index(ad, ","); comma >= 0 {
-			refStr := ad[:comma]
-			if refStr == "" || refStr == "." {
-				return 0, fmt.Errorf("invalid AD ref depth %q", refStr)
-			}
-			return strconv.Atoi(refStr)
-		}
-	}
-	if ro, ok := s.Fields["RO"]; ok {
-		if ro == "" || ro == "." {
-			return 0, fmt.Errorf("invalid RO ref depth %q", ro)
-		}
-		return strconv.Atoi(ro)
-	}
-	return 0, fmt.Errorf("no ref depth field (AD/RO)")
-}
-
-// safeAltDepthsSample parses ALT depths for a sample directly from the AD/AO
-// FORMAT fields instead of calling vcfgo's AltDepths(), for the same
-// malformed-AD-panic reason as safeRefDepthSample.
-func safeAltDepthsSample(s *vcfgo.SampleGenotype) ([]int, error) {
-	if s == nil {
-		return []int{}, fmt.Errorf("nil sample")
-	}
-	if ad, ok := s.Fields["AD"]; ok {
-		if comma := strings.Index(ad, ","); comma >= 0 {
-			altStr := ad[comma+1:]
-			parts := strings.Split(altStr, ",")
-			vals := make([]int, len(parts))
-			for i, p := range parts {
-				if p == "" || p == "." {
-					return []int{}, fmt.Errorf("invalid AD alt depth %q", p)
-				}
-				v, err := strconv.Atoi(p)
-				if err != nil {
-					return []int{}, err
-				}
-				vals[i] = v
-			}
-			return vals, nil
-		}
-	}
-	if ao, ok := s.Fields["AO"]; ok {
-		parts := strings.Split(ao, ",")
-		vals := make([]int, len(parts))
-		for i, p := range parts {
-			if p == "" || p == "." {
-				return []int{}, fmt.Errorf("invalid AO alt depth %q", p)
-			}
-			v, err := strconv.Atoi(p)
-			if err != nil {
-				return []int{}, err
-			}
-			vals[i] = v
-		}
-		return vals, nil
-	}
-	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
-}
-
 // determineHighAllele decides which allele (0 = ref, altIdx+1 = alt) the
 // "high" phenotype segregates with. A parent used in BSA-seq is ideally a
 // fully homozygous inbred line, but in practice parents can carry residual
@@ -130,23 +60,19 @@ func safeAltDepthsSample(s *vcfgo.SampleGenotype) ([]int, error) {
 // parent's reads. Using allele depth instead makes the polarity robust to a
 // parent being imperfectly homozygous. Falls back to the genotype call only
 // when depth data isn't usable (e.g. the parent has zero coverage here).
-func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx int) int {
+func determineHighAllele(fv filter.FilteredVariant, highParentIdx, lowParentIdx, altIdx int) int {
 	predominantAllele := func(idx int) (allele int, ok bool) {
-		if idx < 0 || idx >= len(v.Samples) {
+		if idx < 0 || idx >= len(fv.Samples) {
 			return 0, false
 		}
-		s := v.Samples[idx]
-		refDepth, errR := safeRefDepthSample(s)
-		altDepths, errA := safeAltDepthsSample(s)
-		if errR != nil || errA != nil || altIdx < 0 || altIdx >= len(altDepths) {
+		s := fv.Samples[idx]
+		if !s.RefOK || !s.AltOK {
 			return 0, false
 		}
-		altDepth := altDepths[altIdx]
-		total := refDepth + altDepth
-		if total == 0 {
+		if s.RefDepth+s.AltDepth == 0 {
 			return 0, false
 		}
-		if refDepth >= altDepth {
+		if s.RefDepth >= s.AltDepth {
 			return 0, true
 		}
 		return altIdx + 1, true
@@ -156,8 +82,8 @@ func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx i
 		if allele, ok := predominantAllele(highParentIdx); ok {
 			return allele
 		}
-		if len(v.Samples[highParentIdx].GT) > 0 {
-			return v.Samples[highParentIdx].GT[0]
+		if gt := fv.Samples[highParentIdx].GT; len(gt) > 0 {
+			return gt[0]
 		}
 		return 0
 	}
@@ -171,7 +97,7 @@ func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx i
 			}
 			return 0
 		}
-		if len(v.Samples[lowParentIdx].GT) > 0 && v.Samples[lowParentIdx].GT[0] == 0 {
+		if gt := fv.Samples[lowParentIdx].GT; len(gt) > 0 && gt[0] == 0 {
 			return altIdx + 1
 		}
 	}
@@ -248,18 +174,18 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 					return
 				}
 
-				filtered := passedVariants[i]
-				v := filtered.Variant
-				altIdx := filtered.TargetAlt - 1
-				if altIdx < 0 || altIdx >= len(v.Alt()) {
+				fv := passedVariants[i]
+				altIdx := fv.TargetAlt - 1
+				if altIdx < 0 || altIdx >= fv.NumAlts {
+					_ = bar.Add(1)
 					continue
 				}
 
 				s := BSAstats{
-					CHROM: v.Chromosome,
-					POS:   int64(v.Pos),
-					REF:   v.Reference,
-					ALT:   v.Alt()[altIdx],
+					CHROM: fv.Chrom,
+					POS:   int64(fv.Pos),
+					REF:   fv.Ref,
+					ALT:   fv.Alt,
 				}
 
 				// Determine which allele index (0=ref, 1=alt) corresponds to the
@@ -268,23 +194,19 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 				// homozygous, so the predominant allele in their reads is a more
 				// reliable signal than whichever allele the caller listed first.
 				// Defaults to ref (0) when no parent is present.
-				highAllele := determineHighAllele(v, highParentIdx, lowParentIdx, altIdx)
+				highAllele := determineHighAllele(fv, highParentIdx, lowParentIdx, altIdx)
 
 				if highParentIdx >= 0 {
-					s.HighParGT = v.Samples[highParentIdx].GT
+					s.HighParGT = fv.Samples[highParentIdx].GT
 				}
 				if lowParentIdx >= 0 {
-					s.LowParGT = v.Samples[lowParentIdx].GT
+					s.LowParGT = fv.Samples[lowParentIdx].GT
 				}
 
 				if highBulkIdx >= 0 {
-					refDepth, _ := safeRefDepthSample(v.Samples[highBulkIdx])
-					altDepths, _ := safeAltDepthsSample(v.Samples[highBulkIdx])
-					altDepth := 0
-					if altIdx >= 0 && altIdx < len(altDepths) {
-						altDepth = altDepths[altIdx]
-					}
-					s.HighBulkGT = v.Samples[highBulkIdx].GT
+					sc := fv.Samples[highBulkIdx]
+					refDepth, altDepth := sc.RefDepth, sc.AltDepth
+					s.HighBulkGT = sc.GT
 					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
 						s.HighBulkH, s.HighBulkL = refDepth, altDepth
@@ -299,13 +221,9 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 				}
 
 				if lowBulkIdx >= 0 {
-					refDepth, _ := safeRefDepthSample(v.Samples[lowBulkIdx])
-					altDepths, _ := safeAltDepthsSample(v.Samples[lowBulkIdx])
-					altDepth := 0
-					if altIdx >= 0 && altIdx < len(altDepths) {
-						altDepth = altDepths[altIdx]
-					}
-					s.LowBulkGT = v.Samples[lowBulkIdx].GT
+					sc := fv.Samples[lowBulkIdx]
+					refDepth, altDepth := sc.RefDepth, sc.AltDepth
+					s.LowBulkGT = sc.GT
 					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
 					if highAllele == 0 {
 						s.LowBulkH, s.LowBulkL = refDepth, altDepth

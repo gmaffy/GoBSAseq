@@ -42,6 +42,10 @@ type AnalysisConfig struct {
 	StepSize   int
 	Rep        int
 	BrmAlpha   float64
+	// Seed is the base random seed for the Monte Carlo threshold simulations.
+	// Each simulation derives its own seed from Seed and its parameters, so
+	// results are reproducible regardless of goroutine scheduling.
+	Seed int64
 	// MinGQ is the minimum genotype quality (FORMAT/GQ) required of the parent
 	// samples at a site. Zero disables the check and is applied only when GQ is
 	// present (e.g. DeepVariant VCFs). It is deliberately NOT applied to bulks:

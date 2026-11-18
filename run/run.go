@@ -67,6 +67,9 @@ func sampleIndexByName(sampleMap map[int]string, name string) (int, bool) {
 	return 0, false
 }
 
+// geneSpaceParamCount is the number of parameters missingGeneSpaceParams checks.
+const geneSpaceParamCount = 4
+
 func missingGeneSpaceParams(cfg *utils.AnalysisConfig) []string {
 	var missing []string
 	if cfg.SnpEffDB == "" {
@@ -294,7 +297,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 4/10: Calculating thresholds ...\n")
 
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
-	thresholds, err := stats.CalculateThresholds(*cfg, btype, smoothedStats)
+	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats, smoothedStats)
 	if err != nil {
 		return err
 	}
@@ -304,7 +307,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 5/10: Calculating BRM blocks ...\n")
 
 	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
-	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
+	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats, thresholds[0].BRM.U)
 	if err != nil {
 		return err
 	}
@@ -352,13 +355,20 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return err
 	}
 	color.Green("Merged intervals: %d", len(merged))
+	for _, m := range merged {
+		if m.Support.Valid() {
+			fmt.Printf("  %s: QTL support interval %.2f–%.2f Mb (LOD peak %.2f Mb); above-threshold region %.2f–%.2f Mb\n",
+				m.Chrom, float64(m.Support.Start)/1e6, float64(m.Support.End)/1e6, float64(m.Support.PeakPos)/1e6,
+				float64(m.Start)/1e6, float64(m.Stop)/1e6)
+		}
+	}
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 9/10: Plotting ...\n")
 
 	// ------------------------------------------------ Plots ------------------------------------------------------- //
-	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks); err != nil {
+	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks, merged); err != nil {
 		color.Red("Error generating plots: %v", err)
 		return err
 	}
@@ -439,20 +449,14 @@ func GetBamName(bam string) (string, error) {
 
 func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	// =========================================== Gene Space Check ================================================= //
+	// Non-interactive so the pipeline runs unattended (batch/HPC/CI). Supplying
+	// none of the gene-space parameters means "skip it"; supplying only some is
+	// almost certainly a configuration mistake, so fail fast before the long run.
 	if missing := missingGeneSpaceParams(cfg); len(missing) > 0 {
-		color.Yellow("Gene space analysis parameters missing: %s", strings.Join(missing, ", "))
-		color.Blue("Continue without gene space analysis? [y/N]: ")
-		var answer string
-		if _, err := fmt.Scan(&answer); err != nil {
-			return err
-		}
-		switch strings.ToLower(strings.TrimSpace(answer)) {
-		case "y", "yes":
-			color.Yellow("Continuing without gene space analysis.")
-
-		default:
-
-			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
+		if len(missing) == geneSpaceParamCount {
+			color.Yellow("Gene space analysis not configured (--snpEffDB, --gene-descriptions, --prg, --gff); it will be skipped.")
+		} else {
+			return fmt.Errorf("incomplete gene space parameters, missing: %s (supply all of them, or none to skip gene space analysis)", strings.Join(missing, ", "))
 		}
 	} else {
 		gsFiles := []string{cfg.Gff, cfg.GeneDesc, cfg.Prg}

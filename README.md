@@ -58,7 +58,7 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `-B` / `--bulks` | string | — | Bulk sample names: `high,low` (use `None` to skip) |
 | `-p` / `--parents-depth` | string | `5,5` | Min read depth for parents (high,low) |
 | `-b` / `--bulks-depth` | string | `40,40` | Min read depth for bulks (high,low) |
-| `-S` / `--bulk-sizes` | string | `20,20` | Number of individuals in bulks (high,low) - **Important for deep sequencing: used in Monte Carlo null model** |
+| `-S` / `--bulk-sizes` | string | `20,20` | Number of individuals in bulks (high,low) - **Used by the null-genome simulation that sets thresholds; set it accurately** |
 | `-o` / `--out` | string | `.` | Output directory |
 
 #### BAM & Read Inputs (Optional)
@@ -79,8 +79,9 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel width (bp); σ = width / 2 |
 | `-s` / `--step-size` | int64 | `100000` | Reserved for future regular-grid summaries; marker-centred smoothing does not currently use it |
 | `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC{n}H`, `BC{n}L`, `BC{n}F2H`, `BC{n}F2L` |
-| `--brm-alpha` | float64 | `0.05` | BRM significance level |
-| `--rep` | int | `1000` | Number of simulations for thresholds |
+| `--brm-alpha` | float64 | `0.01` | BRM genome-wide significance level: chance that a genome with no QTL gets any BRM block |
+| `--rep` | int | `1000` | Number of simulated null genomes for thresholds |
+| `--seed` | int | `1` | Random seed for the null simulation (same seed + same input = identical thresholds) |
 
 #### Variant Filtering
 
@@ -107,6 +108,8 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `--min-ReadPosRankSum-INDEL` | `-20.0` | Min read position rank sum |
 
 #### Gene Space Analysis (Optional)
+
+Supply all of `--snpEffDB`, `--gene-descriptions`, `--prg` and `--gff` to run it, or none to skip it. The run never prompts; a partial set is an error.
 
 | Flag | Description |
 |------|-------------|
@@ -198,10 +201,10 @@ genespace/  (if annotation enabled)
 1. Hard Filter         → Remove low-quality variants (SNP/INDEL-specific thresholds)
 2. Raw Statistics      → Per-variant SI, ΔSI, G-stat, LOD, Bayes factor
 3. Smooth & Normalise  → Gaussian kernel smoothing, robust Z-scores (MAD), Stouffer composite Z
-4. Thresholds          → **Two-stage Monte Carlo simulation** for empirical thresholds per depth + bulk size
+4. Thresholds          → **Null-genome simulation**: genome-wide thresholds from simulated bulks with recombination
 5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
-6. QTL Detection       → Regions exceeding the empirical CompositeZ threshold
-7. Individual QTLs     → Per-statistic intervals using depth-specific thresholds
+6. QTL Detection       → Regions exceeding the genome-wide CompositeZ P99 threshold
+7. Individual QTLs     → Per-statistic intervals exceeding genome-wide P99 thresholds
 8. Merge               → Union of Z-score and BRM intervals
 9. Plots               → Interactive HTML charts (echarts) with all thresholds
 10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
@@ -218,8 +221,8 @@ genespace/  (if annotation enabled)
 | **Bayes Factor** | Beta-binomial log₁₀ BF with Beta(0.5, 0.5) prior |
 | **Robust Z-score** | `(x − median) / (1.4826 × MAD)`; outlier-resistant |
 | **Composite Z** | Stouffer: `Σ Zᵢ / √k`; combines all Z-scores |
-| **BRM** | Threshold = `u_α √((n₁+n₂)·p(1−p) / (V_scale·n₁n₂))` for two-bulk |
-| **MC Thresholds** | Two-stage: `Binomial(bulk_size, p₀) → Binomial(depth, realized_af)`; empirical per-depth thresholds |
+| **BRM** | Block where \|ΔSI\| ≥ `u·σ`, σ = `√(p(1−p)·(1/(V·n₁) + 1/(V·n₂)))` (pool sampling only; one bulk: `√(p₀(1−p₀)/(V·n))`); `u` = (1−α) quantile of the per-genome max of \|ΔSI\|/σ in the null simulation, so α is genome-wide |
+| **Thresholds** | Quantiles of the genome-wide maximum of each smoothed track across simulated null genomes (see below) |
 
 ### Population Structures
 
@@ -233,25 +236,20 @@ genespace/  (if annotation enabled)
 
 ---
 
-## Deep Sequencing & Monte Carlo Thresholds
+## Significance Thresholds (Null-Genome Simulation)
 
-### Two-Stage Null Model (For Accurate Deep Sequencing)
+Smoothed statistics are driven, under the null, mostly by **genetic drift**: each bulk holds a limited number of individuals, so long parental segments are over- or under-represented by chance and linked markers deviate together. Thresholds therefore come from simulating whole null genomes, not independent SNPs.
 
-For deeply sequenced datasets, GoBSAseq uses a **two-stage Monte Carlo null model** that properly accounts for the finite population of individuals in each bulk:
+For each of `--rep` null genomes:
 
-**Stage 1**: Sample realised population-specific diploid genotype dosage in the bulk
-```
-Pool AF ~ cross-specific genotype sampling (F2/F3/F4/RIL/backcross)
-```
+1. Every bulk individual is simulated through the cross (`-m`: F2/F3/F4/RIL selfing or BCn backcrossing) chromosome by chromosome, with Haldane crossovers. Each chromosome is assumed to be **100 cM long** (about one crossover per meiosis), a typical value for plants.
+2. At every real marker the pool allele frequency is the simulated dosage, and reads are drawn as `Binomial(observed depth at that marker, pool frequency)`, so the real marker density and depth profile are used.
+3. The pipeline's own statistics, depth-weighted Gaussian smoothing, robust-Z normalisation and CompositeZ formula are applied.
+4. The genome-wide maximum (and minimum, for signed tracks) of each track is recorded.
 
-**Stage 2**: Sample the observed reads from that realized frequency
-```
-Reads ~ Binomial(n = depth, p = realized_allele_frequency)
-```
+**P99** is the 99th percentile of those per-genome maxima: only 1% of genomes without any QTL produce a call anywhere, so it controls the **genome-wide** false-positive rate. Signed tracks (SI, ΔSI, AFDev) split it across both tails. QTLs are called at P99 on every chromosome; P95 values are reported in the thresholds TSV. The per-genome extremes are written to `*.null_genome_extremes.tsv`.
 
-**Why This Matters**: In deep sequencing, many reads may come from the same individuals. The old model (directly sampling reads from p₀) overestimated variance, leading to excessive false positives. The two-stage model correctly models this structure.
-
-**When to Use**: This model is automatically used when `--bulk-sizes` is provided. For best results with deep sequencing (>50x coverage per bulk), always specify accurate bulk sizes.
+Accurate `--bulk-sizes` matter: smaller bulks mean more drift and higher thresholds. Weak QTLs in small bulks can be genuinely indistinguishable from drift at a 1% genome-wide error rate.
 
 ### QTL Detection Methods
 
@@ -259,11 +257,22 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 
 | Method | Threshold | Primary/Secondary | Output File |
 |--------|-----------|----------------|-------------|
-| **Composite Z-score** | Empirical Monte Carlo threshold | **Primary** | `*.compositez.qtl.xlsx` |
-| **Individual statistics** | Empirical depth-specific thresholds | **Secondary** | `*.individual.qtl.xlsx` |
-| **BRM Blocks** | Analytical window-based | **Secondary** | `*.brm_blocks.tsv` |
+| **Composite Z-score** | Genome-wide null-simulation threshold | **Primary** | `*.compositez.qtl.xlsx` |
+| **Individual statistics** | Genome-wide null-simulation thresholds | **Secondary** | `*.individual.qtl.xlsx` |
+| **BRM Blocks** | Genome-wide null-simulation multiplier × drift σ | **Secondary** | `*.brm_blocks.tsv` |
 
 **CompositeZ and individual-statistic detection are run by default.** The threshold TSV records the exact threshold used for every retained marker.
+
+### Localising a QTL: Support Intervals
+
+The threshold decides **whether** a region holds a QTL. It does not say **where**: with a strong QTL in an early generation (F2), linkage spans tens of Mb and the region above the threshold can be the whole chromosome. Each QTL is therefore also given a **support interval**: from the highest smoothed LOD in the region, it extends in both directions while LOD stays within **1.5** of the peak (a 1.5-LOD drop).
+
+- QTL tables list the support interval first (`Support_Start`, `Support_End`, `Support_PeakPos`, `Support_PeakLOD`), then the above-threshold region (`Region_Start`, `Region_End`).
+- `*.brm_blocks.tsv` has `SUPPORT_*` columns appended.
+- Plots shade support intervals red; BRM blocks stay amber.
+- Gene-space analysis searches the support interval.
+
+On `Data/sim_F2_strongQTL.vcf.gz` (true QTL at chr2:15.0 Mb) the above-threshold region is 0–30 Mb and the support interval 14.60–16.29 Mb. The 1.5 drop has not yet been calibrated for smoothed BSA-seq LOD.
 
 ---
 
@@ -298,7 +307,7 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 ### Deep Sequencing (>50x Coverage)
 
 ```bash
-# For deep sequencing, specify bulk sizes for accurate Monte Carlo thresholds
+# Specify accurate bulk sizes: they drive the null-genome simulation
 ./gobsaseq \
   -V deep_seq.vcf.gz \
   -P parent_a,parent_b \
@@ -306,11 +315,10 @@ GoBSAseq provides **two complementary QTL detection approaches**:
   -p 20,20 -b 200,200 \
   -S 150,150  # <-- Bulk sizes: 150 individuals each
   -w 2000000 -s 100000 \
-  -m F2 --rep 2000  # More simulations for deep data
+  -m F2 --rep 2000  # More null genomes = more precise P99
   -o results_deep
 
-# The two-stage Monte Carlo model will automatically use bulk sizes
-# to reduce false positives from deep coverage
+# Thresholds account for drift in bulks of this size
 ```
 
 ---
@@ -343,7 +351,8 @@ stats/
   smoothing.go       Gaussian smoothing + normalization
   detect.go          QTL detection + merging
   brm.go             BRM block detection
-  thresholds.go      Empirical threshold calculation
+  thresholds.go      Genome-wide thresholds from null-genome extremes
+  nullsim.go         Null-genome simulation (cross, recombination, reads, smoothing)
   genespace.go       Gene annotation (optional)
 plots/plots.go       HTML plotting (go-echarts)
 utils/

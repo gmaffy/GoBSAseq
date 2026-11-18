@@ -18,9 +18,15 @@ type MergedQTL struct {
 	BRMPeak        float64
 	BRMThreshold   float64
 	Source         string
+	Support        SupportInterval
 }
 
+// geneSpaceRegion is the support interval when available: the region above
+// the threshold can be a whole chromosome and is not where the QTL is.
 func (m MergedQTL) geneSpaceRegion() (string, int, int) {
+	if m.Support.Valid() {
+		return m.Chrom, int(m.Support.Start), int(m.Support.End)
+	}
 	return m.Chrom, int(m.Start), int(m.Stop)
 }
 
@@ -36,6 +42,7 @@ type PeakIntersection struct {
 	StartIndex     int
 	EndIndex       int
 	PeakIndex      int
+	Support        SupportInterval
 }
 
 type Peak struct {
@@ -59,6 +66,8 @@ type ConsolidatedQTL struct {
 	OneBulkG       *Peak
 	OneBulkLOD     *Peak
 	OneBulkBBLogBF *Peak
+
+	Support SupportInterval
 }
 
 type Tail int
@@ -360,25 +369,21 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	return peaks
 }
 
-func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, threshP95 func(Thresholds) float64, tail Tail, label string) []PeakIntersection {
+// findPeaksAtP99 calls regions at the p99 threshold only. The same level is
+// used on every chromosome: an earlier per-chromosome p99→p95 fallback made a
+// region's call depend on whether some other region on its chromosome passed
+// p99, and admitted false p95 calls on chromosomes with no real QTL.
+func findPeaksAtP99(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, tail Tail) []PeakIntersection {
+	peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP99, tail)
+	if len(peaks) == 0 {
+		return nil
+	}
 	chrom := sm[0].CHROM
-
-	tryLevel := func(threshFn func(Thresholds) float64, level string) []PeakIntersection {
-		peaks := FindPeakIntersections(statName, sm, th, valueFn, threshFn, tail)
-		if len(peaks) == 0 {
-			return nil
-		}
-		for i := range peaks {
-			peaks[i].ThresholdLevel = level
-			peaks[i].Chrom = chrom
-		}
-		return peaks
+	for i := range peaks {
+		peaks[i].ThresholdLevel = "p99"
+		peaks[i].Chrom = chrom
 	}
-
-	if peaks := tryLevel(threshP99, "p99"); peaks != nil {
-		return peaks
-	}
-	return tryLevel(threshP95, "p95")
+	return peaks
 }
 
 type peakStatConfig struct {
@@ -410,7 +415,7 @@ var oneBulkStatConfigs = []peakStatConfig{
 func collectPeaks(sm []SmoothedStats, th []Thresholds, configs []peakStatConfig) []PeakIntersection {
 	var peaks []PeakIntersection
 	for _, cfg := range configs {
-		if found := findPeaksWithFallback(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.p95, cfg.tail, cfg.label); found != nil {
+		if found := findPeaksAtP99(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.tail); found != nil {
 			peaks = append(peaks, found...)
 		}
 	}
@@ -670,7 +675,8 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 
 	f := excelize.NewFile()
 
-	header := []interface{}{"Chrom", "Start", "End", "Threshold"}
+	header := append([]interface{}{"Chrom"}, supportHeader...)
+	header = append(header, "Region_Start", "Region_End", "Threshold")
 	if hasBothBulks {
 		header = append(header,
 			"DeltaSI_Pos", "DeltaSI_Value",
@@ -702,12 +708,8 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 	for rowIdx, qtl := range qtls {
 		row := rowIdx + 2
 
-		rowData := []interface{}{
-			qtl.Chrom,
-			qtl.Start,
-			qtl.End,
-			qtl.Threshold,
-		}
+		rowData := append([]interface{}{qtl.Chrom}, supportCells(qtl.Support)...)
+		rowData = append(rowData, qtl.Start, qtl.End, qtl.Threshold)
 
 		if hasBothBulks {
 			addPeakData(&rowData, qtl.DeltaSI)
@@ -739,6 +741,7 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 
 	var peaks []PeakIntersection
 	var qtls []ConsolidatedQTL
+	lodFn := supportLOD(bsaType)
 	byChr := make(map[string][]int)
 
 	for i := range smoothed {
@@ -762,15 +765,24 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 			chrPeaks = append(chrPeaks, collectPeaks(sm, th, oneBulkStatConfigs)...)
 		}
 
+		sorted := sortedByPos(sm)
+		for i := range chrPeaks {
+			chrPeaks[i].Support = supportInChrom(sorted, lodFn, chrPeaks[i].Start, chrPeaks[i].End, SupportLODDrop)
+		}
+		chrQTLs := ConsolidateQTLs(chrPeaks, mergeGap)
+		for i := range chrQTLs {
+			chrQTLs[i].Support = supportInChrom(sorted, lodFn, chrQTLs[i].Start, chrQTLs[i].End, SupportLODDrop)
+		}
+
 		peaks = append(peaks, chrPeaks...)
-		qtls = append(qtls, ConsolidateQTLs(chrPeaks, mergeGap)...)
+		qtls = append(qtls, chrQTLs...)
 	}
 
 	return peaks, qtls
 }
 
 func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) []PeakIntersection {
-	_ = bsaType
+	lodFn := supportLOD(bsaType)
 
 	var peaks []PeakIntersection
 	byChr := make(map[string][]int)
@@ -788,17 +800,20 @@ func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 			th[i] = thresholds[j]
 		}
 
-		if found := findPeaksWithFallback(
+		if found := findPeaksAtP99(
 			"CompositeZ",
 			sm,
 			th,
 			func(s SmoothedStats) float64 { return s.CompositeZ },
 			func(t Thresholds) float64 { return t.Z.CompositeZP99 },
-			func(t Thresholds) float64 { return t.Z.CompositeZP95 },
 			UpperTail,
-			"CompositeZ",
 		); found != nil {
-			peaks = append(peaks, mergePeakIntersections(found, mergeGap)...)
+			sorted := sortedByPos(sm)
+			merged := mergePeakIntersections(found, mergeGap)
+			for i := range merged {
+				merged[i].Support = supportInChrom(sorted, lodFn, merged[i].Start, merged[i].End, SupportLODDrop)
+			}
+			peaks = append(peaks, merged...)
 		}
 	}
 
@@ -808,22 +823,22 @@ func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 func WriteCompositeZQTLsToExcel(peaks []PeakIntersection, filename string) error {
 	f := excelize.NewFile()
 
-	header := []interface{}{
-		"Chrom", "Start", "End", "Threshold",
+	header := append([]interface{}{"Chrom"}, supportHeader...)
+	header = append(header, "Region_Start", "Region_End", "Threshold",
 		"CompositeZ_Pos", "CompositeZ_Value",
-	}
+	)
 	f.SetSheetRow("Sheet1", "A1", &header)
 
 	for rowIdx, peak := range peaks {
 		row := rowIdx + 2
-		rowData := []interface{}{
-			peak.Chrom,
+		rowData := append([]interface{}{peak.Chrom}, supportCells(peak.Support)...)
+		rowData = append(rowData,
 			peak.Start,
 			peak.End,
 			peak.ThresholdLevel,
 			peak.PeakPos,
 			peak.PeakValue,
-		}
+		)
 		cell, _ := excelize.CoordinatesToCellName(1, row)
 		f.SetSheetRow("Sheet1", cell, &rowData)
 	}
@@ -921,6 +936,12 @@ func MergeCompositeBRM(compositePeaks []PeakIntersection, brmBlocks []BRMBlock, 
 			if iv.end > m.Stop {
 				m.Stop = iv.end
 			}
+			if iv.q != nil {
+				m.Support = m.Support.union(iv.q.Support)
+			}
+			if iv.b != nil {
+				m.Support = m.Support.union(iv.b.Support)
+			}
 			if iv.q != nil && (!hasQ || iv.q.PeakValue > m.CompositeZPeak) {
 				hasQ = true
 				m.CompositeZPos = iv.q.PeakPos
@@ -955,22 +976,22 @@ func MergeCompositeBRM(compositePeaks []PeakIntersection, brmBlocks []BRMBlock, 
 func WriteFinalQTLsToExcel(merged []MergedQTL, filename string) error {
 	f := excelize.NewFile()
 
-	header := []interface{}{
-		"Chrom", "Start", "Stop", "Source", "Threshold",
+	header := append([]interface{}{"Chrom"}, supportHeader...)
+	header = append(header, "Region_Start", "Region_Stop", "Source", "Threshold",
 		"CompositeZ_Pos", "CompositeZ_Value",
 		"BRM_Peak", "BRM_Threshold",
-	}
+	)
 	f.SetSheetRow("Sheet1", "A1", &header)
 
 	for rowIdx, qtl := range merged {
 		row := rowIdx + 2
-		rowData := []interface{}{
-			qtl.Chrom,
+		rowData := append([]interface{}{qtl.Chrom}, supportCells(qtl.Support)...)
+		rowData = append(rowData,
 			qtl.Start,
 			qtl.Stop,
 			qtl.Source,
 			qtl.Threshold,
-		}
+		)
 
 		if qtl.Source == "BRM" {
 			rowData = append(rowData, "", "")
@@ -1006,6 +1027,18 @@ func maxI64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+// supportHeader / supportCells are the leading QTL-table columns: the
+// localised interval comes first; Region_* (the stretch above the threshold)
+// follows for reference.
+var supportHeader = []interface{}{"Support_Start", "Support_End", "Support_PeakPos", "Support_PeakLOD"}
+
+func supportCells(s SupportInterval) []interface{} {
+	if !s.Valid() {
+		return []interface{}{"", "", "", ""}
+	}
+	return []interface{}{s.Start, s.End, s.PeakPos, r6(s.PeakLOD)}
 }
 
 func nanOrFloat(v float64) interface{} {

@@ -16,6 +16,9 @@ type GeneSpaceInterval interface {
 }
 
 func (b BRMBlock) geneSpaceRegion() (string, int, int) {
+	if b.Support.Valid() {
+		return b.Chrom, int(b.Support.Start), int(b.Support.End)
+	}
 	return b.Chrom, int(b.Start), int(b.Stop)
 }
 

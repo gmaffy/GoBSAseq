@@ -2,9 +2,11 @@ package filter_test
 
 import (
 	"compress/gzip"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -49,7 +51,7 @@ func TestSelectedAltFlowsIntoRawStats(t *testing.T) {
 	}
 
 	cfg.OutputDir = t.TempDir()
-	raw, err := stats.RawStats(cfg, "2b", []int{0, 1}, []filter.FilteredVariant{{Variant: variants[0], TargetAlt: selected}})
+	raw, err := stats.RawStats(cfg, "2b", []int{0, 1}, []filter.FilteredVariant{filter.NewFilteredVariant(variants[0], selected)})
 	if err != nil {
 		t.Fatalf("RawStats: %v", err)
 	}
@@ -81,7 +83,7 @@ func TestHardFilterPreservesInputOrder(t *testing.T) {
 		t.Fatalf("HardFilterVcf: %v", err)
 	}
 	for i, want := range []int{100, 200, 300} {
-		if got := passed[i].Variant.Pos; got != uint64(want) {
+		if got := passed[i].Pos; got != uint64(want) {
 			t.Fatalf("passed record %d has position %d, want %d", i, got, want)
 		}
 	}
@@ -245,8 +247,8 @@ func TestHardFilterSplitsMultiallelicEndToEnd(t *testing.T) {
 		t.Fatalf("passed count %d != slice length %d", nPass, len(passed))
 	}
 	for _, fv := range passed {
-		if len(fv.Variant.Alt()) != 1 {
-			t.Fatalf("passed record is not biallelic: ALT=%v", fv.Variant.Alt())
+		if fv.NumAlts != 1 {
+			t.Fatalf("passed record is not biallelic: %d ALTs", fv.NumAlts)
 		}
 		if fv.TargetAlt != 1 {
 			t.Fatalf("decomposed record TargetAlt=%d, want 1", fv.TargetAlt)
@@ -349,5 +351,69 @@ func TestDetectFilterProfile(t *testing.T) {
 	}
 	if !p2.HasGQ {
 		t.Fatal("GQ FORMAT not detected")
+	}
+}
+
+// TestSubsetFastPathMatchesFullParse runs the filter on a multisample VCF file
+// twice: through the file fast path (sample columns subset before parsing)
+// and through the original full-parse reader. Results must be identical.
+func TestSubsetFastPathMatchesFullParse(t *testing.T) {
+	// 6 samples; the analysis uses columns 4 (high bulk) and 1 (low bulk),
+	// deliberately out of order.
+	header := "##fileformat=VCFv4.2\n" +
+		"##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n" +
+		"##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allele depths\">\n" +
+		"##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read depth\">\n" +
+		"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts0\ts1\ts2\ts3\ts4\ts5\n"
+	other := "0/1:5,5:10"
+	var body strings.Builder
+	for i := 0; i < 50; i++ {
+		lb := fmt.Sprintf("0/1:%d,%d:%d", 10+i, 20, 30+i)
+		hb := fmt.Sprintf("0/1:%d,%d:%d", 20, 10+i, 30+i)
+		if i%7 == 0 {
+			hb = "0/1:1,1:2" // fails min depth
+		}
+		fmt.Fprintf(&body, "chr1\t%d\t.\tA\tT\t60\tPASS\t.\tGT:AD:DP\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			100+i*10, other, lb, other, other, hb, other)
+	}
+	text := header + body.String()
+	path := filepath.Join(t.TempDir(), "multi.vcf")
+	// The file uses CRLF line endings, which the fast path must tolerate.
+	if err := os.WriteFile(path, []byte(strings.ReplaceAll(text, "\n", "\r\n")), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(useFile bool) []filter.FilteredVariant {
+		r, err := vcfgo.NewReader(strings.NewReader(text), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := utils.AnalysisConfig{
+			Rdr: r, OutputDir: t.TempDir(),
+			HighParentIdx: -1, LowParentIdx: -1,
+			HighBulkIdx: 4, LowBulkIdx: 1, HighBulkDepth: 10, LowBulkDepth: 10,
+		}
+		if useFile {
+			cfg.VCF = path
+		}
+		passed, _, _, err := filter.HardFilterVcf(cfg, utils.HardFilterConfig{LightFilter: true}, "2b", []int{4, 1})
+		if err != nil {
+			t.Fatalf("HardFilterVcf(useFile=%v): %v", useFile, err)
+		}
+		return passed
+	}
+
+	fast, slow := run(true), run(false)
+	if len(fast) == 0 || len(fast) != len(slow) {
+		t.Fatalf("passed: fast=%d slow=%d", len(fast), len(slow))
+	}
+	for i := range fast {
+		if !reflect.DeepEqual(fast[i], slow[i]) {
+			t.Fatalf("record %d differs:\nfast %+v\nslow %+v", i, fast[i], slow[i])
+		}
+	}
+	// High bulk is s4: its AD alt depth at i=1 is 11.
+	if fast[0].Samples[0].AltDepth != 11 || fast[0].Samples[1].RefDepth != 11 {
+		t.Fatalf("sample order wrong: %+v", fast[0].Samples)
 	}
 }

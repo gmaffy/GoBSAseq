@@ -60,7 +60,7 @@ const posFormatter = `function(value) {
 
 // ── public entry point ───────────────────────────────────────────────────────
 
-func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, thresholds []stats.Thresholds, brmBlocks []stats.BRMBlock) error {
+func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, thresholds []stats.Thresholds, brmBlocks []stats.BRMBlock, qtls []stats.MergedQTL) error {
 	color.Cyan("\n================================ Generating plots for %s... ==========================================", bsaType)
 	if len(smoothed) == 0 {
 		return nil
@@ -74,16 +74,18 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 
 	// ── group by chromosome, preserve sort order ─────────────────────────────
 
-	// Build a map from chrom → [(smoothed, threshold)] preserving index order so
-	// that per-variant thresholds stay aligned with their smoothed values.
-	type indexedStat struct {
-		sm stats.SmoothedStats
-		t  stats.Thresholds
-	}
-	byChr := make(map[string][]indexedStat)
+	// Group marker indices by chromosome (indices, not copies: each
+	// SmoothedStats + Thresholds pair is several hundred bytes).
+	byChr := make(map[string][]int)
 	for i, s := range smoothed {
-		byChr[s.CHROM] = append(byChr[s.CHROM], indexedStat{s, thresholds[i]})
+		byChr[s.CHROM] = append(byChr[s.CHROM], i)
 	}
+
+	// Display resolution: curves are drawn at ~1% of the smoothing σ, keeping
+	// the minimum and maximum of every bin (see downsampleXY), so every peak
+	// and dip survives while files stay small. TSV/Excel outputs keep every
+	// marker.
+	bw := math.Max(1000, float64(cfg.WindowSize)/2/100)
 	chroms := make([]string, 0, len(byChr))
 	for c := range byChr {
 		chroms = append(chroms, c)
@@ -91,9 +93,18 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	sort.Strings(chroms)
 
 	// Index BRM blocks by chrom for fast lookup.
-	brmByChr := make(map[string][]stats.BRMBlock)
+	shadeByChr := make(map[string]shading)
 	for _, b := range brmBlocks {
-		brmByChr[b.Chrom] = append(brmByChr[b.Chrom], b)
+		s := shadeByChr[b.Chrom]
+		s.brm = append(s.brm, b)
+		shadeByChr[b.Chrom] = s
+	}
+	for _, q := range qtls {
+		if q.Support.Valid() {
+			s := shadeByChr[q.Chrom]
+			s.qtl = append(s.qtl, q.Support)
+			shadeByChr[q.Chrom] = s
+		}
 	}
 
 	// ── create page containers ───────────────────────────────────────────────
@@ -113,13 +124,13 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	// ── per-chromosome chart generation ─────────────────────────────────────
 
 	for _, chrom := range chroms {
-		entries := byChr[chrom]
-		if len(entries) == 0 {
+		idxs := byChr[chrom]
+		if len(idxs) == 0 {
 			continue
 		}
 
-		n := len(entries)
-		chromBRM := brmByChr[chrom]
+		n := len(idxs)
+		chromShade := shadeByChr[chrom]
 
 		// Extract position arrays and per-variant threshold arrays.
 		x := make([]int64, n)
@@ -173,8 +184,8 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		obLodT99, obLodT95 := make([]float64, n), make([]float64, n)
 		obBBT99, obBBT95 := make([]float64, n), make([]float64, n)
 
-		for i, e := range entries {
-			s, t := e.sm, e.t
+		for i, j := range idxs {
+			s, t := &smoothed[j], &thresholds[j]
 			x[i] = s.POS
 
 			if hasBothBulks {
@@ -250,45 +261,45 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 
 		if hasBothBulks {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" HighSI", x, hi,
-					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromBRM),
-				createRawValueChart(chrom+" LowSI", x, li,
-					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromBRM),
-				createRawValueChart(chrom+" ΔSI (DeltaSI)", x, dsi,
-					avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), true, chromBRM),
-				createRawValueChart(chrom+" G-statistic", x, gs,
-					avg(gsT99), avg(gsT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" ED⁴", x, ed,
-					avg(edT99), avg(edT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" LOD", x, lod,
-					avg(lodT99), avg(lodT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" BB log-BF", x, bbl,
-					avg(bblT99), avg(bblT95), 0, 0, false, chromBRM),
+				createRawValueChart(bw, chrom+" HighSI", x, hi,
+					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromShade),
+				createRawValueChart(bw, chrom+" LowSI", x, li,
+					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromShade),
+				createRawValueChart(bw, chrom+" ΔSI (DeltaSI)", x, dsi,
+					avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), true, chromShade),
+				createRawValueChart(bw, chrom+" G-statistic", x, gs,
+					avg(gsT99), avg(gsT95), 0, 0, false, chromShade),
+				createRawValueChart(bw, chrom+" ED⁴", x, ed,
+					avg(edT99), avg(edT95), 0, 0, false, chromShade),
+				createRawValueChart(bw, chrom+" LOD", x, lod,
+					avg(lodT99), avg(lodT95), 0, 0, false, chromShade),
+				createRawValueChart(bw, chrom+" BB log-BF", x, bbl,
+					avg(bblT99), avg(bblT95), 0, 0, false, chromShade),
 			)
 		}
 
 		if hasHighBulk && !hasBothBulks {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" HighSI", x, hi,
-					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromBRM),
+				createRawValueChart(bw, chrom+" HighSI", x, hi,
+					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromShade),
 			)
 		}
 		if hasLowBulk && !hasBothBulks {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" LowSI", x, li,
-					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromBRM),
+				createRawValueChart(bw, chrom+" LowSI", x, li,
+					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromShade),
 			)
 		}
 		if hasOneBulk {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" AF Deviation", x, afDev,
-					avg(afDevT99), avg(afDevT95), avg(afDevTM99), avg(afDevTM95), true, chromBRM),
-				createRawValueChart(chrom+" One-bulk G-statistic", x, obG,
-					avg(obGT99), avg(obGT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" One-bulk LOD", x, obLod,
-					avg(obLodT99), avg(obLodT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" One-bulk BB log-BF", x, obBB,
-					avg(obBBT99), avg(obBBT95), 0, 0, false, chromBRM),
+				createRawValueChart(bw, chrom+" AF Deviation", x, afDev,
+					avg(afDevT99), avg(afDevT95), avg(afDevTM99), avg(afDevTM95), true, chromShade),
+				createRawValueChart(bw, chrom+" One-bulk G-statistic", x, obG,
+					avg(obGT99), avg(obGT95), 0, 0, false, chromShade),
+				createRawValueChart(bw, chrom+" One-bulk LOD", x, obLod,
+					avg(obLodT99), avg(obLodT95), 0, 0, false, chromShade),
+				createRawValueChart(bw, chrom+" One-bulk BB log-BF", x, obBB,
+					avg(obBBT99), avg(obBBT95), 0, 0, false, chromShade),
 			)
 		}
 
@@ -296,11 +307,11 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 
 		robustZPage.AddCharts(
 			createZOverlayChart(
-				chrom, bsaType, x,
+				bw, chrom, bsaType, x,
 				hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ,
 				afDevZ, obGZ, obLodZ, obBBZ,
 				hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk,
-				chromBRM,
+				chromShade,
 			),
 		)
 
@@ -308,10 +319,10 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		// Use the empirical CompositeZ thresholds from the first variant on this
 		// chromosome (they are global — identical for every variant — so any entry
 		// gives the same value).
-		czThresh := entries[0].t.Z
+		czThresh := thresholds[idxs[0]].Z
 
 		compositePage.AddCharts(
-			createCompositeChart(chrom, x, compositeZ, maxAbsZ, chromBRM, czThresh),
+			createCompositeChart(bw, chrom, x, compositeZ, maxAbsZ, chromShade, czThresh),
 		)
 	}
 
@@ -363,6 +374,9 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 			Top:      "1%",
 		}),
 		charts.WithXAxisOpts(opts.XAxis{
+			Type:         "value",
+			Min:          "dataMin",
+			Max:          "dataMax",
 			Name:         "Genomic Position",
 			NameLocation: "middle",
 			NameGap:      35,
@@ -419,15 +433,16 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 //
 //	hasNegativeThresh is false.
 func createRawValueChart(
+	bw float64,
 	title string,
 	x []int64,
 	y []float64,
 	t99, t95, tm99, tm95 float64,
 	hasNegativeThresh bool,
-	brmBlocks []stats.BRMBlock,
+	shade shading,
 ) *charts.Line {
 
-	subtitle := fmt.Sprintf("p99 threshold: %.4f  |  p95 threshold: %.4f  |  shaded: BRM blocks", t99, t95)
+	subtitle := fmt.Sprintf("p99 threshold: %.4f  |  p95 threshold: %.4f  |  amber: BRM blocks · red: QTL support interval", t99, t95)
 
 	line := charts.NewLine()
 	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "Value", chartWidth, chartHeight, hasNegativeThresh)...)
@@ -436,46 +451,34 @@ func createRawValueChart(
 		Show:        opts.Bool(true),
 		Trigger:     "axis",
 		AxisPointer: &opts.AxisPointer{Type: "cross"},
-		Formatter: opts.FuncOpts(`function(params) {
+		// Threshold values are embedded: the threshold lines are two-point
+		// series, so they are not sampled at the hovered position.
+		Formatter: opts.FuncOpts(fmt.Sprintf(`function(params) {
 			let pos = params[0].axisValue;
 			let posFmt = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
 			let result = '<strong>Position: ' + posFmt + '</strong><br/>';
-			let t99val = null, t95val = null;
-			params.forEach(function(p) {
-				if (p.seriesName === 'p99') t99val = parseFloat(p.value);
-				if (p.seriesName === 'p95') t95val = parseFloat(p.value);
-			});
+			let t99val = %g, t95val = %g;
 			params.forEach(function(item) {
-				let val = parseFloat(item.value);
+				let val = parseFloat(item.value[1]);
 				if (isNaN(val)) return;
 				let sig = '';
 				if (item.seriesName === 'Statistic') {
-					if (t99val !== null && val > t99val)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99</span>';
-					else if (t95val !== null && val > t95val) sig = ' <span style="color:#f39c12">● p95</span>';
+					if (val > t99val)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ p99</span>';
+					else if (val > t95val) sig = ' <span style="color:#f39c12">● p95</span>';
 				}
 				result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(5) + sig + '<br/>';
 			});
 			return result;
-		}`),
+		}`, t99, t95)),
 	}))
 
-	n := len(y)
-	yData := make([]opts.LineData, n)
-	y99 := make([]opts.LineData, n)
-	y95 := make([]opts.LineData, n)
+	yData := downsampleXY(x, y, bw)
+	y99 := constLine(x, t99)
+	y95 := constLine(x, t95)
 	var ym99, ym95 []opts.LineData
 	if hasNegativeThresh {
-		ym99 = make([]opts.LineData, n)
-		ym95 = make([]opts.LineData, n)
-	}
-	for i, v := range y {
-		yData[i] = opts.LineData{Value: v}
-		y99[i] = opts.LineData{Value: t99}
-		y95[i] = opts.LineData{Value: t95}
-		if hasNegativeThresh {
-			ym99[i] = opts.LineData{Value: tm99}
-			ym95[i] = opts.LineData{Value: tm95}
-		}
+		ym99 = constLine(x, tm99)
+		ym95 = constLine(x, tm95)
 	}
 
 	statSeriesOpts := []charts.SeriesOpts{
@@ -483,10 +486,9 @@ func createRawValueChart(
 		charts.WithLineStyleOpts(opts.LineStyle{Width: 2.5, Color: "#1f77b4"}),
 		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 	}
-	statSeriesOpts = append(statSeriesOpts, brmMarkAreaOpts(brmBlocks, x)...)
+	statSeriesOpts = append(statSeriesOpts, shadingOpts(shade, x)...)
 
-	line.SetXAxis(positionLabels(x)).
-		AddSeries("Statistic", yData, statSeriesOpts...).
+	line.AddSeries("Statistic", yData, statSeriesOpts...).
 		AddSeries("p99", y99,
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
@@ -548,17 +550,18 @@ func statColor(name string) string {
 // This replaces the legacy createRobustZOverlayChart; it is bsaType-aware so
 // it only draws the series relevant to the current analysis mode.
 func createZOverlayChart(
+	bw float64,
 	chrom, bsaType string,
 	x []int64,
 	hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ []float64,
 	afDevZ, obGZ, obLodZ, obBBZ []float64,
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
-	brmBlocks []stats.BRMBlock,
+	shade shading,
 ) *charts.Line {
 
 	title := chrom + " — Robust Z-score Overlay"
-	subtitle := "Genome-wide robust Z-score (background median+MAD). " +
-		"z = ±2 suggestive · z = ±3 significant. Shaded bands: BRM blocks."
+	subtitle := "Robust Z (median+MAD). z = ±2 suggestive · z = ±3 significant. " +
+		"Amber: BRM blocks · red: QTL support interval."
 
 	line := charts.NewLine()
 	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "Robust Z-score", chartWidth, chartHeight, true)...)
@@ -588,7 +591,7 @@ func createZOverlayChart(
 				let refSeries = ['z=0','z=+2 (sugg.)','z=+3 (sig.)','z=-2 (sugg.)','z=-3 (sig.)'];
 				params.forEach(function(item) {
 					if (refSeries.indexOf(item.seriesName) !== -1) return;
-					let val = parseFloat(item.value);
+					let val = parseFloat(item.value[1]);
 					if (isNaN(val)) return;
 					let sig = '';
 					if (Math.abs(val) >= 3.0)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ significant</span>';
@@ -600,24 +603,16 @@ func createZOverlayChart(
 		}),
 	)
 
-	n := len(x)
-	mkRef := func(val float64) []opts.LineData {
-		d := make([]opts.LineData, n)
-		for i := range d {
-			d[i] = opts.LineData{Value: val}
-		}
-		return d
-	}
+	mkRef := func(val float64) []opts.LineData { return constLine(x, val) }
 
 	// Reference lines — z=0 carries the BRM mark-area.
 	zeroOpts := []charts.SeriesOpts{
 		charts.WithLineStyleOpts(opts.LineStyle{Type: "solid", Width: 1, Color: "#bdc3c7"}),
 		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 	}
-	zeroOpts = append(zeroOpts, brmMarkAreaOpts(brmBlocks, x)...)
+	zeroOpts = append(zeroOpts, shadingOpts(shade, x)...)
 
-	line.SetXAxis(positionLabels(x)).
-		AddSeries("z=0", mkRef(0), zeroOpts...).
+	line.AddSeries("z=0", mkRef(0), zeroOpts...).
 		AddSeries("z=+2 (sugg.)", mkRef(zSugg),
 			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
@@ -671,7 +666,7 @@ func createZOverlayChart(
 
 	for _, s := range series {
 		col := statColor(s.name)
-		line.AddSeries(s.name, floatSliceToLineData(s.data),
+		line.AddSeries(s.name, downsampleXY(x, s.data, bw),
 			charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
 			charts.WithLineStyleOpts(opts.LineStyle{Width: s.w, Color: col}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Color: col, Opacity: opts.Float(0)}),
@@ -689,10 +684,11 @@ func createZOverlayChart(
 // rather than the legacy hard-coded ±3 / ±2 constants.
 // BRM block shading is included.
 func createCompositeChart(
+	bw float64,
 	chrom string,
 	x []int64,
 	compositeZ, maxAbsZ []float64,
-	brmBlocks []stats.BRMBlock,
+	shade shading,
 	czThresh stats.ZThresholds,
 ) *charts.Line {
 
@@ -701,9 +697,8 @@ func createCompositeChart(
 
 	title := chrom + " — Composite Signal"
 	subtitle := fmt.Sprintf(
-		"Stouffer CompositeZ (ΔSI + G-stat + LOD, k=%d) and max |Z| envelope. "+
-			"Dashed lines: empirical MC upper-tail p99 (%.3f) and p95 (%.3f). "+
-			"Shaded bands: BRM blocks.",
+		"CompositeZ (ΔSI + G + LOD, k=%d) and max |Z|. Genome-wide p99 %.2f · p95 %.2f. "+
+			"Amber: BRM blocks · red: QTL support interval.",
 		czThresh.NumStats, czP99, czP95,
 	)
 
@@ -719,7 +714,7 @@ func createCompositeChart(
 		let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
 		let result = '<strong>' + posStr + '</strong><br/>';
 		params.forEach(function(item) {
-			let val = parseFloat(item.value);
+			let val = parseFloat(item.value[1]);
 			if (isNaN(val)) return;
 			let sig = '';
 			if (item.seriesName === 'CompositeZ' || item.seriesName === 'MaxAbsZ') {
@@ -740,28 +735,20 @@ func createCompositeChart(
 		}),
 	)
 
-	n := len(x)
-	mkRef := func(val float64) []opts.LineData {
-		d := make([]opts.LineData, n)
-		for i := range d {
-			d[i] = opts.LineData{Value: val}
-		}
-		return d
-	}
+	mkRef := func(val float64) []opts.LineData { return constLine(x, val) }
 
 	compositeOpts := []charts.SeriesOpts{
 		charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
 		charts.WithLineStyleOpts(opts.LineStyle{Width: 2.5, Color: "#2ca02c"}),
 		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
 	}
-	compositeOpts = append(compositeOpts, brmMarkAreaOpts(brmBlocks, x)...)
+	compositeOpts = append(compositeOpts, shadingOpts(shade, x)...)
 
 	p99Label := fmt.Sprintf("p99 (%.3f)", czP99)
 	p95Label := fmt.Sprintf("p95 (%.3f)", czP95)
 
-	line.SetXAxis(positionLabels(x)).
-		AddSeries("CompositeZ", floatSliceToLineData(compositeZ), compositeOpts...).
-		AddSeries("MaxAbsZ", floatSliceToLineData(maxAbsZ),
+	line.AddSeries("CompositeZ", downsampleXY(x, compositeZ, bw), compositeOpts...).
+		AddSeries("MaxAbsZ", downsampleXY(x, maxAbsZ, bw),
 			charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
 			charts.WithLineStyleOpts(opts.LineStyle{Width: 1.8, Color: "#9467bd", Type: "dotted"}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
@@ -780,32 +767,54 @@ func createCompositeChart(
 
 // ── BRM mark-area helpers ─────────────────────────────────────────────────────
 
-// brmMarkAreaOpts returns go-echarts SeriesOpts that shade the genomic
-// intervals covered by the supplied BRM blocks in the same amber colour used
-// by the legacy code.  It is safe to call with nil or empty blocks.
-func brmMarkAreaOpts(blocks []stats.BRMBlock, x []int64) []charts.SeriesOpts {
-	if len(blocks) == 0 || len(x) == 0 {
+// shading holds the intervals shaded on a chromosome's charts.
+type shading struct {
+	brm []stats.BRMBlock        // amber: regions significant by BRM
+	qtl []stats.SupportInterval // red: LOD-drop support interval (where the QTL is)
+}
+
+// shadingOpts returns go-echarts SeriesOpts that shade BRM blocks (amber)
+// and QTL support intervals (red, drawn on top). Safe with empty shading.
+func shadingOpts(sh shading, x []int64) []charts.SeriesOpts {
+	if len(x) == 0 {
 		return nil
 	}
 
-	xLabels := positionLabels(x)
-	areas := make([][]opts.MarkAreaData, 0, len(blocks))
-	for _, b := range blocks {
-		startIdx := sort.Search(len(x), func(i int) bool { return x[i] >= b.Start })
-		stopIdx := sort.Search(len(x), func(i int) bool { return x[i] > b.Stop }) - 1
+	clip := func(start, stop int64) (int64, int64, bool) {
+		startIdx := sort.Search(len(x), func(i int) bool { return x[i] >= start })
+		stopIdx := sort.Search(len(x), func(i int) bool { return x[i] > stop }) - 1
 		if startIdx >= len(x) || stopIdx < 0 {
-			continue
+			return 0, 0, false
 		}
 		if stopIdx < startIdx {
 			stopIdx = startIdx
 		}
-		areas = append(areas, []opts.MarkAreaData{
-			{
-				Name:  fmt.Sprintf("BRM block %.4f", b.Peak),
-				XAxis: xLabels[startIdx],
-			},
-			{XAxis: xLabels[stopIdx]},
-		})
+		return x[startIdx], x[stopIdx], true
+	}
+
+	var areas [][]opts.MarkAreaData
+	for _, b := range sh.brm {
+		if s, e, ok := clip(b.Start, b.Stop); ok {
+			areas = append(areas, []opts.MarkAreaData{
+				{Name: fmt.Sprintf("BRM block %.4f", b.Peak), XAxis: s},
+				{XAxis: e},
+			})
+		}
+	}
+	for _, q := range sh.qtl {
+		if s, e, ok := clip(q.Start, q.End); ok {
+			areas = append(areas, []opts.MarkAreaData{
+				{
+					Name:  fmt.Sprintf("QTL %.2f–%.2f Mb", float64(q.Start)/1e6, float64(q.End)/1e6),
+					XAxis: s,
+					MarkAreaStyle: opts.MarkAreaStyle{
+						ItemStyle: &opts.ItemStyle{Color: "rgba(192, 57, 43, 0.30)"},
+						Label:     &opts.Label{Show: opts.Bool(true), Position: "insideTop", Color: "#922b21"},
+					},
+				},
+				{XAxis: e},
+			})
+		}
 	}
 	if len(areas) == 0 {
 		return nil
@@ -822,24 +831,42 @@ func brmMarkAreaOpts(blocks []stats.BRMBlock, x []int64) []charts.SeriesOpts {
 
 // ── utility helpers ───────────────────────────────────────────────────────────
 
-// floatSliceToLineData converts a []float64 into the go-echarts []LineData
-// format required by AddSeries.
-func floatSliceToLineData(vals []float64) []opts.LineData {
-	ld := make([]opts.LineData, len(vals))
-	for i, v := range vals {
-		ld[i] = opts.LineData{Value: v}
+// downsampleXY converts a series to [position, value] points for a numeric
+// x-axis, keeping only the minimum and maximum point of every bin of width
+// bw (in their original order). Every local peak and dip wider than a bin is
+// preserved exactly, while the point count drops to at most two per bin.
+func downsampleXY(x []int64, y []float64, bw float64) []opts.LineData {
+	out := make([]opts.LineData, 0, 2*int(float64(x[len(x)-1]-x[0])/bw+2))
+	emit := func(i int) { out = append(out, opts.LineData{Value: [2]float64{float64(x[i]), y[i]}}) }
+	for start := 0; start < len(x); {
+		bin := int64(float64(x[start]) / bw)
+		end, lo, hi := start, start, start
+		for end < len(x) && int64(float64(x[end])/bw) == bin {
+			if y[end] < y[lo] {
+				lo = end
+			}
+			if y[end] > y[hi] {
+				hi = end
+			}
+			end++
+		}
+		first, second := min(lo, hi), max(lo, hi)
+		emit(first)
+		if second != first {
+			emit(second)
+		}
+		start = end
 	}
-	return ld
+	return out
 }
 
-// positionLabels converts a slice of int64 genomic positions to the string
-// X-axis labels expected by go-echarts.
-func positionLabels(x []int64) []string {
-	labels := make([]string, len(x))
-	for i, v := range x {
-		labels[i] = fmt.Sprintf("%d", v)
+// constLine is a horizontal line across the chromosome: two points instead of
+// one per marker.
+func constLine(x []int64, v float64) []opts.LineData {
+	return []opts.LineData{
+		{Value: [2]float64{float64(x[0]), v}},
+		{Value: [2]float64{float64(x[len(x)-1]), v}},
 	}
-	return labels
 }
 
 // writeHTMLPage renders a go-echarts Page to a file.
