@@ -126,15 +126,37 @@ func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) f
 		suffix := p[2:]
 		isHigh := strings.HasSuffix(suffix, "H")
 		suffix = strings.TrimSuffix(strings.TrimSuffix(suffix, "H"), "L")
+		isF2 := strings.HasSuffix(suffix, "F2")
 		suffix = strings.TrimSuffix(suffix, "F2")
 		n, err := strconv.Atoi(suffix)
 		if err == nil && n >= 1 {
-			het := int(distuv.Binomial{N: float64(bulkSize), P: math.Pow(0.5, float64(n)), Src: rng}.Rand())
-			copies := het
-			if isHigh {
-				copies = 2*bulkSize - het
+			// BCn: recurrent homozygote 1-q, heterozygote q, with q = 0.5^n.
+			// BCnF2 (one selfing of BCn): heterozygotes segregate 1:2:1, so
+			// recurrent hom = 1-q+q/4, het = q/2, donor hom = q/4.
+			q := math.Pow(0.5, float64(n))
+			pHet, pDonor := q, 0.0
+			if isF2 {
+				pHet, pDonor = q/2, q/4
 			}
-			return float64(copies) / float64(2*bulkSize)
+			recurrent := 0 // recurrent-parent allele copies in the pool
+			for range bulkSize {
+				u := rng.Float64()
+				switch {
+				case u < pDonor:
+					// donor homozygote: 0 recurrent copies
+				case u < pDonor+pHet:
+					recurrent++
+				default:
+					recurrent += 2
+				}
+			}
+			f := float64(recurrent) / float64(2*bulkSize)
+			// SI is the frequency of the high-parent allele: the recurrent
+			// allele for BC*H, the donor allele for BC*L.
+			if !isHigh {
+				f = 1 - f
+			}
+			return f
 		}
 	}
 	// Unknown structures are rejected by ExpectedAF before this point. Keep a
@@ -158,21 +180,15 @@ func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) f
 // accounts for the finite population of individuals in each bulk, rather than
 // assuming reads are drawn directly from the expected population frequency p0.
 func simulateTwoBulk(p simParams) TwoBulkThresholds {
-	if p.highDepth <= 0 || p.lowDepth <= 0 || p.rep <= 0 {
+	// Bulk sizes are validated by CalculateThresholds (cfg.BulkSizes).
+	if p.highDepth <= 0 || p.lowDepth <= 0 || p.rep <= 0 || p.highBulkSize <= 0 || p.lowBulkSize <= 0 {
 		return TwoBulkThresholds{}
 	}
 
 	rng := rand.New(rand.NewSource(nextSeed()))
 
-	// Use bulk sizes if provided, otherwise fall back to depth (for backwards compatibility)
 	highBulkSize := p.highBulkSize
 	lowBulkSize := p.lowBulkSize
-	if highBulkSize <= 0 {
-		highBulkSize = p.highDepth // fallback: assume each read is from a different individual
-	}
-	if lowBulkSize <= 0 {
-		lowBulkSize = p.lowDepth
-	}
 
 	hSIArr := make([]float64, p.rep)
 	lSIArr := make([]float64, p.rep)
@@ -275,17 +291,14 @@ func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
 // accounts for the finite population of individuals in the bulk, rather than
 // assuming reads are drawn directly from the expected population frequency p0.
 func simulateOneBulk(p simParams) OneBulkThresholds {
-	if p.highDepth <= 0 || p.p0One <= 0 || p.p0One >= 1 || p.rep <= 0 {
+	// Bulk size is validated by CalculateThresholds (cfg.BulkSizes).
+	if p.highDepth <= 0 || p.p0One <= 0 || p.p0One >= 1 || p.rep <= 0 || p.oneBulkSize <= 0 {
 		return OneBulkThresholds{}
 	}
 
 	rng := rand.New(rand.NewSource(nextSeed()))
 
-	// Use bulk size if provided, otherwise fall back to depth (for backwards compatibility)
 	bulkSize := p.oneBulkSize
-	if bulkSize <= 0 {
-		bulkSize = p.highDepth // fallback: assume each read is from a different individual
-	}
 
 	afDevArr := make([]float64, p.rep)
 	gsArr := make([]float64, p.rep)
@@ -528,9 +541,6 @@ func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
 // consolidate() and are therefore not simulated here.
 func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
 	bulkSize := p.oneBulkSize
-	if bulkSize <= 0 {
-		bulkSize = p.highBulkSize
-	}
 	if p.repDepth <= 0 || bulkSize <= 0 || p.rep <= 0 {
 		return nil
 	}
@@ -612,18 +622,9 @@ func calculateEmpiricalCompositeZThresholds(
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 	numStats := countZStats(bsaType)
 
-	// Bulk sizes — fall back to 100 if not configured.
-	highBulkSize := cfg.HighBulkSize
-	lowBulkSize := cfg.LowBulkSize
-	oneBulkSize := cfg.OneBulkSize
-	if highBulkSize <= 0 {
-		highBulkSize = 100
-	}
-	if lowBulkSize <= 0 {
-		lowBulkSize = 100
-	}
-	if oneBulkSize <= 0 {
-		oneBulkSize = highBulkSize
+	highBulkSize, lowBulkSize, oneBulkSize, err := cfg.BulkSizes(bsaType)
+	if err != nil {
+		return ZThresholds{}, err
 	}
 
 	// Representative sequencing depth: use the median across all smoothed variants.
@@ -843,6 +844,11 @@ func CalculateThresholds(
 
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
+	highBulkSize, lowBulkSize, oneBulkSize, err := cfg.BulkSizes(bsaType)
+	if err != nil {
+		return nil, err
+	}
+
 	color.Cyan(
 		"\n============================ Calculating Thresholds (%s, p₀=%.4f, %d simulations) ============================\n",
 		bsaType, p0, cfg.Rep,
@@ -855,9 +861,9 @@ func CalculateThresholds(
 		p0Low:        p0,
 		p0One:        p0,
 		rep:          cfg.Rep,
-		highBulkSize: cfg.HighBulkSize,
-		lowBulkSize:  cfg.LowBulkSize,
-		oneBulkSize:  cfg.OneBulkSize,
+		highBulkSize: highBulkSize,
+		lowBulkSize:  lowBulkSize,
+		oneBulkSize:  oneBulkSize,
 		population:   cfg.Population,
 	}
 

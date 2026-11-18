@@ -91,8 +91,8 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 		return fmt.Errorf("RunGeneSpace: create output dir: %w", err)
 	}
 
-	if cfg.Rdr != nil {
-		if _, hasEFF := cfg.Rdr.Header.Infos["EFF"]; hasEFF {
+	if cfg.VCFInfoIDs != nil {
+		if cfg.VCFInfoIDs["EFF"] {
 			color.Yellow("EFF column already present in VCF; skipping SnpEff annotation step.")
 			color.Yellow("Gene space analysis requires a freshly annotated TSV — skipping.")
 			return nil

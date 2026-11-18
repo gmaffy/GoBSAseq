@@ -1,6 +1,9 @@
 package utils
 
-import "github.com/brentp/vcfgo"
+import (
+	"fmt"
+	"strings"
+)
 
 type HardFilterConfig struct {
 	LightFilter              bool
@@ -20,7 +23,9 @@ type HardFilterConfig struct {
 
 type AnalysisConfig struct {
 	VCF string
-	Rdr *vcfgo.Reader
+	// Rdr *vcfgo.Reader // LEGACY: the vcfgo reader used by the old filter.
+	// VCFInfoIDs lists the INFO keys declared in the input VCF header.
+	VCFInfoIDs map[string]bool
 
 	HighParFwdReads  string
 	HighParRevReads  string
@@ -53,6 +58,16 @@ type AnalysisConfig struct {
 	// SplitMultiallelic decomposes multi-allelic records into biallelic ones
 	// before filtering (bcftools norm -m- equivalent). Enabled by default.
 	SplitMultiallelic bool
+	// MinPooledMAF is the segregation floor for two-bulk modes without two
+	// informative parents (2b, hp2b, lp2b): the pooled minor allele frequency of
+	// both bulks must be at least this. < 0 = automatic (0.4 × the population's
+	// expected minor allele frequency, 0.2 for F2); 0 = disabled.
+	MinPooledMAF float64
+	// RequireNonParentAllele (one-parent one-bulk modes) drops sites where the
+	// bulk shows fewer than 2 reads of the allele the parent does not carry.
+	// Off by default: such sites may be non-segregating, but they may also be
+	// QTL markers where the bulk is fixed for the parent's allele.
+	RequireNonParentAllele bool
 	// Region calling controls. A zero value selects biologically conservative
 	// defaults derived from the Gaussian smoothing bandwidth.
 	MinQTLWidth   int64
@@ -89,7 +104,8 @@ type AnalysisConfig struct {
 	OneBulkIdx   int
 	OneBulkName  string
 	OneBulkDepth int
-	OneBulkSize  int
+	// OneBulkSize is not set from the CLI; use BulkSizes(bsaType) instead.
+	OneBulkSize int
 
 	SnpEffDB string
 	Ref      string
@@ -118,4 +134,28 @@ func (cfg AnalysisConfig) EffectiveMergeDistance() int64 {
 		return int64(cfg.WindowSize / 2)
 	}
 	return 0
+}
+
+// BulkSizes returns the number of individuals in each bulk used by bsaType.
+// high/low are the two-bulk sizes; one is the size of the single bulk in
+// one-bulk modes (LowBulkSize for *lb modes, HighBulkSize otherwise). Bulk
+// size sets the pool-sampling variance of every null model, so a missing size
+// is an error rather than a silent default.
+func (cfg AnalysisConfig) BulkSizes(bsaType string) (high, low, one int, err error) {
+	hasHigh := strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
+	hasLow := strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
+	if hasHigh && cfg.HighBulkSize <= 0 {
+		return 0, 0, 0, fmt.Errorf("high bulk size must be > 0 for %s (set -S/--bulk-sizes), got %d", bsaType, cfg.HighBulkSize)
+	}
+	if hasLow && cfg.LowBulkSize <= 0 {
+		return 0, 0, 0, fmt.Errorf("low bulk size must be > 0 for %s (set -S/--bulk-sizes), got %d", bsaType, cfg.LowBulkSize)
+	}
+	high, low = cfg.HighBulkSize, cfg.LowBulkSize
+	switch {
+	case hasHigh && !hasLow:
+		one = high
+	case hasLow && !hasHigh:
+		one = low
+	}
+	return high, low, one, nil
 }

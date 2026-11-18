@@ -291,6 +291,10 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 	}
 
 	_, _, hasBoth, hasOne := BulkFlags(bsaType)
+	highBulkSize, lowBulkSize, oneBulkSize, err := cfg.BulkSizes(bsaType)
+	if err != nil {
+		return nil, err
+	}
 	popScale := PopulationVarianceScale(cfg.Population)
 	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
 
@@ -305,27 +309,14 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
 		var blocks []BRMBlock
 		if hasBoth {
-			blocks = calculateBRMBlocksTwoBulk(chrom, stats, cfg.HighBulkSize, cfg.LowBulkSize, popScale, uAlpha)
+			blocks = calculateBRMBlocksTwoBulk(chrom, stats, highBulkSize, lowBulkSize, popScale, uAlpha)
 		} else if hasOne {
 			// expectedSI: use expectedHighAlleleP0 if available, else 0.5
 			expectedSI, _ := ExpectedAF(cfg.Population)
 			if expectedSI == 0 {
 				expectedSI = 0.5
 			}
-			// Determine bulk size: try OneBulkSize first, then HighBulkSize/LowBulkSize, then default
-			bulkSize := cfg.OneBulkSize
-			if bulkSize <= 0 {
-				if cfg.HighBulkSize > 0 {
-					bulkSize = cfg.HighBulkSize
-				} else if cfg.LowBulkSize > 0 {
-					bulkSize = cfg.LowBulkSize
-				} else {
-					// Default to a reasonable bulk size if none specified
-					// This handles cases where only depth is available
-					bulkSize = 100
-				}
-			}
-			blocks = calculateBRMBlocksOneBulk(chrom, stats, bulkSize, popScale, expectedSI, uAlpha)
+			blocks = calculateBRMBlocksOneBulk(chrom, stats, oneBulkSize, popScale, expectedSI, uAlpha)
 		}
 		if len(blocks) > 0 {
 			allBlocks = append(allBlocks, mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance())...)

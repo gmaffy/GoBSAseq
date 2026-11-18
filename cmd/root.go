@@ -210,6 +210,8 @@ var rootCmd = &cobra.Command{
 		parentsMaxDepth, _ := cmd.Flags().GetString("parents-max-depth")
 		minGQ, _ := cmd.Flags().GetInt("min-GQ")
 		noSplitMultiallelic, _ := cmd.Flags().GetBool("no-split-multiallelic")
+		minPooledMAF, _ := cmd.Flags().GetFloat64("min-pooled-maf")
+		requireNonParent, _ := cmd.Flags().GetBool("require-nonparent-allele")
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
@@ -412,17 +414,19 @@ var rootCmd = &cobra.Command{
 			HighBulkBam: hbBam,
 			LowBulkBam:  lbBam,
 
-			Population:        population,
-			WindowSize:        winSize,
-			StepSize:          step,
-			Rep:               rep,
-			BrmAlpha:          brmAlpha,
-			MinQTLWidth:       minQTLWidth,
-			MergeDistance:     mergeDistance,
-			MinQTLMarkers:     minQTLMarkers,
-			MinGQ:             minGQ,
-			SplitMultiallelic: !noSplitMultiallelic,
-			OutputDir:         resultsDir,
+			Population:             population,
+			WindowSize:             winSize,
+			StepSize:               step,
+			Rep:                    rep,
+			BrmAlpha:               brmAlpha,
+			MinQTLWidth:            minQTLWidth,
+			MergeDistance:          mergeDistance,
+			MinQTLMarkers:          minQTLMarkers,
+			MinGQ:                  minGQ,
+			SplitMultiallelic:      !noSplitMultiallelic,
+			MinPooledMAF:           minPooledMAF,
+			RequireNonParentAllele: requireNonParent,
+			OutputDir:              resultsDir,
 
 			HighParentName:     highParentName,
 			HighParentDepth:    highParentDepth,
@@ -497,6 +501,8 @@ func init() {
 	rootCmd.Flags().String("parents-max-depth", "", "Parents max-depth cap hp,lp to drop coverage outliers (empty = disabled)")
 	rootCmd.Flags().Int("min-GQ", 0, "Minimum genotype quality (GQ) for PARENT samples; 0 = disabled, applied only when GQ present (not applied to bulks, to avoid AF-correlated bias)")
 	rootCmd.Flags().Bool("no-split-multiallelic", false, "Do not decompose multi-allelic records into biallelic records before filtering")
+	rootCmd.Flags().Bool("require-nonparent-allele", false, "One parent + one bulk modes: drop sites where the bulk has <2 reads of the allele the parent does not carry (removes non-segregating sites, but also QTL markers where the bulk is fixed for the parent's allele)")
+	rootCmd.Flags().Float64("min-pooled-maf", -1, "Segregation floor for 2b/hp2b/lp2b: minimum pooled minor allele frequency of the two bulks (-1 = auto: 0.4 x expected minor AF, 0.2 for F2; 0 = off)")
 
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")

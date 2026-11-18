@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	bam2 "github.com/biogo/hts/bam"
-	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
 	"github.com/gmaffy/GoBSAseq/plots"
@@ -528,20 +527,31 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		return fmt.Errorf("VCF file must be a .vcf or .vcf.gz file")
 	}
 
-	f, cleanup, err := openVCF(cfg.VCF)
-	if err != nil {
-		return fmt.Errorf("failed to open VCF %q: %w", cfg.VCF, err)
-	}
-	defer cleanup()
+	// LEGACY: the old filter consumed a vcfgo reader opened here.
+	// f, cleanup, err := openVCF(cfg.VCF)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to open VCF %q: %w", cfg.VCF, err)
+	// }
+	// defer cleanup()
+	//
+	// rdr, err := vcfgo.NewReader(f, false)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to create VCF reader: %w", err)
+	// }
+	// cfg.Rdr = rdr
 
-	rdr, err := vcfgo.NewReader(f, false)
+	// The filter streams the VCF itself; only the header is needed here.
+	hdr, err := filter.ReadVCFHeader(cfg.VCF)
 	if err != nil {
-		return fmt.Errorf("failed to create VCF reader: %w", err)
+		return fmt.Errorf("failed to read VCF header %q: %w", cfg.VCF, err)
 	}
-	cfg.Rdr = rdr
+	cfg.VCFInfoIDs = make(map[string]bool, len(hdr.Infos))
+	for id := range hdr.Infos {
+		cfg.VCFInfoIDs[id] = true
+	}
 
 	// ================================================ Sample Map ================================================== //
-	sampleNames := rdr.Header.SampleNames
+	sampleNames := hdr.Samples
 	sampleMap := map[int]string{0: "None"}
 	for i, name := range sampleNames {
 		sampleMap[i+1] = name

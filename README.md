@@ -104,6 +104,24 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `--min-QUAL-INDEL` | `30.0` | Min variant quality |
 | `--max-FS-INDEL` | `200.0` | Max FisherStrand bias |
 | `--max-SOR-INDEL` | `10.0` | Max strand odds ratio |
+
+GATK semantics apply: a record fails only when an annotation is **present** and beyond its threshold (absent annotations pass, as in `VariantFiltration`). Records whose FILTER is not `PASS`/`.` are rejected. `--light-filtering` keeps FS/SOR but drops the two rank-sum tests, which are unreliable near allele fixation in pooled samples.
+
+**BSA-seq filters** (applied per biallelic REF/ALT view, after multi-allelic splitting):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bulks-max-depth` / `--parents-max-depth` | off | Max depth caps (`hb,lb` / `hp,lp`) against collapsed repeats; uses the larger of FORMAT/DP and allele depth |
+| `--min-GQ` | `0` | GQ floor for **parents only** (bulk GQ tracks allele frequency) |
+| `--no-split-multiallelic` | off | Keep multi-allelic records whole; the first passing ALT represents the record |
+| `--require-nonparent-allele` | off | One parent + one bulk modes: drop sites where the bulk has < 2 reads of the allele the parent does not carry |
+| `--min-pooled-maf` | `-1` (auto) | Segregation floor for `2b`/`hp2b`/`lp2b`: pooled minor allele frequency of both bulks must reach this. Auto = 0.4 × the population's expected minor AF (0.2 for F2, 0.1 for BC1). `0` disables |
+
+- **Bulk depth** (`-b`) is the REF + ALT allele depth from AD (the reads the SNP-index uses), not FORMAT/DP. Reads on other ALT alleles may be at most 5% of a sample's allele depth.
+- **Parents** must be homozygous: ≥ 85% of allele depth on one allele (other-ALT reads count against both). Two-parent modes also require the parents to differ. Without AD, only a homozygous REF or target-ALT genotype counts.
+- **One parent + one bulk** (`hphb`, `hplb`, `lphb`, `lplb`): a bulk fixed for the parent's allele cannot be told apart from a non-segregating site. Such sites are kept by default (they may be QTL markers); `--require-nonparent-allele` drops them.
+- **Rejection report**: at the end of filtering, the number of records removed by each rule is printed, so the cost of every filter is visible.
+- **Inputs**: `.vcf`, `.vcf.gz` (bgzip is decompressed on several threads; plain gzip on one thread) and FreeBayes-style RO/AO when AD is absent. For pooled bulks called with GATK HaplotypeCaller, set `--max-reads-per-alignment-start 0`; the default (50) caps AD in deep bulks. Site-level annotations (QD, FS, …) describe all samples in the VCF, so in a large cohort VCF they mostly reflect the other samples.
 | `--min-ReadPosRankSum-INDEL` | `-20.0` | Min read position rank sum |
 
 #### Gene Space Analysis (Optional)
@@ -170,7 +188,7 @@ stats/
   *.smoothed_and_normalised.tsv    # Gaussian smoothed + robust Z-scores
   *.brm_blocks.tsv                 # BRM-detected blocks
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
-  *.lowqual.vcf.gz                 # Variants failing hard filter
+  *.lowqual.vcf.gz                 # Records where no ALT passed (kept samples only)
 qtls/
   *.compositez.qtl.xlsx            # CompositeZ QTL intervals (empirical threshold)
   *.final.qtl.xlsx                 # Interval-level union of CompositeZ + BRM evidence
