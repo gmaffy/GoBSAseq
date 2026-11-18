@@ -2,6 +2,7 @@ package filter
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/biogo/hts/bgzf"
+	"github.com/biogo/hts/tabix"
 	"github.com/brentp/vcfgo"
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -516,84 +518,36 @@ func bsaSeqFilterAllele(v *vcfgo.Variant, cfg utils.AnalysisConfig, bsaType stri
 	}
 }
 
-// SampleCounts holds what downstream statistics need from one kept sample.
-// The *OK flags record whether the AD (or RO/AO) values parsed cleanly, so
-// callers can tell a real zero depth from an unusable field.
-type SampleCounts struct {
-	GT       []int
-	RefDepth int  // 0 when unparseable
-	RefOK    bool // REF depth parsed cleanly
-	AltDepth int  // depth of the target ALT; 0 when unusable
-	AltOK    bool // ALT depths parsed cleanly and the target ALT is present
+// countingWriter tracks bytes written so tabix chunk offsets can be recorded.
+type countingWriter struct {
+	io.Writer
+	n int64
 }
 
-// FilteredVariant is a passing record reduced to the fields the statistics
-// use. Keeping the full parsed vcfgo.Variant for every passing site (INFO,
-// FORMAT maps, all sample fields) dominated memory on large callsets.
-// TargetAlt is the one-based VCF allele number that satisfied the BSA-seq
-// filter; Samples are in kept-sample order.
+func (cw *countingWriter) Write(p []byte) (int, error) {
+	n, err := cw.Writer.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&cw.n, int64(n))
+	}
+	return n, err
+}
+
+// vcfRecord implements the tabix record interface for index building.
+type vcfRecord struct {
+	chrom string
+	start int // 0-based
+	end   int // 0-based half-open
+}
+
+func (r vcfRecord) RefName() string { return r.chrom }
+func (r vcfRecord) Start() int      { return r.start }
+func (r vcfRecord) End() int        { return r.end }
+
+// FilteredVariant associates a passing record with the ALT allele that satisfied
+// the BSA-seq filter. TargetAlt is one-based VCF allele numbering.
 type FilteredVariant struct {
-	Chrom     string
-	Pos       uint64
-	Ref       string
-	Alt       string // the target ALT allele
-	NumAlts   int    // number of ALT alleles in the record
+	Variant   *vcfgo.Variant
 	TargetAlt int
-	Samples   []SampleCounts
-}
-
-// NewFilteredVariant reduces v to a FilteredVariant for the given target ALT.
-func NewFilteredVariant(v *vcfgo.Variant, targetAlt int) FilteredVariant {
-	alts := v.Alt()
-	fv := FilteredVariant{
-		Chrom:     v.Chromosome,
-		Pos:       v.Pos,
-		Ref:       v.Reference,
-		NumAlts:   len(alts),
-		TargetAlt: targetAlt,
-		Samples:   make([]SampleCounts, len(v.Samples)),
-	}
-	altIdx := targetAlt - 1
-	if altIdx >= 0 && altIdx < len(alts) {
-		fv.Alt = alts[altIdx]
-	}
-	for i, s := range v.Samples {
-		if s == nil {
-			continue
-		}
-		sc := SampleCounts{GT: s.GT}
-		ref, errR := safeSampleRefDepth(s)
-		sc.RefOK = errR == nil
-		if sc.RefOK {
-			sc.RefDepth = ref
-		}
-		altDepths, errA := safeSampleAltDepths(s)
-		if errA == nil && altIdx >= 0 && altIdx < len(altDepths) {
-			sc.AltDepth = altDepths[altIdx]
-			sc.AltOK = true
-		}
-		fv.Samples[i] = sc
-	}
-	return fv
-}
-
-// remapSampleIndices rewrites the role indices in cfg (original VCF sample
-// positions) to positions within keep, for use on a sample-subset stream.
-// Roles not in keep (e.g. a parent set to None) become -1.
-func remapSampleIndices(cfg utils.AnalysisConfig, keep []int) utils.AnalysisConfig {
-	pos := func(orig int) int {
-		for i, k := range keep {
-			if k == orig && orig >= 0 {
-				return i
-			}
-		}
-		return -1
-	}
-	cfg.HighParentIdx = pos(cfg.HighParentIdx)
-	cfg.LowParentIdx = pos(cfg.LowParentIdx)
-	cfg.HighBulkIdx = pos(cfg.HighBulkIdx)
-	cfg.LowBulkIdx = pos(cfg.LowBulkIdx)
-	return cfg
 }
 
 func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsaseqType string, keepIndices []int) ([]FilteredVariant, int, int, error) {
@@ -636,30 +590,6 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 		delete(writerHeader.SampleFormats, id)
 	}
 
-	// Fast path: re-read the VCF file with only the kept sample columns, so
-	// vcfgo never parses the other samples (see openSubsetVCF). Sample role
-	// indices are remapped to positions in the subset stream. Without a file
-	// path (e.g. tests feeding cfg.Rdr directly) the original reader is used.
-	fcfg := cfg
-	sampleIdx := keepIndices
-	if cfg.VCF != "" {
-		sub, closeSub, err := openSubsetVCF(cfg.VCF, keepIndices)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		defer closeSub()
-		subRdr, err := vcfgo.NewReader(sub, false)
-		if err != nil {
-			return nil, 0, 0, fmt.Errorf("read subset VCF header: %w", err)
-		}
-		rdr = subRdr
-		fcfg = remapSampleIndices(cfg, keepIndices)
-		sampleIdx = make([]int, len(keepIndices))
-		for i := range sampleIdx {
-			sampleIdx[i] = i
-		}
-	}
-
 	// Output files.
 	hfFile, err := os.Create(hardFilteredVcfPath)
 	if err != nil {
@@ -667,7 +597,8 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 	}
 	defer hfFile.Close()
 
-	hfBgzf := bgzf.NewWriter(hfFile, 1)
+	hfCounting := &countingWriter{Writer: hfFile}
+	hfBgzf := bgzf.NewWriter(hfCounting, 1)
 	hfWriter, err := vcfgo.NewWriter(hfBgzf, &writerHeader)
 	if err != nil {
 		hfBgzf.Close()
@@ -688,6 +619,13 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 		badBgzf.Close()
 		return nil, 0, 0, fmt.Errorf("create rejected VCF writer: %w", err)
 	}
+
+	hfIdx := tabix.New()
+	hfIdx.Format = 2 // VCF
+	hfIdx.NameColumn = 1
+	hfIdx.BeginColumn = 2
+	hfIdx.EndColumn = 0
+	hfIdx.MetaChar = '#'
 
 	bar := progressbar.Default(-1, "Hard filtering variants")
 
@@ -771,7 +709,7 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 				targetAlt := 0
 				passed := PassesHardFilter(v, hfcfg)
 				if passed {
-					targetAlt = BsaSeqTargetAlt(v, fcfg, bsaseqType)
+					targetAlt = BsaSeqTargetAlt(v, cfg, bsaseqType)
 					passed = targetAlt != 0
 				}
 				resultCh <- variantResult{seq: queued.seq, v: v, targetAlt: targetAlt, passed: passed}
@@ -792,8 +730,8 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 
 	writeResult := func(res variantResult) error {
 		// Subset samples to kept indices and drop the PGT/PID format fields.
-		newSamples := make([]*vcfgo.SampleGenotype, len(sampleIdx))
-		for i, idx := range sampleIdx {
+		newSamples := make([]*vcfgo.SampleGenotype, len(keepIndices))
+		for i, idx := range keepIndices {
 			if idx < len(res.v.Samples) {
 				newSamples[i] = res.v.Samples[idx]
 			}
@@ -812,9 +750,18 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 			return nil
 		}
 
+		blockOffset, _ := hfBgzf.Next()
+		startOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffset)}
 		hfWriter.WriteVariant(res.v)
+		blockOffsetEnd, _ := hfBgzf.Next()
+		endOffset := bgzf.Offset{File: hfCounting.n, Block: uint16(blockOffsetEnd)}
 
-		passedVariants = append(passedVariants, NewFilteredVariant(res.v, res.targetAlt))
+		rec := vcfRecord{chrom: res.v.Chromosome, start: int(res.v.Pos) - 1, end: int(res.v.Pos) - 1 + len(res.v.Ref())}
+		if err := hfIdx.Add(rec, bgzf.Chunk{Begin: startOffset, End: endOffset}, true, true); err != nil {
+			return fmt.Errorf("tabix add variant at %s:%d: %w", res.v.Chromosome, res.v.Pos, err)
+		}
+
+		passedVariants = append(passedVariants, FilteredVariant{Variant: res.v, TargetAlt: res.targetAlt})
 		passed++
 		return nil
 	}
@@ -866,9 +813,20 @@ func HardFilterVcf(cfg utils.AnalysisConfig, hfcfg utils.HardFilterConfig, bsase
 		return nil, 0, 0, fmt.Errorf("close rejected bgzf: %w", err)
 	}
 
-	// Tabix index, built from the closed file so chunk offsets are exact.
-	if err := buildTabixIndex(hardFilteredVcfPath); err != nil {
-		return nil, 0, 0, fmt.Errorf("build tabix index: %w", err)
+	// Tabix index.
+	tbiFile, err := os.Create(hardFilteredVcfPath + ".tbi")
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("create tbi file: %w", err)
+	}
+	defer tbiFile.Close()
+
+	tbiGz := bgzf.NewWriter(tbiFile, 1)
+	if err := tabix.WriteTo(tbiGz, hfIdx); err != nil {
+		tbiGz.Close()
+		return nil, 0, 0, fmt.Errorf("write tabix index: %w", err)
+	}
+	if err := tbiGz.Close(); err != nil {
+		return nil, 0, 0, fmt.Errorf("close tbi bgzf: %w", err)
 	}
 
 	original := int(originalCount.Load())
