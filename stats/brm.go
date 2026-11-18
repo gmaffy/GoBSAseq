@@ -219,14 +219,10 @@ func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int
 		if !(threshold > 0) {
 			continue
 		}
-		// In one-bulk case SmoothedStats.SmAFDev holds AF deviation; but sm.SmHighSI or SmAFDev may be used.
-		// Use SmAFDev when available (one-bulk pipeline sets it), else compute deviation from expected using SmHighSI.
-		var deviation float64
-		if s.SmAFDev != 0 {
-			deviation = s.SmAFDev
-		} else {
-			deviation = s.SmHighSI - expectedSI
-		}
+		// SmAFDev is the smoothed SI − p0 of whichever bulk is present. (An
+		// earlier fallback to SmHighSI − p0 when SmAFDev was exactly 0 gave
+		// −p0 for low-bulk-only runs, where SmHighSI is 0.)
+		deviation := s.SmAFDev
 		significant := math.Abs(deviation) >= threshold
 		if significant {
 			if !inBlock {
@@ -258,9 +254,10 @@ func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int
 }
 
 // RunBRM runs BRM block detection across chromosomes and writes a TSV of
-// blocks. u is the genome-wide multiplier from CalculateThresholds
-// (Thresholds.BRM.U).
-func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, u float64) ([]BRMBlock, error) {
+// blocks. th supplies the genome-wide multiplier (th.BRM.U) and the support
+// interval drop (th.SupportDrop) from CalculateThresholds.
+func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, th Thresholds, rf *RegionFilter) ([]BRMBlock, error) {
+	u := th.BRM.U
 
 	color.Cyan("===================================== Running BRM block detection =========================================")
 	if len(sm) == 0 {
@@ -282,6 +279,7 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, u floa
 	}
 
 	lodFn := supportLOD(bsaType)
+	dropped := 0
 	var allBlocks []BRMBlock
 	for chrom, stats := range byChrom {
 		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
@@ -297,13 +295,24 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, u floa
 			blocks = calculateBRMBlocksOneBulk(chrom, stats, oneSize, popScale, expectedSI, uAlpha)
 		}
 		if len(blocks) > 0 {
-			merged := mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance())
-			for i := range merged {
-				merged[i].Support = supportInChrom(stats, lodFn, float64(merged[i].Start), float64(merged[i].Stop), SupportLODDrop)
+			for _, b := range mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance()) {
+				if !rf.Keep(b.Chrom, float64(b.Start), float64(b.Stop)) {
+					dropped++
+					continue
+				}
+				b.Support = supportInChrom(stats, lodFn, float64(b.Start), float64(b.Stop), th.SupportDrop)
+				allBlocks = append(allBlocks, b)
 			}
-			allBlocks = append(allBlocks, merged...)
 		}
 	}
+
+	rf.report("BRM", dropped)
+	sort.Slice(allBlocks, func(i, j int) bool {
+		if allBlocks[i].Chrom != allBlocks[j].Chrom {
+			return allBlocks[i].Chrom < allBlocks[j].Chrom
+		}
+		return allBlocks[i].Start < allBlocks[j].Start
+	})
 
 	// write TSV
 	outDir := filepath.Join(cfg.OutputDir, "stats")

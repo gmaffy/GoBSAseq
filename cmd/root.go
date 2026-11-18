@@ -13,6 +13,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/run"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/gmaffy/genome-whisperer/genespace"
 	"github.com/spf13/cobra"
 )
 
@@ -217,6 +218,9 @@ var rootCmd = &cobra.Command{
 		rep, _ := cmd.Flags().GetInt("rep")
 		seed, _ := cmd.Flags().GetInt64("seed")
 		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
+		geneSpaceTrait, _ := cmd.Flags().GetString("trait")
+		minConcordance, _ := cmd.Flags().GetFloat64("min-concordance")
+		promoterLength, _ := cmd.Flags().GetInt("promoter-length")
 		minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
 		mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
 		minQTLMarkers, _ := cmd.Flags().GetInt("min-qtl-markers")
@@ -225,8 +229,23 @@ var rootCmd = &cobra.Command{
 		lightFiltering, _ := cmd.Flags().GetBool("light-filtering")
 		minQD_SNP, _ := cmd.Flags().GetFloat64("min-QD-SNP")
 		minQUAL_SNP, _ := cmd.Flags().GetFloat64("min-QUAL-SNP")
-		minSOR_SNP, _ := cmd.Flags().GetFloat64("min-SOR-SNP")
-		minFS_SNP, _ := cmd.Flags().GetFloat64("min-FS-SNP")
+		// SOR and FS are upper limits (variants above them fail). The flags
+		// were once named --min-SOR-SNP / --min-FS-SNP; those names still work
+		// (deprecated) and are used if given.
+		maxSOR_SNP, _ := cmd.Flags().GetFloat64("max-SOR-SNP")
+		maxFS_SNP, _ := cmd.Flags().GetFloat64("max-FS-SNP")
+		for _, alias := range []struct {
+			old, new string
+			dst      *float64
+		}{{"min-SOR-SNP", "max-SOR-SNP", &maxSOR_SNP}, {"min-FS-SNP", "max-FS-SNP", &maxFS_SNP}} {
+			if cmd.Flags().Changed(alias.old) {
+				if cmd.Flags().Changed(alias.new) {
+					color.Red("--%s and its deprecated alias --%s were both given; use only --%s", alias.new, alias.old, alias.new)
+					return
+				}
+				*alias.dst, _ = cmd.Flags().GetFloat64(alias.old)
+			}
+		}
 		minMQ_SNP, _ := cmd.Flags().GetFloat64("min-MQ-SNP")
 		minMQRank, _ := cmd.Flags().GetFloat64("min-MQRankSum-SNP")
 		minReadPosRank, _ := cmd.Flags().GetFloat64("min-ReadPosRankSum-SNP")
@@ -359,8 +378,8 @@ var rootCmd = &cobra.Command{
 
 		qd_snp := minQD_SNP
 		qual_snp := minQUAL_SNP
-		sor_snp := minSOR_SNP
-		fs_snp := minFS_SNP
+		sor_snp := maxSOR_SNP
+		fs_snp := maxFS_SNP
 		mq_snp := minMQ_SNP
 		mqRank_snp := minMQRank
 		readPosRank_snp := minReadPosRank
@@ -452,6 +471,10 @@ var rootCmd = &cobra.Command{
 			GeneDesc: geneDescriptions,
 			Prg:      prg,
 
+			GeneSpaceTrait: geneSpaceTrait,
+			MinConcordance: minConcordance,
+			PromoterLength: promoterLength,
+
 			Caller:             caller,
 			Merger:             merger,
 			NoMerging:          noMerging,
@@ -503,9 +526,9 @@ func init() {
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
 	rootCmd.Flags().Int64P("step-size", "s", 100000, "Step Size")
-	rootCmd.Flags().Int64("min-qtl-width", 0, "Minimum QTL width in bp (0 uses smoothing sigma)")
+	rootCmd.Flags().Int64("min-qtl-width", 0, "Minimum width (bp) of a called region, for every method (0 = smoothing sigma, i.e. window-size/2; negative disables)")
 	rootCmd.Flags().Int64("merge-distance", 0, "Maximum gap in bp to merge same-direction QTL support (0 uses smoothing sigma)")
-	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum significant markers supporting a QTL")
+	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum number of markers inside a called region, for every method (0 or negative disables)")
 
 	// ------------------------------------------------- Threshold -------------------------------------------------- //
 	rootCmd.Flags().Float64("brm-alpha", 0.01, "BRM genome-wide significance level: chance that a genome with no QTL gets any BRM block (0.01 matches the P99 used for the other statistics)")
@@ -517,8 +540,12 @@ func init() {
 	rootCmd.Flags().Bool("light-filtering", false, "Enable light filtering")
 	rootCmd.Flags().Float64("min-QD-SNP", 2.0, "QualByDepth SNPs") // SNP_QD_Min             float64 // default 2.0   – QualByDepth
 	rootCmd.Flags().Float64("min-QUAL-SNP", 30.0, "Variant quality SNPs")
-	rootCmd.Flags().Float64("min-SOR-SNP", 3.0, "StrandOddsRatio SNPs")
-	rootCmd.Flags().Float64("min-FS-SNP", 60.0, "FisherStrand SNPs")
+	rootCmd.Flags().Float64("max-SOR-SNP", 3.0, "Maximum StrandOddsRatio for SNPs (SOR above this fails)")
+	rootCmd.Flags().Float64("max-FS-SNP", 60.0, "Maximum FisherStrand for SNPs (FS above this fails)")
+	rootCmd.Flags().Float64("min-SOR-SNP", 3.0, "Deprecated: use --max-SOR-SNP")
+	rootCmd.Flags().Float64("min-FS-SNP", 60.0, "Deprecated: use --max-FS-SNP")
+	_ = rootCmd.Flags().MarkDeprecated("min-SOR-SNP", "use --max-SOR-SNP (it is an upper limit)")
+	_ = rootCmd.Flags().MarkDeprecated("min-FS-SNP", "use --max-FS-SNP (it is an upper limit)")
 	rootCmd.Flags().Float64("min-MQ-SNP", 40.0, "RMSMappingQuality SNPs")
 	rootCmd.Flags().Float64("min-MQRankSum-SNP", -12.5, "MappingQualityRank SNPs")
 	rootCmd.Flags().Float64("min-ReadPosRankSum-SNP", -8.0, "ReadPosRank SNPs")
@@ -536,7 +563,10 @@ func init() {
 	rootCmd.Flags().String("cds", "", "cds file path")
 	rootCmd.Flags().StringP("reference", "r", "", "reference file path")
 	rootCmd.Flags().String("protein", "", "protein fasta path")
-	rootCmd.Flags().String("gene-descriptions", "", "gene descriptions file path")
+	rootCmd.Flags().String("gene-descriptions", "", "Gene descriptions TSV (id<TAB>description); optional")
+	rootCmd.Flags().String("trait", genespace.DefaultProfile, "Gene-space trait profile: "+strings.Join(genespace.ProfileNames(), ", "))
+	rootCmd.Flags().Float64("min-concordance", 0.9, "Gene space: minimum genotype concordance (0-1] for a variant to follow the resistant/susceptible split")
+	rootCmd.Flags().Int("promoter-length", 2000, "Gene space: bases upstream of a gene whose variants count toward it (0 disables)")
 	rootCmd.Flags().String("prg", "", "prg blast file path ")
 
 	// ------------------------------------------- OutDir ----------------------------------------------------------- //

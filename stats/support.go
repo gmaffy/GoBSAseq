@@ -5,19 +5,26 @@ import (
 	"sort"
 )
 
-// SupportLODDrop is how far (in smoothed-LOD units) the statistic may fall
-// below the peak before the support interval ends. 1.5 follows the classical
-// "1.5-LOD drop" rule; it has not yet been calibrated for smoothed BSA-seq
-// LOD (planned: choose the drop that gives ~95% coverage of the true QTL
-// position in simulations).
-const SupportLODDrop = 1.5
+// SupportZDrop is how far smoothed LOD may fall below its peak before the
+// support interval ends, in units of the null LOD scale (NullScales, i.e.
+// Z_LOD units). The drop in LOD units is SupportZDrop × that scale, stored in
+// Thresholds.SupportDrop.
+//
+// Calibration (CHANGES.md §14): 216 simulated F2 datasets (depth 30/60/150×,
+// bulks of 30/50/100, strong/moderate/weak QTL at random positions, default
+// 2 Mb window); 6.5 gives 95% coverage of the true QTL position overall
+// (92–98% per depth, bulk size and strength). A fixed drop in raw LOD units
+// does not transfer between depths (smoothed LOD grows with depth): the
+// classical 1.5 gave 99% coverage but intervals up to whole chromosomes at
+// low depth. Null-scaled units varied least across conditions.
+const SupportZDrop = 6.5
 
 // SupportInterval localises a QTL. The threshold decides WHETHER a region
 // holds a QTL; the region above the threshold can span a whole chromosome
 // when the QTL is strong (few meioses ⇒ long linkage blocks), so it says
 // little about WHERE the QTL is. The support interval is the stretch around
 // the highest smoothed LOD in the region where LOD stays within
-// SupportLODDrop of that peak.
+// Thresholds.SupportDrop of that peak.
 type SupportInterval struct {
 	Start   int64   // first marker with LOD ≥ peak − drop
 	End     int64   // last marker with LOD ≥ peak − drop

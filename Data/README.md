@@ -33,9 +33,9 @@ Results with the default `--seed 1` and `--rep 1000`:
 
 | Dataset | CompositeZ P99 | CompositeZ calls | Individual-stat calls | BRM blocks |
 |---------|---------------:|------------------|-----------------------|------------|
-| strongQTL | 28.4 | 1 (chr2) | 1 (chr2) | 1 (chr2, peak 15.44 Mb) |
-| weakQTL | 29.2 | 0 | 0 | 0 |
-| null | 31.2 | 0 | 0 | 0 |
+| strongQTL | 22.9 | 1 (chr2) | 1 (chr2) | 1 (chr2, peak 15.44 Mb) |
+| weakQTL | 24.6 | 0 | 0 | 0 |
+| null | 22.3 | 0 | 0 | 0 |
 
 ## Regenerate or make new ones
 

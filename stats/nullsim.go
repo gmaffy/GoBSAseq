@@ -243,6 +243,9 @@ type nullLayout struct {
 	hReads, lReads *readSampler // read samplers for the high / low bulk
 	lg             *lgammaTables
 	brmScale       float64 // PopulationVarianceScale, for BRM's σ
+
+	scales    NullScales // Z-score normalisation; set by estimateScales
+	scalesSet bool
 }
 
 func buildNullLayout(raw []BSAstats, smoothed []SmoothedStats, bsaType string, sigma float64, contigLen map[string]float64,
@@ -373,7 +376,6 @@ type nullWorker struct {
 	wsum  []float64
 	wv    [nTracks][]float64
 	track [nTracks][]float64 // per evaluated bin, genome-wide (see nullChrom.evalBins)
-	rz    robustZScratch
 }
 
 func (L *nullLayout) activeTracks() []int {
@@ -400,7 +402,15 @@ func grow[T any](s []T, n int) []T {
 	return s[:n]
 }
 
+// simulateGenome simulates one null genome and returns its extremes.
 func (L *nullLayout) simulateGenome(rng *rand.Rand, w *nullWorker) nullExtremes {
+	L.simulateTracks(rng, w)
+	return L.extremes(w)
+}
+
+// simulateTracks fills w.track with the smoothed statistics of one simulated
+// null genome, one value per evaluated bin (see nullChrom.evalBins).
+func (L *nullLayout) simulateTracks(rng *rand.Rand, w *nullWorker) {
 	tracks := L.activeTracks()
 	for _, t := range tracks {
 		w.track[t] = grow(w.track[t], 0)
@@ -512,7 +522,10 @@ func (L *nullLayout) simulateGenome(rng *rand.Rand, w *nullWorker) nullExtremes 
 			}
 		}
 	}
+}
 
+// extremes returns the genome-wide extremes of the tracks in w.
+func (L *nullLayout) extremes(w *nullWorker) nullExtremes {
 	ex := nullExtremes{}
 	maxMin := func(xs []float64) (float64, float64) {
 		mx, mn := math.Inf(-1), math.Inf(1)
@@ -529,25 +542,17 @@ func (L *nullLayout) simulateGenome(rng *rand.Rand, w *nullWorker) nullExtremes 
 		ex.LowSIMax, ex.LowSIMin = maxMin(w.track[tLowSI])
 	}
 
-	// CompositeZ: identical normalisation (robustZScores) and formula (compositeZ).
-	var zS, zG, zL []float64
 	if L.hasBoth {
 		ex.DeltaSIMax, ex.DeltaSIMin = maxMin(w.track[tDeltaSI])
 		ex.GstatMax, _ = maxMin(w.track[tG])
 		ex.ED4Max, _ = maxMin(w.track[tED4])
 		ex.LODMax, _ = maxMin(w.track[tLOD])
 		ex.BBLogBFMax, _ = maxMin(w.track[tBB])
-		zS = w.rz.robustZ(w.track[tDeltaSI], L.counts, 0)
-		zG = w.rz.robustZ(w.track[tG], L.counts, 1)
-		zL = w.rz.robustZ(w.track[tLOD], L.counts, 2)
 	} else if L.hasOne {
 		ex.AFDevMax, ex.AFDevMin = maxMin(w.track[tAFDev])
 		ex.OneGMax, _ = maxMin(w.track[tG1])
 		ex.OneLODMax, _ = maxMin(w.track[tLOD1])
 		ex.OneBBMax, _ = maxMin(w.track[tBB1])
-		zS = w.rz.robustZ(w.track[tAFDev], L.counts, 0)
-		zG = w.rz.robustZ(w.track[tG1], L.counts, 1)
-		zL = w.rz.robustZ(w.track[tLOD1], L.counts, 2)
 	}
 	// BRM: largest |ΔSI|/σ (two bulks) or |SI − p0|/σ (one bulk), with σ
 	// computed exactly as RunBRM does on the real data.
@@ -566,78 +571,150 @@ func (L *nullLayout) simulateGenome(rng *rand.Rand, w *nullWorker) nullExtremes 
 		}
 	}
 
+	// CompositeZ with the same fixed null scales (L.scales) and formula
+	// (compositeZ) as the real data (normaliseToNull).
 	ex.CompositeZMax = math.Inf(-1)
-	for i := range zS {
-		ex.CompositeZMax = math.Max(ex.CompositeZMax, compositeZ(zS[i], zG[i], zL[i]))
+	if sT, gT, lT, ok := L.compositeTracks(); ok {
+		sc := &L.scales
+		for i := range w.track[sT] {
+			cz := compositeZ(sc[sT].z(w.track[sT][i]), sc[gT].z(w.track[gT][i]), sc[lT].z(w.track[lT][i]))
+			ex.CompositeZMax = math.Max(ex.CompositeZMax, cz)
+		}
 	}
 	return ex
 }
 
-// robustZScratch holds reusable buffers for robustZ.
-type robustZScratch struct {
-	idx []int
-	dev []float64
-	out [3][]float64
+// compositeTracks returns the tracks combined into CompositeZ: the signed
+// difference (ΔSI or AFDev), G and LOD.
+func (L *nullLayout) compositeTracks() (signed, g, lod int, ok bool) {
+	switch {
+	case L.hasBoth:
+		return tDeltaSI, tG, tLOD, true
+	case L.hasOne:
+		return tAFDev, tG1, tLOD1, true
+	}
+	return 0, 0, 0, false
 }
 
-// robustZ returns robustZScores of the expanded vector in which vals[i]
-// appears counts[i] times, but only once per distinct entry: the result is
-// bit-identical to robustZScores on the expanded vector (same median, MAD,
-// fallback and rounding). slot selects which output buffer to reuse.
-func (s *robustZScratch) robustZ(vals []float64, counts []int, slot int) []float64 {
-	const consistencyFactor = 1.4826
-	n := len(vals)
-	out := grow(s.out[slot], n)
-	s.out[slot] = out
-	if n == 0 {
-		return out
+// ── Null scales (Z-score normalisation) ────────────────────────────────────
+
+// trackScale is the location and scale used to turn a smoothed statistic
+// into a Z-score: z = (x − Med) / Scale, with Med the median and Scale
+// 1.4826 × MAD of the statistic across positions of simulated null genomes.
+type trackScale struct {
+	Med, Scale float64
+}
+
+func (s trackScale) z(v float64) float64 {
+	return math.Round(((v-s.Med)/s.Scale)*1e6) / 1e6
+}
+
+// NullScales holds a trackScale per smoothed statistic (indexed by track).
+//
+// Why fixed null scales: Z-scores used to be computed from each genome's own
+// median and MAD. A QTL region inflates its own genome's spread and so
+// shrinks its own Z-scores, and the MAD varies from genome to genome, giving
+// CompositeZ a heavy-tailed null (high, noisy thresholds). With one fixed
+// transform for the real data and every simulated genome, Z measures
+// distance from what a QTL-free genome produces, in the same units
+// everywhere.
+type NullScales [nTracks]trackScale
+
+const (
+	scaleGenomes   = 50        // simulated genomes used to estimate NullScales
+	scaleMaxValues = 2_000_000 // cap on pooled values per statistic (memory)
+)
+
+// estimateScales simulates up to scaleGenomes null genomes (with their own
+// seeds, separate from the threshold genomes) and pools their smoothed values
+// to give each statistic's null median and 1.4826 × MAD. Each evaluated bin
+// is weighted by its number of markers, so the result matches pooling the
+// markers themselves. Long genomes are thinned to scaleMaxValues values per
+// statistic by taking every k-th bin.
+func (L *nullLayout) estimateScales(reps int, seed int64) NullScales {
+	k := min(scaleGenomes, max(reps, 1))
+	nb := len(L.counts)
+	stride := max(1, (k*nb+scaleMaxValues-1)/scaleMaxValues)
+	tracks := L.activeTracks()
+
+	per := make([][nTracks][]float64, k)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range runtime.GOMAXPROCS(0) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := &nullWorker{}
+			for {
+				r := int(next.Add(1)) - 1
+				if r >= k {
+					return
+				}
+				rng := rand.New(rand.NewSource(deriveSeed(seed, fmt.Sprintf("null-scale:%d", r))))
+				L.simulateTracks(rng, w)
+				for _, t := range tracks {
+					vals := make([]float64, 0, nb/stride+1)
+					for i := 0; i < nb; i += stride {
+						vals = append(vals, w.track[t][i])
+					}
+					per[r][t] = vals
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	var counts []int
+	for range k {
+		for i := 0; i < nb; i += stride {
+			counts = append(counts, L.counts[i])
+		}
 	}
 	total := 0
 	for _, c := range counts {
 		total += c
 	}
 
-	med := s.weightedMedian(vals, counts, total)
-	s.dev = grow(s.dev, n)
-	for i, v := range vals {
-		s.dev[i] = math.Abs(v - med)
-	}
-	mad := s.weightedMedian(s.dev, counts, total) * consistencyFactor
-
-	if mad > 0 {
+	var sc NullScales
+	var s robustZScratch
+	for _, t := range tracks {
+		vals := make([]float64, 0, len(counts))
+		for r := range k {
+			vals = append(vals, per[r][t]...)
+		}
+		med := s.weightedMedian(vals, counts, total)
+		dev := make([]float64, len(vals))
 		for i, v := range vals {
-			out[i] = math.Round(((v-med)/mad)*1e6) / 1e6
+			dev[i] = math.Abs(v - med)
 		}
-		return out
-	}
-	// MAD = 0 fallback: classical Z-score, summed in expanded order.
-	var mean float64
-	for i, v := range vals {
-		for range counts[i] {
-			mean += v
+		scale := 1.4826 * s.weightedMedian(dev, counts, total)
+		if !(scale > 0) { // degenerate (e.g. constant track): fall back to the SD, then to 1
+			var m, v float64
+			for i, x := range vals {
+				m += float64(counts[i]) * x
+			}
+			m /= float64(total)
+			for i, x := range vals {
+				v += float64(counts[i]) * (x - m) * (x - m)
+			}
+			scale = math.Sqrt(v / float64(total))
+			if !(scale > 0) {
+				scale = 1
+			}
 		}
+		sc[t] = trackScale{Med: med, Scale: scale}
 	}
-	mean /= float64(total)
-	var variance float64
-	for i, v := range vals {
-		d := v - mean
-		for range counts[i] {
-			variance += d * d
-		}
-	}
-	sd := math.Sqrt(variance / float64(total))
-	for i, v := range vals {
-		if sd == 0 {
-			out[i] = 0
-		} else {
-			out[i] = math.Round(((v-mean)/sd)*1e6) / 1e6
-		}
-	}
-	return out
+	return sc
 }
 
-// weightedMedian is medianOf on the expanded vector (vals[i] repeated
-// counts[i] times; total = Σ counts).
+// robustZScratch holds reusable buffers for weightedMedian.
+type robustZScratch struct {
+	idx []int
+}
+
+// weightedMedian is the median of the expanded vector in which vals[i]
+// appears counts[i] times (total = Σ counts); for an even total, the mean of
+// the two middle values.
 func (s *robustZScratch) weightedMedian(vals []float64, counts []int, total int) float64 {
 	s.idx = grow(s.idx, len(vals))
 	for i := range s.idx {
@@ -798,6 +875,9 @@ func (t *lgammaTables) betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail in
 // is seeded from (seed, replicate index), so results do not depend on goroutine
 // scheduling.
 func simulateNullExtremes(L *nullLayout, reps int, seed int64) []nullExtremes {
+	if !L.scalesSet {
+		L.scales, L.scalesSet = L.estimateScales(reps, seed), true
+	}
 	out := make([]nullExtremes, reps)
 	bar := progressbar.NewOptions(reps,
 		progressbar.OptionSetDescription("Null genome simulation"),

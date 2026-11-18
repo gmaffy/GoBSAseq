@@ -60,14 +60,10 @@ const posFormatter = `function(value) {
 
 // ── public entry point ───────────────────────────────────────────────────────
 
-func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, thresholds []stats.Thresholds, brmBlocks []stats.BRMBlock, qtls []stats.MergedQTL) error {
+func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, th stats.Thresholds, brmBlocks []stats.BRMBlock, qtls []stats.MergedQTL) error {
 	color.Cyan("\n================================ Generating plots for %s... ==========================================", bsaType)
 	if len(smoothed) == 0 {
 		return nil
-	}
-	if len(thresholds) != len(smoothed) {
-		return fmt.Errorf("GeneratePlots: len(thresholds)=%d != len(smoothed)=%d",
-			len(thresholds), len(smoothed))
 	}
 
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := stats.BulkFlags(bsaType)
@@ -185,7 +181,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		obBBT99, obBBT95 := make([]float64, n), make([]float64, n)
 
 		for i, j := range idxs {
-			s, t := &smoothed[j], &thresholds[j]
+			s, t := &smoothed[j], &th
 			x[i] = s.POS
 
 			if hasBothBulks {
@@ -319,7 +315,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		// Use the empirical CompositeZ thresholds from the first variant on this
 		// chromosome (they are global — identical for every variant — so any entry
 		// gives the same value).
-		czThresh := thresholds[idxs[0]].Z
+		czThresh := th.Z
 
 		compositePage.AddCharts(
 			createCompositeChart(bw, chrom, x, compositeZ, maxAbsZ, chromShade, czThresh),
@@ -560,7 +556,7 @@ func createZOverlayChart(
 ) *charts.Line {
 
 	title := chrom + " — Robust Z-score Overlay"
-	subtitle := "Robust Z (median+MAD). z = ±2 suggestive · z = ±3 significant. " +
+	subtitle := "Z vs simulated QTL-free genomes (median+MAD). z = ±2 / ±3 per-position guides. " +
 		"Amber: BRM blocks · red: QTL support interval."
 
 	line := charts.NewLine()

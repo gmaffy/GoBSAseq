@@ -18,6 +18,13 @@ data (see `Data/`). Build, `go vet` and all tests pass.
 | 9 | A strong QTL was reported as the whole chromosome | LOD-drop support interval around the peak, reported first in every QTL table |
 | 10 | Null-genome simulation too slow for plant-sized genomes | Smoothing per 10 kb bin instead of per marker; tabulated read sampling and log-gamma |
 | 11 | BRM called QTLs in 13–40% of genomes with none, more with deeper sequencing | Drift-only σ and a genome-wide multiplier from the null simulation; `--brm-alpha` is now genome-wide (default 0.01) |
+| 12 | CompositeZ found only 4 of 10 weak QTLs (G/LOD found 8) | Z-scores use a fixed median and MAD from simulated null genomes instead of each genome's own |
+| 13 | `--min-qtl-width` / `--min-qtl-markers` did nothing; BRM one-bulk fallback bug | Both flags now filter every method's regions; fallback removed |
+| 14 | Support-interval drop (1.5 LOD) uncalibrated; too wide at low depth | Drop of 6.5 null LOD scales, calibrated to 95% coverage on 216 simulated datasets |
+| 15 | Peak memory ~2.5 GB at 900k markers (duplicated per-marker data) | One genome-wide threshold value, unused field removed, chromosomes scanned in place: −40% |
+| 16 | `--min-SOR-SNP` / `--min-FS-SNP` were upper limits | Renamed `--max-SOR-SNP` / `--max-FS-SNP`; old names kept as deprecated aliases |
+| 17 | README out of date | Rewritten to match the current app |
+| 18 | genome-whisperer update broke the build | Adapted to the new `genespace.GeneSpace(Options)` and `variants.RunPipeline(Options)`; gene descriptions optional |
 
 ---
 
@@ -450,6 +457,211 @@ width or marker count (problem 5 of the BRM review), and the one-bulk
 
 ---
 
+## 12. CompositeZ: Z-scores against the simulated null
+
+**Problem.** Each statistic was turned into a Z-score with the genome's *own*
+median and MAD, in the real data and in every simulated genome. Two effects
+cost power:
+
+- A QTL inflates its own genome's spread (with 5 chromosomes, a whole-chromosome
+  QTL is 20% of the markers), which shrinks its own Z-scores. In one weak-QTL
+  run G was 2.2× its threshold but CompositeZ only 0.6× its own.
+- The MAD varies from genome to genome, so the per-genome maximum of
+  CompositeZ had a heavy tail (P99 3.3× the median), giving high, noisy
+  thresholds.
+
+**Fix** (`stats/nullsim.go`, `stats/smoothing.go`, `stats/thresholds.go`).
+A separate batch of 50 simulated null genomes (own seeds, about 5% extra
+run time) gives each statistic a fixed median and scale (1.4826 × MAD,
+weighted by markers per bin; very long genomes are thinned to 2M values per
+statistic). The same transform, z = (x − median) / scale, is applied to the
+real data and to every threshold genome, so Z measures distance from what a
+QTL-free genome produces. The values are written to
+`GoBSAseq.<type>.null_scales.tsv`.
+
+Because Z-scores now need the simulation, they are filled in the threshold
+step, and the smoothed TSV is written there (same file name and columns).
+The per-genome robust Z code (`normalise`, `robustZScores`, `medianOf`) was
+removed. The robust-Z overlay plot now shows Z against the simulated null.
+
+**Result** (same 60 simulated datasets as the earlier benchmark):
+
+| Test | Before | After |
+|---|---|---|
+| Weak QTL found by CompositeZ | 4 / 10 | **8 / 10** (same as G/LOD) |
+| No QTL: genomes with a CompositeZ call | 0 / 30 | 0 / 30 |
+| Strong QTL found / wrong-chromosome calls | 20 / 20, 0 | 20 / 20, 0 |
+| Null CompositeZ maximum, P99 ÷ median | 3.3 | 2.4 |
+| `Data/` CompositeZ P99 (strong / weak / null) | 28.4 / 29.2 / 31.2 | 22.9 / 24.6 / 22.3 |
+
+All 60 datasets now give 0 false calls from every method (CompositeZ,
+individual statistics, BRM). Tests: `TestWeightedMedianMatchesExpanded`,
+`TestEstimateScales` (ΔSI centred near 0, reproducible for a seed).
+
+---
+
+## 13. Minimum region size; BRM one-bulk fallback
+
+**Problem.** `--min-qtl-width` and `--min-qtl-markers` were parsed but never
+used, so a region of any width or marker count could become a QTL, including
+BRM blocks entering the final table. Separately, one-bulk BRM fell back to
+`SmHighSI − p0` whenever `SmAFDev` was exactly 0; in a low-bulk-only run
+`SmHighSI` is 0, so that marker got a deviation of −p0 and was called
+significant.
+
+**Fix.**
+
+- New `RegionFilter` (`stats/regionfilter.go`) applied to the final regions
+  of all three methods after merging: individual statistics
+  (`DetectIndividualQTLs`), CompositeZ (`DetectCompositeZQTLs`) and BRM
+  (`RunBRM`). A region must be at least `--min-qtl-width` wide (default 0 =
+  smoothing σ, i.e. `--window-size`/2; negative disables) and contain at
+  least `--min-qtl-markers` markers (default 5; 0 disables). The run prints
+  how many regions each method dropped. Thresholds are calibrated without the
+  filter, so it can only make calls more conservative.
+- One-bulk BRM uses `SmAFDev` directly (no fallback).
+- BRM blocks are now sorted by chromosome and position (they followed Go's
+  random map order).
+
+**Result.** On the 60-dataset benchmark nothing was dropped and results are
+unchanged (strong 20/20, weak 8/10, 0 false calls in 30 null genomes), so
+the filter costs no power there; it is a safeguard against narrow artefacts.
+Test: `TestRegionFilter`.
+
+---
+
+## 14. Calibrated support intervals
+
+**Problem.** Support intervals (section 9) used the classical 1.5-LOD drop,
+which was never checked for smoothed BSA-seq LOD. Smoothed LOD grows with read
+depth, so a fixed drop in LOD units is relatively wide at low depth and
+narrow at high depth.
+
+**Calibration.** 216 simulated F2 datasets (`Data/simulate_bsa.py`, which
+gained a `moderate` strength): depth 30, 60 and 150×; bulks of 30, 50 and 100;
+strong, moderate and weak QTLs at random positions; 8 replicates each; default
+2 Mb window. In 197 the QTL was detected. For each, I measured the smallest
+drop from the LOD peak at which the interval reaches the true position, in
+three candidate units:
+
+| Unit | Spread of the 95% drop across conditions (max ÷ min) |
+|---|---|
+| Raw LOD | 3.5× |
+| Fraction of peak LOD | 13× |
+| **Null LOD scale (Z_LOD, section 12)** | **1.8×** |
+
+Null-scaled units carry over best, so the drop is now **6.5 × the null LOD
+scale** (`SupportZDrop` in `stats/support.go`; the value in LOD units, about
+0.3 at 30×, 0.6 at 60× and 1.2 at 150×, is printed at the threshold step and
+stored in `Thresholds.SupportDrop`).
+
+| Drop | Coverage of true QTL | Median width | 90th pct width |
+|---|---|---|---|
+| 1.5 LOD (before) | 99% | 3.8 Mb | 26.8 Mb |
+| 6.5 null scales (now) | 95% (92–98% per depth, bulk size, strength) | 2.3 Mb | 5.9 Mb |
+
+Weak QTLs: median width 16.7 → 4.9 Mb. Strong: 1.6 → 1.0 Mb.
+
+**Held-out check** (the 60-dataset benchmark, different seeds): intervals
+contained the true QTL for 26 of 28 detected QTLs (93%); median width strong
+1.69 → 1.05 Mb, weak 13.1 → 6.4 Mb; no change to calls (0 false in 30 null
+genomes). `Data/sim_F2_strongQTL`: 14.93–15.94 Mb (truth 15.0 Mb), was
+14.60–16.29 Mb.
+
+**Limits.** Calibrated for F2 with the default window and 1 Morgan per
+chromosome; other crosses and window sizes are untested. A 95% interval
+misses the true QTL about 1 time in 20 by design.
+
+**Found along the way.** The default `--bulks-depth 40,40` removes every
+marker where a bulk has fewer than 40 reads. With bulks sequenced at ~30×,
+only about 80 of 15,000 markers passed and the localisation was poor; those
+calibration runs were redone with `-b 10,10`. See Known issues.
+
+---
+
+## 15. Memory
+
+**Problem.** Peak memory was about 3 KB per marker (2.5 GB for 900k markers).
+Three things duplicated per-marker data: the genome-wide thresholds were
+stored as one 304-byte `Thresholds` value per marker; every `SmoothedStats`
+carried an unused 304-byte `thresholds` field; and QTL detection copied each
+chromosome's records and thresholds before scanning them.
+
+**Fix.** `CalculateThresholds` returns a single `Thresholds` (the thresholds
+TSV still lists it per marker); the unused field is gone (`SmoothedStats`
+568 → 264 bytes); `chromosomes()` (`stats/detect.go`) splits the sorted
+input into per-chromosome sub-slices without copying (it copies only if
+chromosomes are interleaved). `FindPeakIntersections` now takes the threshold
+as a function of marker index.
+
+**Result** (tomato-sized, 900k markers, full default run):
+
+| | Before | After |
+|---|---|---|
+| Peak memory (RSS) | 2.48 GB | **1.49 GB** |
+| Max heap, threshold step | 1.96 GB | 1.37 GB |
+| Max heap, QTL detection | 2.03 GB | < 0.7 GB |
+| Run time | 79 s | 77 s |
+
+Every output TSV and every QTL call is byte-identical. Individual-statistic
+and CompositeZ QTLs are now listed in chromosome order (they followed Go's
+random map order). Test: `TestChromosomes`.
+
+## 16. SOR / FS flag names
+
+`--min-SOR-SNP` and `--min-FS-SNP` set upper limits (variants above them
+fail). They are now `--max-SOR-SNP` and `--max-FS-SNP`, matching
+`--max-SOR-INDEL` / `--max-FS-INDEL`. The old names still work, print a
+deprecation notice and are hidden from `--help`; giving both an old and a new
+name is an error. Defaults (3 and 60) are unchanged.
+
+## 17. README
+
+Rewritten to match the app: current flags (filtering, depth caps, light
+filtering, region filter, seed, variant calling, config file), output files
+and columns, pipeline steps, CompositeZ formula, BRM as Block Regression
+Mapping (Huang et al. 2020), support intervals, test data, troubleshooting
+(including the `--bulks-depth` default), project structure, and corrected
+references (the Magwene 2011 citation was wrong; QTL-seq and BRM added).
+
+---
+
+## 18. genome-whisperer update
+
+`github.com/gmaffy/genome-whisperer` was updated from
+`v0.0.0-20260706090856-3d8bbe76817b` to `v0.0.0-20261118091955-61bdb2472be2`
+(`go get …@latest`, `go mod tidy`). Two API changes broke the build:
+
+- **`genespace.GeneSpace`** now takes an `Options` struct and returns
+  `(rows, reportPath, error)`. `stats/genespace.go` fills it from the config
+  and prints the number of genes scored and the report path per interval. The
+  new options are exposed as `--trait` (default `disease-resistance`),
+  `--min-concordance` (default 0.9, validated to (0, 1]) and
+  `--promoter-length` (default 2000), using genome-whisperer's own defaults.
+- **`variants.VariantCalling` was removed**; the BAM path in `run/run.go` now
+  calls `variants.RunPipeline(variants.Options{…})`. `Species` and `RefVer`
+  are required but only label output files outside genome-whisperer's
+  data-directory mode, so they are set to the snpEff DB name (or `bsaseq`) and
+  the reference file name, as the old call effectively did. `MinGQ` is 0:
+  genome-whisperer's GQ filter would apply to bulks, where GQ is correlated
+  with allele frequency; GoBSAseq applies `--min-GQ` to parents itself.
+
+**Gene descriptions are optional.** Gene-space now needs `--snpEffDB`,
+`--prg` and `--gff` (all or none; a partial set is an error), and
+`--gene-descriptions` may be left out. The PRG file is still required:
+genome-whisperer's annotation step (`CreateSuperVcf`) opens it
+unconditionally.
+
+**Checks.** Build, `go vet` and tests pass; a normal run's outputs are
+byte-identical; the parameter checks behave as described. Gene-space and BAM
+variant calling were not run end to end (snpEff, GATK and DeepVariant are not
+installed in the test environment).
+
+**README.** The read (FASTQ) input flags were documented as working, but a
+read-based run only prints a message and stops; the README now says so.
+
+---
+
 ## Also added
 
 - `Data/`: three simulated F2 datasets (strong QTL, weak QTL, no QTL), the
@@ -460,18 +672,13 @@ width or marker count (problem 5 of the BRM review), and the one-bulk
 
 - **One support interval per region.** Two linked QTLs on one chromosome fall
   in one above-threshold region and only the higher peak gets an interval.
-- **Support-interval drop (1.5 LOD) is not yet calibrated** (section 9).
+- **Default `--bulks-depth 40,40` discards most markers at low coverage.**
+  With bulks at ~30× mean depth, ~99% of markers fail it (section 14). Users
+  sequencing bulks below ~60× should lower it (e.g. `-b 10,10`); the
+  threshold simulation uses the observed depths, so lower-depth markers are
+  handled correctly.
+- **Support intervals were calibrated for F2 with the default window only.**
 
-- **Memory is now dominated by per-marker records** (about 3 KB per marker,
-  2.7 GB for 900k markers), including one identical `Thresholds` struct per
-  marker. The null simulation itself adds little.
-- **BRM**: no minimum block width or marker count before a block enters the
-  final table, and the one-bulk fallback when `SmAFDev` is exactly 0
-  computes a wrong deviation (section 11).
-- **CompositeZ is less powerful than G or LOD for weak QTLs** (4 of 10 found
-  vs 8 of 10). Robust-Z divides by each genome's own MAD, which a large QTL
-  region inflates, and which varies between genomes, so the CompositeZ null
-  has a heavy tail.
 - Chart tooltips mark only upper-tail exceedances (★ p99 / ● p95); a value
   below a lower (valley) threshold, such as LowSI at a QTL, is not flagged.
 
@@ -479,9 +686,6 @@ width or marker count (problem 5 of the BRM review), and the one-bulk
   parent, so ΔSI's sign is effectively random per marker and smoothing cancels
   part of the true signal. The null simulation reproduces this, so thresholds
   stay valid, but power is lost. G and LOD are not affected.
-- `--min-qtl-width` and `--min-qtl-markers` are accepted but never used.
-- `--min-SOR-SNP` and `--min-FS-SNP` are actually maximum values.
 - Write errors on output files are not checked everywhere.
-- Output order of QTLs can vary between runs (map iteration).
 - Many files have Windows (CRLF) line endings, which shows up as whole-file
   changes in git. A `.gitattributes` with `* text=auto eol=lf` would fix it.

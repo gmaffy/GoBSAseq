@@ -216,9 +216,12 @@ const (
 //	return peaks
 //}
 
-func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds []Thresholds, valueFn func(SmoothedStats) float64, threshFn func(Thresholds) float64, tail Tail) []PeakIntersection {
+// FindPeakIntersections returns the regions where valueFn crosses the
+// threshold thrAt(i) (marker index i), with linear interpolation of the
+// crossing points. smoothed is one chromosome, sorted by position.
+func FindPeakIntersections(statName string, smoothed []SmoothedStats, thrAt func(i int) float64, valueFn func(SmoothedStats) float64, tail Tail) []PeakIntersection {
 
-	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
+	if len(smoothed) < 2 {
 		return nil
 	}
 
@@ -240,9 +243,9 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	var d0 float64
 	switch tail {
 	case UpperTail:
-		d0 = y0 - threshFn(thresholds[0])
+		d0 = y0 - thrAt(0)
 	case LowerTail:
-		d0 = threshFn(thresholds[0]) - y0
+		d0 = thrAt(0) - y0
 	}
 
 	if d0 > 0 {
@@ -251,7 +254,7 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		startIndex = 0
 		peakPos = smoothed[0].POS
 		peakValue = y0
-		peakThresh = threshFn(thresholds[0])
+		peakThresh = thrAt(0)
 		peakIndex = 0
 	}
 
@@ -260,8 +263,8 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		y1 := valueFn(smoothed[i])
 		y2 := valueFn(smoothed[i+1])
 
-		t1 := threshFn(thresholds[i])
-		t2 := threshFn(thresholds[i+1])
+		t1 := thrAt(i)
+		t2 := thrAt(i + 1)
 
 		var d1, d2 float64
 
@@ -373,8 +376,8 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 // used on every chromosome: an earlier per-chromosome p99→p95 fallback made a
 // region's call depend on whether some other region on its chromosome passed
 // p99, and admitted false p95 calls on chromosomes with no real QTL.
-func findPeaksAtP99(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, tail Tail) []PeakIntersection {
-	peaks := FindPeakIntersections(statName, sm, th, valueFn, threshP99, tail)
+func findPeaksAtP99(statName string, sm []SmoothedStats, p99 float64, valueFn func(SmoothedStats) float64, tail Tail) []PeakIntersection {
+	peaks := FindPeakIntersections(statName, sm, func(int) float64 { return p99 }, valueFn, tail)
 	if len(peaks) == 0 {
 		return nil
 	}
@@ -412,10 +415,10 @@ var oneBulkStatConfigs = []peakStatConfig{
 	{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }, UpperTail, "OneBulkBBLogBF"},
 }
 
-func collectPeaks(sm []SmoothedStats, th []Thresholds, configs []peakStatConfig) []PeakIntersection {
+func collectPeaks(sm []SmoothedStats, th Thresholds, configs []peakStatConfig) []PeakIntersection {
 	var peaks []PeakIntersection
 	for _, cfg := range configs {
-		if found := findPeaksAtP99(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.tail); found != nil {
+		if found := findPeaksAtP99(cfg.name, sm, cfg.p99(th), cfg.valueFn, cfg.tail); found != nil {
 			peaks = append(peaks, found...)
 		}
 	}
@@ -736,27 +739,56 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 	return nil
 }
 
-func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
+// chromosomes splits smoothed into one slice per chromosome, sorted by
+// position, in order of first appearance. When each chromosome's markers are
+// already contiguous and sorted (the normal case: VCFs are sorted), the slices
+// share smoothed's memory instead of copying it.
+func chromosomes(smoothed []SmoothedStats) [][]SmoothedStats {
+	var out [][]SmoothedStats
+	seen := map[string]bool{}
+	contiguous := true
+	for i := 0; i < len(smoothed); {
+		j := i
+		for j < len(smoothed) && smoothed[j].CHROM == smoothed[i].CHROM {
+			j++
+		}
+		if seen[smoothed[i].CHROM] {
+			contiguous = false
+			break
+		}
+		seen[smoothed[i].CHROM] = true
+		out = append(out, sortedByPos(smoothed[i:j:j]))
+		i = j
+	}
+	if contiguous {
+		return out
+	}
+	// Interleaved chromosomes: group by copying (rare).
+	out = out[:0]
+	byChr := map[string][]SmoothedStats{}
+	var order []string
+	for _, s := range smoothed {
+		if _, ok := byChr[s.CHROM]; !ok {
+			order = append(order, s.CHROM)
+		}
+		byChr[s.CHROM] = append(byChr[s.CHROM], s)
+	}
+	for _, c := range order {
+		out = append(out, sortedByPos(byChr[c]))
+	}
+	return out
+}
+
+func DetectIndividualQTLs(smoothed []SmoothedStats, th Thresholds, bsaType string, mergeGap int64, rf *RegionFilter) ([]PeakIntersection, []ConsolidatedQTL) {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
 	var peaks []PeakIntersection
 	var qtls []ConsolidatedQTL
 	lodFn := supportLOD(bsaType)
-	byChr := make(map[string][]int)
+	dropped := 0
+	defer func() { rf.report("Individual statistics", dropped) }()
 
-	for i := range smoothed {
-		byChr[smoothed[i].CHROM] = append(byChr[smoothed[i].CHROM], i)
-	}
-
-	for _, idx := range byChr {
-		sm := make([]SmoothedStats, len(idx))
-		th := make([]Thresholds, len(idx))
-
-		for i, j := range idx {
-			sm[i] = smoothed[j]
-			th[i] = thresholds[j]
-		}
-
+	for _, sm := range chromosomes(smoothed) {
 		var chrPeaks []PeakIntersection
 		if hasBothBulks {
 			chrPeaks = append(chrPeaks, collectPeaks(sm, th, twoBulkStatConfigs)...)
@@ -765,55 +797,43 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 			chrPeaks = append(chrPeaks, collectPeaks(sm, th, oneBulkStatConfigs)...)
 		}
 
-		sorted := sortedByPos(sm)
 		for i := range chrPeaks {
-			chrPeaks[i].Support = supportInChrom(sorted, lodFn, chrPeaks[i].Start, chrPeaks[i].End, SupportLODDrop)
+			chrPeaks[i].Support = supportInChrom(sm, lodFn, chrPeaks[i].Start, chrPeaks[i].End, th.SupportDrop)
 		}
 		chrQTLs := ConsolidateQTLs(chrPeaks, mergeGap)
-		for i := range chrQTLs {
-			chrQTLs[i].Support = supportInChrom(sorted, lodFn, chrQTLs[i].Start, chrQTLs[i].End, SupportLODDrop)
+		kept := chrQTLs[:0]
+		for _, q := range chrQTLs {
+			if !rf.Keep(q.Chrom, q.Start, q.End) {
+				dropped++
+				continue
+			}
+			q.Support = supportInChrom(sm, lodFn, q.Start, q.End, th.SupportDrop)
+			kept = append(kept, q)
 		}
 
 		peaks = append(peaks, chrPeaks...)
-		qtls = append(qtls, chrQTLs...)
+		qtls = append(qtls, kept...)
 	}
 
 	return peaks, qtls
 }
 
-func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) []PeakIntersection {
+func DetectCompositeZQTLs(smoothed []SmoothedStats, th Thresholds, bsaType string, mergeGap int64, rf *RegionFilter) []PeakIntersection {
 	lodFn := supportLOD(bsaType)
+	dropped := 0
+	defer func() { rf.report("CompositeZ", dropped) }()
 
 	var peaks []PeakIntersection
-	byChr := make(map[string][]int)
-
-	for i := range smoothed {
-		byChr[smoothed[i].CHROM] = append(byChr[smoothed[i].CHROM], i)
-	}
-
-	for _, idx := range byChr {
-		sm := make([]SmoothedStats, len(idx))
-		th := make([]Thresholds, len(idx))
-
-		for i, j := range idx {
-			sm[i] = smoothed[j]
-			th[i] = thresholds[j]
-		}
-
-		if found := findPeaksAtP99(
-			"CompositeZ",
-			sm,
-			th,
-			func(s SmoothedStats) float64 { return s.CompositeZ },
-			func(t Thresholds) float64 { return t.Z.CompositeZP99 },
-			UpperTail,
-		); found != nil {
-			sorted := sortedByPos(sm)
-			merged := mergePeakIntersections(found, mergeGap)
-			for i := range merged {
-				merged[i].Support = supportInChrom(sorted, lodFn, merged[i].Start, merged[i].End, SupportLODDrop)
+	for _, sm := range chromosomes(smoothed) {
+		found := findPeaksAtP99("CompositeZ", sm, th.Z.CompositeZP99,
+			func(s SmoothedStats) float64 { return s.CompositeZ }, UpperTail)
+		for _, p := range mergePeakIntersections(found, mergeGap) {
+			if !rf.Keep(p.Chrom, p.Start, p.End) {
+				dropped++
+				continue
 			}
-			peaks = append(peaks, merged...)
+			p.Support = supportInChrom(sm, lodFn, p.Start, p.End, th.SupportDrop)
+			peaks = append(peaks, p)
 		}
 	}
 

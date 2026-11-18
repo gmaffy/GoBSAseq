@@ -102,8 +102,6 @@ type SmoothedStats struct {
 	CompositeZ float64
 	// max|Z| across all valid statistics (unsigned)
 	MaxAbsZ float64
-
-	thresholds Thresholds
 }
 
 func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
@@ -133,24 +131,26 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 		return nil, err
 	}
 
-	// ── 2. Robust Z-score normalisation (global, across all chroms) ───────
-	normalise(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+	// Z-scores, CompositeZ and MaxAbsZ need the null scales from the
+	// null-genome simulation, so CalculateThresholds fills them (via
+	// normaliseToNull) and writes the smoothed TSV.
+	color.Green("Smoothed %d variants\n", len(smoothed))
+	return smoothed, nil
+}
 
-	// ── 3. Stouffer's Z consolidation ─────────────────────────────────────
-	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
-
-	// ── 4. Write TSV ───────────────────────────────────────────────────────
+// writeSmoothedOutput writes GoBSAseq.<type>.smoothed_and_normalised.tsv.
+func writeSmoothedOutput(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats) error {
+	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 	outDir := filepath.Join(cfg.OutputDir, "stats")
 	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
+		return err
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.smoothed_and_normalised.tsv", bsaType))
 	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk); err != nil {
-		return nil, err
+		return err
 	}
-
 	color.Green("Smoothed & normalised stats written to %s (%d variants)\n", outPath, len(smoothed))
-	return smoothed, nil
+	return nil
 }
 
 // ─── smoothing ─────────────────────────────────────────────────────────────────
@@ -360,118 +360,51 @@ func extractFloat(raw []BSAstats, chromIdx []int, fn func(BSAstats) float64) []f
 
 // ─── normalisation ─────────────────────────────────────────────────────────────
 
-// normalise computes global robust Z-scores for every smoothed statistic.
-// The Z-scores are stored in place (Z* fields of each SmoothedStats).
-func normalise(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+// normaliseToNull fills the Z-score fields with z = (x − median) / scale,
+// where median and scale (1.4826 × MAD) come from simulated null genomes
+// (NullScales, see nullsim.go), then fills CompositeZ and MaxAbsZ. The same
+// fixed transform is applied to every simulated genome, so CompositeZ and
+// its threshold are on the same scale.
+func normaliseToNull(sm []SmoothedStats, sc NullScales, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
 	type field struct {
-		get func(*SmoothedStats) float64
-		set func(*SmoothedStats, float64)
+		track int
+		get   func(*SmoothedStats) float64
+		set   func(*SmoothedStats, float64)
 	}
 	var fields []field
 	if hasHighBulk {
 		fields = append(fields,
-			field{func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }},
+			field{tHighSI, func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }},
 		)
 	}
 	if hasLowBulk {
 		fields = append(fields,
-			field{func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }},
+			field{tLowSI, func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }},
 		)
 	}
 	if hasBothBulks {
 		fields = append(fields,
-			field{func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmLOD }, func(s *SmoothedStats, v float64) { s.ZLOD = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmBBLogBF }, func(s *SmoothedStats, v float64) { s.ZBBLogBF = v }},
+			field{tDeltaSI, func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
+			field{tG, func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
+			field{tED4, func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
+			field{tLOD, func(s *SmoothedStats) float64 { return s.SmLOD }, func(s *SmoothedStats, v float64) { s.ZLOD = v }},
+			field{tBB, func(s *SmoothedStats) float64 { return s.SmBBLogBF }, func(s *SmoothedStats, v float64) { s.ZBBLogBF = v }},
 		)
 	}
 	if hasOneBulk {
 		fields = append(fields,
-			field{func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmOneBulkLOD }, func(s *SmoothedStats, v float64) { s.ZOneBulkLOD = v }},
-			field{func(s *SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(s *SmoothedStats, v float64) { s.ZOneBulkBBLogBF = v }},
+			field{tAFDev, func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
+			field{tG1, func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
+			field{tLOD1, func(s *SmoothedStats) float64 { return s.SmOneBulkLOD }, func(s *SmoothedStats, v float64) { s.ZOneBulkLOD = v }},
+			field{tBB1, func(s *SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(s *SmoothedStats, v float64) { s.ZOneBulkBBLogBF = v }},
 		)
 	}
-
 	for _, f := range fields {
-		vals := make([]float64, len(sm))
 		for i := range sm {
-			vals[i] = f.get(&sm[i])
-		}
-		zs := robustZScores(vals)
-		for i := range sm {
-			f.set(&sm[i], zs[i])
+			f.set(&sm[i], sc[f.track].z(f.get(&sm[i])))
 		}
 	}
-}
-
-// robustZScores returns Z = (x − median) / (1.4826 × MAD) for a slice.
-// When MAD = 0 (all values identical or one outlier drives deviations to zero),
-// falls back to classical Z = (x − mean) / SD.
-// If SD is also 0 (fully constant), returns a zero slice.
-// The 1.4826 factor makes MAD a consistent estimator of σ under normality
-// (Rousseeuw & Croux 1993).
-func robustZScores(vals []float64) []float64 {
-	const consistencyFactor = 1.4826 // MAD → σ consistency factor
-
-	n := len(vals)
-	if n == 0 {
-		return nil
-	}
-
-	med := medianOf(vals)
-	absDeviations := make([]float64, n)
-	for i, v := range vals {
-		absDeviations[i] = math.Abs(v - med)
-	}
-	mad := medianOf(absDeviations) * consistencyFactor
-
-	zs := make([]float64, n)
-	if mad > 0 {
-		for i, v := range vals {
-			zs[i] = math.Round(((v-med)/mad)*1e6) / 1e6
-		}
-		return zs
-	}
-
-	// MAD = 0 fallback: classical Z-score.
-	var mean float64
-	for _, v := range vals {
-		mean += v
-	}
-	mean /= float64(n)
-
-	var variance float64
-	for _, v := range vals {
-		d := v - mean
-		variance += d * d
-	}
-	sd := math.Sqrt(variance / float64(n))
-	if sd == 0 {
-		return zs // all zeros; caller handles this gracefully
-	}
-	for i, v := range vals {
-		zs[i] = math.Round(((v-mean)/sd)*1e6) / 1e6
-	}
-	return zs
-}
-
-// medianOf returns the median of a float64 slice without modifying the original.
-func medianOf(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0
-	}
-	sorted := make([]float64, len(vals))
-	copy(sorted, vals)
-	sort.Float64s(sorted)
-	n := len(sorted)
-	if n%2 == 1 {
-		return sorted[n/2]
-	}
-	return (sorted[n/2-1] + sorted[n/2]) / 2
+	consolidate(sm, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
 }
 
 // ─── consolidation ─────────────────────────────────────────────────────────────

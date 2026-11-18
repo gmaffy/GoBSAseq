@@ -14,8 +14,9 @@ This simulator is independent of GoBSAseq's own null-genome code
 
 Strengths (probability a plant with 0/1/2 low-parent alleles at the QTL
 enters the HIGH bulk; the LOW bulk mirrors it):
-    strong: 1.0 / 0.0  / 0.0   (complete selection on homozygotes)
-    weak:   1.0 / 0.55 / 0.3
+    strong:   1.0 / 0.0  / 0.0   (complete selection on homozygotes)
+    moderate: 1.0 / 0.35 / 0.1
+    weak:     1.0 / 0.55 / 0.3
     none:   no QTL (null genome, for calibration checks)
 """
 import argparse
@@ -23,6 +24,7 @@ import random
 
 STRENGTHS = {
     "strong": [1.0, 0.0, 0.0],
+    "moderate": [1.0, 0.35, 0.1],
     "weak": [1.0, 0.55, 0.3],
     "none": None,
 }

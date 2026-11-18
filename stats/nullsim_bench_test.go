@@ -2,7 +2,9 @@ package stats
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
+	"sort"
 	"testing"
 )
 
@@ -51,9 +53,9 @@ func BenchmarkNullGenome(b *testing.B) {
 	}
 }
 
-// robustZ on (value, count) pairs must be bit-identical to robustZScores on
-// the expanded vector, including ties, even totals and the MAD = 0 fallback.
-func TestWeightedRobustZMatchesExpanded(t *testing.T) {
+// weightedMedian on (value, count) pairs must equal the median of the
+// expanded vector, including ties and even totals.
+func TestWeightedMedianMatchesExpanded(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
 	var s robustZScratch
 	for trial := 0; trial < 300; trial++ {
@@ -62,33 +64,45 @@ func TestWeightedRobustZMatchesExpanded(t *testing.T) {
 		counts := make([]int, n)
 		var expanded []float64
 		for i := range vals {
-			switch trial % 3 {
-			case 0:
+			if trial%2 == 0 {
 				vals[i] = rng.NormFloat64()
-			case 1:
+			} else {
 				vals[i] = float64(rng.Intn(4)) // many ties
-			case 2:
-				vals[i] = 1.5 // constant except one outlier: MAD = 0 fallback
-				if i == 0 {
-					vals[i] = 9
-				}
 			}
 			counts[i] = 1 + rng.Intn(6)
 			for range counts[i] {
 				expanded = append(expanded, vals[i])
 			}
 		}
-		want := robustZScores(expanded)
-		got := s.robustZ(vals, counts, trial%3)
-		k := 0
-		for i := range vals {
-			for range counts[i] {
-				if got[i] != want[k] {
-					t.Fatalf("trial %d: bin %d got %v, want %v", trial, i, got[i], want[k])
-				}
-				k++
-			}
+		sort.Float64s(expanded)
+		m := len(expanded)
+		want := expanded[m/2]
+		if m%2 == 0 {
+			want = (expanded[m/2-1] + expanded[m/2]) / 2
 		}
+		if got := s.weightedMedian(vals, counts, m); got != want {
+			t.Fatalf("trial %d: got %v, want %v", trial, got, want)
+		}
+	}
+}
+
+// Null scales come from QTL-free simulated genomes: ΔSI is centred near 0,
+// and Z-scores of the threshold genomes use the same fixed transform.
+func TestEstimateScales(t *testing.T) {
+	L := syntheticLayout(3, 20_000_000, 20_000)
+	L.brmScale = PopulationVarianceScale("F2")
+	sc := L.estimateScales(50, 1)
+	if m := sc[tDeltaSI].Med; math.Abs(m) > 0.02 {
+		t.Errorf("null median of ΔSI = %v, want ≈ 0", m)
+	}
+	for _, tr := range L.activeTracks() {
+		if !(sc[tr].Scale > 0) {
+			t.Errorf("track %d: scale %v, want > 0", tr, sc[tr].Scale)
+		}
+	}
+	// Same seed → same scales (reproducibility).
+	if again := L.estimateScales(50, 1); again != sc {
+		t.Error("estimateScales is not reproducible for a fixed seed")
 	}
 }
 

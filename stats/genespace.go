@@ -79,9 +79,9 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 	color.Cyan("\n============================= Gene space analysis (%s) ==============================\n", bsaType)
 
 	// ── prerequisite check ───────────────────────────────────────────────────
-	if cfg.SnpEffDB == "" || cfg.GeneDesc == "" || cfg.Prg == "" || cfg.Gff == "" {
+	if cfg.SnpEffDB == "" || cfg.Prg == "" || cfg.Gff == "" {
 		color.Yellow("Skipping gene space analysis: one or more required parameters are missing " +
-			"(SnpEffDB, GeneDesc, Prg, Gff).")
+			"(SnpEffDB, Prg, Gff; gene descriptions are optional).")
 		return nil
 	}
 	if len(intervals) == 0 {
@@ -104,7 +104,7 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 
 	color.Green("Step 1: Annotating variants with SnpEff ...")
 	annotErr, annotatedTsvFiles := annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
-	
+
 	if annotErr != nil {
 		return fmt.Errorf("RunGeneSpace: SnpEff annotation failed: %w", annotErr)
 	}
@@ -132,22 +132,27 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 		chrom, start, stop := iv.geneSpaceRegion()
 		color.Blue("  Interval: %s:%d-%d", chrom, start, stop)
 
-		_, err := genespace.GeneSpace(
-			cfg.Gff,
-			annotatedTsv,
-			chrom,
-			start,
-			stop,
-			resLines,
-			susLines,
-			cfg.GeneDesc,
-			cfg.Prg,
-			outDir,
-		)
+		rows, report, err := genespace.GeneSpace(genespace.Options{
+			GFF:            cfg.Gff,
+			VariantTable:   annotatedTsv,
+			Chrom:          chrom,
+			Start:          start,
+			Stop:           stop,
+			ResLines:       resLines,
+			SusLines:       susLines,
+			DescFile:       cfg.GeneDesc, // optional
+			PrgFile:        cfg.Prg,
+			OutDir:         outDir,
+			Trait:          cfg.GeneSpaceTrait,
+			MinConcordance: cfg.MinConcordance,
+			PromoterLength: cfg.PromoterLength,
+		})
 		if err != nil {
 			// Log and continue rather than aborting the whole run.
 			color.Red("  gene space analysis failed for %s:%d-%d: %v", chrom, start, stop, err)
+			continue
 		}
+		color.Green("  %d gene(s) scored → %s", len(rows), report)
 	}
 
 	color.Green("Gene space analysis complete.")

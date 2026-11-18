@@ -100,8 +100,13 @@ type AnalysisConfig struct {
 	Protein  string
 	Gff      string
 	Cds      string
-	GeneDesc string
-	Prg      string
+	GeneDesc string // optional
+
+	// Gene-space scoring (genome-whisperer genespace.Options).
+	GeneSpaceTrait string  // trait profile, e.g. "disease-resistance"
+	MinConcordance float64 // (0, 1]: genotype concordance for a variant to follow the R/S split
+	PromoterLength int     // bp upstream of a gene attributed to it; 0 disables
+	Prg            string
 
 	Merger             string
 	Caller             string

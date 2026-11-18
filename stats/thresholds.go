@@ -23,6 +23,10 @@ type Thresholds struct {
 	OneBulk OneBulkThresholds
 	Z       ZThresholds
 	BRM     BRMThreshold
+
+	// SupportDrop is the LOD drop (smoothed-LOD units) that ends a support
+	// interval: SupportZDrop × the null LOD scale (see support.go).
+	SupportDrop float64
 }
 
 // BRMThreshold is BRM's genome-wide multiplier: a BRM block is called where
@@ -97,9 +101,9 @@ func countZStats(bsaType string) int {
 // ── Public entry point ───────────────────────────────────────────────────────
 
 // CalculateThresholds derives genome-wide significance thresholds by
-// simulating cfg.Rep null genomes (see nullsim.go) and returns one Thresholds
-// entry per smoothed variant. The values are the same for every variant: they
-// are genome-wide thresholds, not per-position ones.
+// simulating cfg.Rep null genomes (see nullsim.go). They are genome-wide, so
+// one Thresholds value applies to every marker (the thresholds TSV still
+// lists it per marker for convenience).
 //
 // Interpretation: a "P99" threshold is exceeded anywhere in the genome by only
 // 1% of null genomes (genome-wide false-positive rate 1%); "P95" by 5%. Signed
@@ -110,33 +114,34 @@ func CalculateThresholds(
 	bsaType string,
 	raw []BSAstats,
 	smoothed []SmoothedStats,
-) ([]Thresholds, error) {
+) (Thresholds, error) {
+	var none Thresholds
 
 	if len(smoothed) == 0 || len(raw) == 0 {
-		return nil, fmt.Errorf("no data to calculate thresholds from")
+		return none, fmt.Errorf("no data to calculate thresholds from")
 	}
 	if cfg.Rep <= 0 {
-		return nil, fmt.Errorf("--rep must be > 0, got %d", cfg.Rep)
+		return none, fmt.Errorf("--rep must be > 0, got %d", cfg.Rep)
 	}
 	if cfg.WindowSize <= 0 {
-		return nil, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
+		return none, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
 	}
 	p0, err := ExpectedAF(cfg.Population)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine null AF: %w", err)
+		return none, fmt.Errorf("cannot determine null AF: %w", err)
 	}
 	design, err := parseCrossDesign(cfg.Population)
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 
 	hasHigh, hasLow, hasBoth, hasOne := BulkFlags(bsaType)
 	highSize, lowSize, oneSize := bulkSizes(cfg, bsaType)
 	if !(cfg.BrmAlpha > 0 && cfg.BrmAlpha < 1) {
-		return nil, fmt.Errorf("--brm-alpha must be between 0 and 1, got %v", cfg.BrmAlpha)
+		return none, fmt.Errorf("--brm-alpha must be between 0 and 1, got %v", cfg.BrmAlpha)
 	}
 	if (hasHigh && !hasOne && highSize <= 0) || (hasLow && !hasOne && lowSize <= 0) || (hasOne && oneSize <= 0) {
-		return nil, fmt.Errorf("bulk sizes must be > 0 (got high=%d low=%d); set them with --bulk-sizes", highSize, lowSize)
+		return none, fmt.Errorf("bulk sizes must be > 0 (got high=%d low=%d); set them with --bulk-sizes", highSize, lowSize)
 	}
 
 	sigma := float64(cfg.WindowSize) / 2
@@ -149,6 +154,17 @@ func CalculateThresholds(
 	)
 	color.Blue("Null model: %s bulks of %s, %.0f cM per chromosome (assumed), observed marker positions and depths, seed %d",
 		strings.ToUpper(cfg.Population), bulkSizeLabel(hasBoth, highSize, lowSize, oneSize), morgansPerChromosome*100, cfg.Seed)
+
+	// Z-score scales from a separate batch of null genomes; the real data and
+	// every threshold genome are normalised with the same fixed transform.
+	layout.scales, layout.scalesSet = layout.estimateScales(cfg.Rep, cfg.Seed), true
+	normaliseToNull(smoothed, layout.scales, hasHigh, hasLow, hasBoth, hasOne)
+	if err := writeSmoothedOutput(cfg, bsaType, smoothed); err != nil {
+		return none, err
+	}
+	if err := writeNullScalesTSV(filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.null_scales.tsv", bsaType)), layout); err != nil {
+		return none, fmt.Errorf("failed to write null scales TSV: %w", err)
+	}
 
 	ext := simulateNullExtremes(layout, cfg.Rep, cfg.Seed)
 
@@ -214,21 +230,23 @@ func CalculateThresholds(
 		color.Yellow("Note: the BRM threshold (alpha %.3g) rests on %.0f simulated genome(s) in the tail; increase --rep for a stable value.", cfg.BrmAlpha, tail)
 	}
 
-	thresholds := make([]Thresholds, len(smoothed))
-	for i := range thresholds {
-		thresholds[i] = t
+	lodTrack := tLOD
+	if !hasBoth {
+		lodTrack = tLOD1
 	}
-	color.Green("✔ Genome-wide thresholds: CompositeZ P99=%.3f P95=%.3f; BRM u=%.3f (genome-wide alpha %.3g)", czP99, czP95, t.BRM.U, t.BRM.Alpha)
+	t.SupportDrop = SupportZDrop * layout.scales[lodTrack].Scale
+
+	color.Green("✔ Genome-wide thresholds: CompositeZ P99=%.3f P95=%.3f; BRM u=%.3f (genome-wide alpha %.3g); support-interval drop %.3f LOD", czP99, czP95, t.BRM.U, t.BRM.Alpha, t.SupportDrop)
 
 	outDir := filepath.Join(cfg.OutputDir, "stats")
 	if err := writeNullExtremesTSV(filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.null_genome_extremes.tsv", bsaType)), ext, hasBoth, hasOne); err != nil {
-		return thresholds, fmt.Errorf("failed to write null extremes TSV: %w", err)
+		return t, fmt.Errorf("failed to write null extremes TSV: %w", err)
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType))
-	if err := writeThresholdsTSV(outPath, smoothed, thresholds, bsaType); err != nil {
-		return thresholds, fmt.Errorf("failed to write thresholds TSV: %w", err)
+	if err := writeThresholdsTSV(outPath, smoothed, t, bsaType); err != nil {
+		return t, fmt.Errorf("failed to write thresholds TSV: %w", err)
 	}
-	return thresholds, nil
+	return t, nil
 }
 
 func bulkSizeLabel(hasBoth bool, high, low, one int) string {
@@ -251,6 +269,23 @@ func contigLengths(cfg utils.AnalysisConfig) map[string]float64 {
 		}
 	}
 	return out
+}
+
+// writeNullScalesTSV writes the null median and scale used for each Z-score.
+func writeNullScalesTSV(path string, L *nullLayout) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	names := [nTracks]string{
+		tHighSI: "HighSI", tLowSI: "LowSI", tDeltaSI: "DeltaSI", tG: "Gstat", tED4: "ED4",
+		tLOD: "LOD", tBB: "BBLogBF", tAFDev: "AFDev", tG1: "OneBulkGstat", tLOD1: "OneBulkLOD", tBB1: "OneBulkBBLogBF",
+	}
+	var b strings.Builder
+	b.WriteString("Statistic\tNullMedian\tNullScale\n")
+	for _, tr := range L.activeTracks() {
+		fmt.Fprintf(&b, "%s\t%.6g\t%.6g\n", names[tr], L.scales[tr].Med, L.scales[tr].Scale)
+	}
+	return os.WriteFile(path, []byte(b.String()), 0644)
 }
 
 // writeNullExtremesTSV writes the per-genome extremes behind the thresholds,
@@ -300,7 +335,7 @@ func writeNullExtremesTSV(path string, ext []nullExtremes, hasBoth, hasOne bool)
 func writeThresholdsTSV(
 	path string,
 	smoothed []SmoothedStats,
-	thresholds []Thresholds,
+	t Thresholds,
 	bsaType string,
 ) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -353,8 +388,7 @@ func writeThresholdsTSV(
 	// ── rows ─────────────────────────────────────────────────────────────────
 	f4 := func(v float64) string { return fmt.Sprintf("%.4f", v) }
 
-	for i, sm := range smoothed {
-		t := thresholds[i]
+	for _, sm := range smoothed {
 		row := []string{
 			sm.CHROM,
 			fmt.Sprintf("%d", sm.POS),

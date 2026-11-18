@@ -13,13 +13,9 @@ func TestFindPeakIntersectionsUsesLocalThresholds(t *testing.T) {
 		{CHROM: "chr1", POS: 100, SmGstat: 0.1},
 		{CHROM: "chr1", POS: 200, SmGstat: 0.6},
 	}
-	th := []Thresholds{
-		{TwoBulk: TwoBulkThresholds{GstatP99: 0.2}},
-		{TwoBulk: TwoBulkThresholds{GstatP99: 0.8}},
-	}
-	peaks := FindPeakIntersections("Gstat", sm, th,
-		func(s SmoothedStats) float64 { return s.SmGstat },
-		func(t Thresholds) float64 { return t.TwoBulk.GstatP99 }, UpperTail)
+	th := []float64{0.2, 0.8}
+	peaks := FindPeakIntersections("Gstat", sm, func(i int) float64 { return th[i] },
+		func(s SmoothedStats) float64 { return s.SmGstat }, UpperTail)
 	if len(peaks) != 0 {
 		t.Fatalf("expected no peak below its local threshold, got %#v", peaks)
 	}
