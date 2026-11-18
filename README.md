@@ -271,6 +271,29 @@ The drop is **6.5 × the null LOD scale** (the `LOD` row of `*.null_scales.tsv`;
 
 Calibration used 216 simulated F2 datasets (depth 30/60/150×, bulks of 30/50/100, strong to weak QTLs, default window). The interval contained the true QTL in **95%** of them (92–98% per condition), with a median width of 2.3 Mb; a separate held-out set gave 93%. On `Data/sim_F2_strongQTL.vcf.gz` the above-threshold region is 0–30 Mb and the support interval 14.93–15.94 Mb (truth 15.0 Mb). Other crosses and window sizes have not been calibrated.
 
+**Worked example** (`Data/sim_F2_strongQTL.vcf.gz`, chr2, true QTL at 15.0 Mb):
+
+1. **Peak.** The highest smoothed LOD in the called region is 32.817, at 15,436,548.
+2. **Drop.** The null LOD scale is 0.0879 (`*.null_scales.tsv`), so the drop is 6.5 × 0.0879 = 0.571 LOD (printed as `support-interval drop 0.571 LOD`).
+3. **Floor.** 32.817 − 0.571 = 32.246.
+4. **Walk outwards.** From the peak, move marker by marker in each direction and stop at the last marker whose LOD is still ≥ 32.246. On the left that is 14,929,613 (LOD 32.254); the next marker, 14,916,794, is at 32.225, below the floor. On the right it is 15,942,346.
+5. **Result.** Support interval 14,929,613–15,942,346 (1.0 Mb), containing the true position; the above-threshold region was the whole chromosome.
+
+**How to read it.** Treat the support interval roughly as a **95% interval for the QTL position**: in about 1 case in 20 the true position lies just outside it. Its width reflects how sharply the signal peaks, so strong QTLs give narrow intervals (about 1 Mb in the simulations) and weak QTLs wide ones (several Mb). The interval is centred on the LOD peak, which can differ slightly from the CompositeZ or BRM peak positions also reported.
+
+### Reading the plots
+
+Each chart (individual statistics, Z-score overlay, composite signal) shows one chromosome:
+
+| Element | Meaning |
+|---------|---------|
+| Solid line | The smoothed statistic (or CompositeZ) along the chromosome |
+| Dashed red / orange horizontal lines | Genome-wide **P99** / **P95** thresholds; a QTL is called where the line crosses P99 |
+| **Amber** band | **BRM block**: region where Block Regression Mapping finds the allele-frequency difference significant. Like the above-threshold region, it can span most of a chromosome; it says *that* the chromosome carries a QTL |
+| **Red** band, labelled `QTL <start>–<end> Mb` | **Support interval** from the final QTL table: *where* the QTL most likely is (≈95% interval, see above). Gene-space analysis uses this interval |
+
+Red is drawn on top of amber. A strong QTL typically looks like a wide amber band with a narrow red band at the peak. Red without amber means CompositeZ called the QTL but BRM did not. The slider under each chart zooms into a region, and hovering shows values (★ marks points above P99, ● above P95; values below the lower thresholds are not marked).
+
 ---
 
 ## Test Data
