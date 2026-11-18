@@ -67,14 +67,13 @@ func sampleIndexByName(sampleMap map[int]string, name string) (int, bool) {
 	return 0, false
 }
 
-// geneSpaceParamCount is the number of parameters missingGeneSpaceParams checks.
-// Gene descriptions (--gene-descriptions) are optional.
-const geneSpaceParamCount = 3
-
 func missingGeneSpaceParams(cfg *utils.AnalysisConfig) []string {
 	var missing []string
 	if cfg.SnpEffDB == "" {
 		missing = append(missing, "SnpEffDB")
+	}
+	if cfg.GeneDesc == "" {
+		missing = append(missing, "GeneDesc")
 	}
 	if cfg.Prg == "" {
 		missing = append(missing, "Prg")
@@ -295,7 +294,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 4/10: Calculating thresholds ...\n")
 
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
-	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats, smoothedStats)
+	thresholds, err := stats.CalculateThresholds(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
@@ -305,7 +304,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 5/10: Calculating BRM blocks ...\n")
 
 	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
-	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats, thresholds, stats.NewRegionFilter(*cfg, smoothedStats))
+	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
 	if err != nil {
 		return err
 	}
@@ -321,9 +320,8 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	}
 
 	mergeGap := cfg.EffectiveMergeDistance()
-	regionFilter := stats.NewRegionFilter(*cfg, smoothedStats)
 
-	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, mergeGap, regionFilter)
+	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, mergeGap)
 	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing individual QTLs to Excel: %v\n", err)
@@ -335,7 +333,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
 
-	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype, mergeGap, regionFilter)
+	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype, mergeGap)
 	err = stats.WriteCompositeZQTLsToExcel(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing composite Z QTLs to Excel: %v\n", err)
@@ -354,20 +352,13 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 		return err
 	}
 	color.Green("Merged intervals: %d", len(merged))
-	for _, m := range merged {
-		if m.Support.Valid() {
-			fmt.Printf("  %s: QTL support interval %.2f–%.2f Mb (LOD peak %.2f Mb); above-threshold region %.2f–%.2f Mb\n",
-				m.Chrom, float64(m.Support.Start)/1e6, float64(m.Support.End)/1e6, float64(m.Support.PeakPos)/1e6,
-				float64(m.Start)/1e6, float64(m.Stop)/1e6)
-		}
-	}
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
 	color.Cyan("STEP 9/10: Plotting ...\n")
 
 	// ------------------------------------------------ Plots ------------------------------------------------------- //
-	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks, merged); err != nil {
+	if err := plots.GeneratePlots(*cfg, btype, smoothedStats, thresholds, brmBlocks); err != nil {
 		color.Red("Error generating plots: %v", err)
 		return err
 	}
@@ -448,26 +439,23 @@ func GetBamName(bam string) (string, error) {
 
 func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 	// =========================================== Gene Space Check ================================================= //
-	// Non-interactive so the pipeline runs unattended (batch/HPC/CI). Supplying
-	// none of the gene-space parameters means "skip it"; supplying only some is
-	// almost certainly a configuration mistake, so fail fast before the long run.
 	if missing := missingGeneSpaceParams(cfg); len(missing) > 0 {
-		if len(missing) == geneSpaceParamCount {
-			color.Yellow("Gene space analysis not configured (--snpEffDB, --prg, --gff; --gene-descriptions optional); it will be skipped.")
-		} else {
-			return fmt.Errorf("incomplete gene space parameters, missing: %s (supply all of them, or none to skip gene space analysis)", strings.Join(missing, ", "))
+		color.Yellow("Gene space analysis parameters missing: %s", strings.Join(missing, ", "))
+		color.Blue("Continue without gene space analysis? [y/N]: ")
+		var answer string
+		if _, err := fmt.Scan(&answer); err != nil {
+			return err
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+			color.Yellow("Continuing without gene space analysis.")
+
+		default:
+
+			return fmt.Errorf("missing gene space parameters: %s", strings.Join(missing, ", "))
 		}
 	} else {
-		gsFiles := []string{cfg.Gff, cfg.Prg}
-		if cfg.GeneDesc != "" {
-			gsFiles = append(gsFiles, cfg.GeneDesc)
-		}
-		if !(cfg.MinConcordance > 0 && cfg.MinConcordance <= 1) {
-			return fmt.Errorf("--min-concordance must be in (0, 1], got %g", cfg.MinConcordance)
-		}
-		if cfg.PromoterLength < 0 {
-			return fmt.Errorf("--promoter-length must be >= 0, got %d", cfg.PromoterLength)
-		}
+		gsFiles := []string{cfg.Gff, cfg.GeneDesc, cfg.Prg}
 
 		for _, gsFile := range gsFiles {
 			if !filePathExists(gsFile) {
@@ -512,37 +500,11 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 
 			return fmt.Errorf("failed to create vcfs directory: %w", err)
 		}
+		logFile := filepath.Join(cfg.OutputDir, "vcfs", "variant_calling.log")
+
 		// ----------------------------------------- Run variant calling ------------------------------------------- //
-		// genome-whisperer's RunPipeline: gVCFs → joint genotyping → hard filter.
-		// Species and RefVer only label output files here (they matter for
-		// genome-whisperer's data-directory mode), but must be non-empty.
-		species := cfg.SnpEffDB
-		if species == "" {
-			species = "bsaseq"
-		}
-		refVer := strings.TrimSuffix(filepath.Base(cfg.Ref), filepath.Ext(cfg.Ref))
-		if refVer == "" || refVer == "." {
-			refVer = "ref"
-		}
-		vcfFile, err := variants.RunPipeline(variants.Options{
-			Bams:         bams,
-			OutDir:       vcDir,
-			Species:      species,
-			RefVer:       refVer,
-			RefFasta:     cfg.Ref,
-			Caller:       cfg.Caller,
-			Merger:       cfg.Merger,
-			DVVer:        cfg.DeepVariantVersion,
-			ModelType:    cfg.ModelType,
-			GatkLogLevel: "WARNING",
-			Threads:      cfg.Threads,
-			Verbose:      cfg.Verbose,
-			NoMerging:    cfg.NoMerging,
-			// GQ is not applied to bulks (it is correlated with allele
-			// frequency); GoBSAseq applies --min-GQ to parents itself.
-			MinGQ:      0,
-			HardFilter: utils2.HardFilterConfig(hf),
-		})
+		//threads, _ := strconv.Atoi(cfg.Threads)
+		vcfFile, err := variants.VariantCalling(bams, cfg.Ref, cfg.SnpEffDB, cfg.SnpEffDB, vcDir, cfg.Caller, cfg.Merger, false, false, utils2.HardFilterConfig(hf), cfg.Verbose, "WARNING", cfg.Threads, logFile, cfg.DeepVariantVersion, cfg.ModelType) //(cfg.Ref, bams, vcDir, cfg.SnpEffDB, 8, "INFO", cfg.Caller, cfg.Merger, logFile, cfg.DeepVariantVersion, cfg.ModelType, true, cfg.NoMerging)
 		if err != nil {
 			fmt.Printf("variant calling failed: %v\n", err)
 			// wrap and return the error so the caller receives context

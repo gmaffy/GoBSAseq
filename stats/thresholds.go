@@ -1,19 +1,25 @@
 package stats
 
 import (
-	"bufio"
 	"encoding/csv"
 	"fmt"
-	"hash/fnv"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"github.com/schollz/progressbar/v3"
+	"golang.org/x/sync/singleflight"
 	"gonum.org/v1/gonum/stat"
+	"gonum.org/v1/gonum/stat/distuv"
 )
 
 // ── Threshold structs ────────────────────────────────────────────────────────
@@ -22,19 +28,6 @@ type Thresholds struct {
 	TwoBulk TwoBulkThresholds
 	OneBulk OneBulkThresholds
 	Z       ZThresholds
-	BRM     BRMThreshold
-
-	// SupportDrop is the LOD drop (smoothed-LOD units) that ends a support
-	// interval: SupportZDrop × the null LOD scale (see support.go).
-	SupportDrop float64
-}
-
-// BRMThreshold is BRM's genome-wide multiplier: a BRM block is called where
-// |ΔSI| (or |SI − p0|) ≥ U·σ (see "BRM significance" in brm.go). U is the
-// (1 − Alpha) quantile of the per-genome maximum of |ΔSI|/σ in null genomes.
-type BRMThreshold struct {
-	U     float64
-	Alpha float64
 }
 
 type TwoBulkThresholds struct {
@@ -65,13 +58,637 @@ type ZThresholds struct {
 	NumStats                     int
 }
 
-// deriveSeed deterministically mixes a base seed with a simulation's identity
-// (its parameter key), so every simulation gets a distinct but reproducible
-// RNG stream no matter which goroutine runs it or in what order.
-func deriveSeed(base int64, key string) int64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(key))
-	return base ^ int64(h.Sum64())
+// ── Simulation parameters ────────────────────────────────────────────────────
+
+// simParams bundles the inputs to a single null simulation run.
+type simParams struct {
+	highDepth int
+	lowDepth  int     // == highDepth for two-bulk with shared depth
+	p0High    float64 // expected AF in high bulk under H₀
+	p0Low     float64 // expected AF in low bulk under H₀ (usually == p0High)
+	p0One     float64 // expected AF for one-bulk mode
+	rep       int
+	// Bulk sizes for more accurate null model (finite population sampling)
+	highBulkSize int
+	lowBulkSize  int
+	oneBulkSize  int
+	population   string
+}
+
+// ── Module-level caches ──────────────────────────────────────────────────────
+
+var (
+	twoBulkCache  sync.Map
+	oneBulkCache  sync.Map
+	twoBulkFlight singleflight.Group
+	oneBulkFlight singleflight.Group
+
+	// globalSeedCounter ensures each goroutine gets a unique RNG seed even
+	// when multiple goroutines start within the same nanosecond.
+	globalSeedCounter atomic.Int64
+)
+
+func nextSeed() int64 {
+	return globalSeedCounter.Add(1)
+}
+
+// samplePoolAF samples the allele frequency carried by a pool of individuals.
+// It models diploid genotype dosage, rather than treating each individual as a
+// single allele draw. F2/F3/F4 are successive selfing generations from an F1;
+// RIL is the fully fixed limit. BCnH/L are recurrent-parent backcrosses.
+func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) float64 {
+	if bulkSize <= 0 {
+		return p0
+	}
+	p := strings.ToUpper(strings.TrimSpace(population))
+	selfGenerations := map[string]int{"F2": 1, "F3": 2, "F4": 3}
+	if g, ok := selfGenerations[p]; ok || p == "RIL" {
+		het := 0.0
+		if p != "RIL" {
+			het = math.Pow(0.5, float64(g))
+		}
+		pHom := (1 - het) / 2
+		copies := 0
+		for range bulkSize {
+			u := rng.Float64()
+			switch {
+			case u < pHom:
+				copies += 0
+			case u < pHom+het:
+				copies++
+			default:
+				copies += 2
+			}
+		}
+		return float64(copies) / float64(2*bulkSize)
+	}
+	if strings.HasPrefix(p, "BC") {
+		suffix := p[2:]
+		isHigh := strings.HasSuffix(suffix, "H")
+		suffix = strings.TrimSuffix(strings.TrimSuffix(suffix, "H"), "L")
+		suffix = strings.TrimSuffix(suffix, "F2")
+		n, err := strconv.Atoi(suffix)
+		if err == nil && n >= 1 {
+			het := int(distuv.Binomial{N: float64(bulkSize), P: math.Pow(0.5, float64(n)), Src: rng}.Rand())
+			copies := het
+			if isHigh {
+				copies = 2*bulkSize - het
+			}
+			return float64(copies) / float64(2*bulkSize)
+		}
+	}
+	// Unknown structures are rejected by ExpectedAF before this point. Keep a
+	// conservative diploid fallback for callers that use this helper directly.
+	copies := int(distuv.Binomial{N: float64(2 * bulkSize), P: p0, Src: rng}.Rand())
+	return float64(copies) / float64(2*bulkSize)
+}
+
+// ── Two-bulk simulation ──────────────────────────────────────────────────────
+
+// simulateTwoBulk runs rep draws from a two-stage null model for both bulks:
+// Stage 1: Sample genotype dosage in each bulk population according to the
+// selected cross. This represents the realised allele frequency among the
+// actual diploid individuals in the bulk.
+//
+// Stage 2: Sample the observed reads from that realized frequency
+//
+//	(Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+// This two-stage model is more biologically accurate for deep sequencing because it
+// accounts for the finite population of individuals in each bulk, rather than
+// assuming reads are drawn directly from the expected population frequency p0.
+func simulateTwoBulk(p simParams) TwoBulkThresholds {
+	if p.highDepth <= 0 || p.lowDepth <= 0 || p.rep <= 0 {
+		return TwoBulkThresholds{}
+	}
+
+	rng := rand.New(rand.NewSource(nextSeed()))
+
+	// Use bulk sizes if provided, otherwise fall back to depth (for backwards compatibility)
+	highBulkSize := p.highBulkSize
+	lowBulkSize := p.lowBulkSize
+	if highBulkSize <= 0 {
+		highBulkSize = p.highDepth // fallback: assume each read is from a different individual
+	}
+	if lowBulkSize <= 0 {
+		lowBulkSize = p.lowDepth
+	}
+
+	hSIArr := make([]float64, p.rep)
+	lSIArr := make([]float64, p.rep)
+	dsiArr := make([]float64, p.rep)
+	gsArr := make([]float64, p.rep)
+	edArr := make([]float64, p.rep)
+	lodArr := make([]float64, p.rep)
+	bbArr := make([]float64, p.rep)
+
+	for i := 0; i < p.rep; i++ {
+		// Stage 1: realised diploid genotype dosage in each pool.
+		realizedHighAF := samplePoolAF(rng, p.population, highBulkSize, p.p0High)
+		realizedLowAF := samplePoolAF(rng, p.population, lowBulkSize, p.p0Low)
+
+		// Stage 2: Sample observed reads from the realized allele frequencies
+		// High bulk reads
+		distHighReads := distuv.Binomial{N: float64(p.highDepth), P: realizedHighAF, Src: rng}
+		hAlt := distHighReads.Rand()
+		hRef := float64(p.highDepth) - hAlt
+
+		// Low bulk reads
+		distLowReads := distuv.Binomial{N: float64(p.lowDepth), P: realizedLowAF, Src: rng}
+		lAlt := distLowReads.Rand()
+		lRef := float64(p.lowDepth) - lAlt
+
+		hSI := hAlt / float64(p.highDepth)
+		lSI := lAlt / float64(p.lowDepth)
+
+		hSIArr[i] = hSI
+		lSIArr[i] = lSI
+		dsiArr[i] = hSI - lSI
+		gsArr[i] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
+		edArr[i] = euclideanDistance4(hSI, lSI)
+		lodArr[i] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
+		bbArr[i] = betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))
+	}
+
+	sort.Float64s(hSIArr)
+	sort.Float64s(lSIArr)
+	sort.Float64s(dsiArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(edArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
+	}
+
+	return TwoBulkThresholds{
+		HighSIP99: q(hSIArr, 0.995), HighSIP95: q(hSIArr, 0.95),
+		HighSIMp99: q(hSIArr, 0.005), HighSIMp95: q(hSIArr, 0.05),
+
+		LowSIP99: q(lSIArr, 0.995), LowSIP95: q(lSIArr, 0.95),
+		LowSIMp99: q(lSIArr, 0.005), LowSIMp95: q(lSIArr, 0.05),
+
+		DeltaSIP99: q(dsiArr, 0.995), DeltaSIP95: q(dsiArr, 0.95),
+		DeltaSIMp99: q(dsiArr, 0.005), DeltaSIMp95: q(dsiArr, 0.05),
+
+		GstatP99: q(gsArr, 0.995), GstatP95: q(gsArr, 0.95),
+		ED4P99: q(edArr, 0.995), ED4P95: q(edArr, 0.95),
+		LODP99: q(lodArr, 0.995), LODP95: q(lodArr, 0.95),
+		BBLogBFP99: q(bbArr, 0.995), BBLogBFP95: q(bbArr, 0.95),
+	}
+}
+
+// twoBulkCacheKey builds a deterministic string key for the memo cache.
+func twoBulkCacheKey(p simParams) string {
+	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d_%s",
+		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize,
+		strings.ToUpper(strings.TrimSpace(p.population)))
+}
+
+// simulateTwoBulkCached returns cached results or runs the simulation once.
+func simulateTwoBulkCached(p simParams) TwoBulkThresholds {
+	key := twoBulkCacheKey(p)
+	if v, ok := twoBulkCache.Load(key); ok {
+		return v.(TwoBulkThresholds)
+	}
+	v, _, _ := twoBulkFlight.Do(key, func() (interface{}, error) {
+		t := simulateTwoBulk(p)
+		twoBulkCache.Store(key, t)
+		return t, nil
+	})
+	return v.(TwoBulkThresholds)
+}
+
+// ── One-bulk simulation ──────────────────────────────────────────────────────
+
+// simulateOneBulk runs rep draws from a two-stage null model for a single bulk:
+// Stage 1: Sample genotype dosage in the bulk population according to the
+// selected cross. This represents the realised allele frequency among the
+// actual diploid individuals in the bulk.
+//
+// Stage 2: Sample the observed reads from that realized frequency
+//
+//	(Binomial(n=depth, p=realized_af)) - this represents the sequencing observation.
+//
+// This two-stage model is more biologically accurate for deep sequencing because it
+// accounts for the finite population of individuals in the bulk, rather than
+// assuming reads are drawn directly from the expected population frequency p0.
+func simulateOneBulk(p simParams) OneBulkThresholds {
+	if p.highDepth <= 0 || p.p0One <= 0 || p.p0One >= 1 || p.rep <= 0 {
+		return OneBulkThresholds{}
+	}
+
+	rng := rand.New(rand.NewSource(nextSeed()))
+
+	// Use bulk size if provided, otherwise fall back to depth (for backwards compatibility)
+	bulkSize := p.oneBulkSize
+	if bulkSize <= 0 {
+		bulkSize = p.highDepth // fallback: assume each read is from a different individual
+	}
+
+	afDevArr := make([]float64, p.rep)
+	gsArr := make([]float64, p.rep)
+	lodArr := make([]float64, p.rep)
+	bbArr := make([]float64, p.rep)
+
+	for i := 0; i < p.rep; i++ {
+		// Stage 1: realised diploid genotype dosage in the pool.
+		realizedAF := samplePoolAF(rng, p.population, bulkSize, p.p0One)
+
+		// Stage 2: Sample observed reads from the realized allele frequency
+		distReads := distuv.Binomial{N: float64(p.highDepth), P: realizedAF, Src: rng}
+		altF := distReads.Rand()
+		alt := int(altF)
+		ref := p.highDepth - alt
+		si := altF / float64(p.highDepth)
+
+		afDevArr[i] = si - p.p0One
+		gsArr[i] = oneBulkGStatistic(alt, ref, p.p0One)
+		lodArr[i] = oneBulkLOD(alt, ref, p.p0One)
+		bbArr[i] = oneBulkBetaBinomialLogBF(alt, ref, p.p0One)
+	}
+
+	sort.Float64s(afDevArr)
+	sort.Float64s(gsArr)
+	sort.Float64s(lodArr)
+	sort.Float64s(bbArr)
+
+	q := func(arr []float64, p float64) float64 {
+		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
+	}
+
+	return OneBulkThresholds{
+		AFDevP99: q(afDevArr, 0.995), AFDevP95: q(afDevArr, 0.95),
+		AFDevMp99: q(afDevArr, 0.005), AFDevMp95: q(afDevArr, 0.05),
+		OneBulkGstatP99: q(gsArr, 0.995), OneBulkGstatP95: q(gsArr, 0.95),
+		OneBulkLODP99: q(lodArr, 0.995), OneBulkLODP95: q(lodArr, 0.95),
+		OneBulkBBLogBFP99: q(bbArr, 0.995), OneBulkBBLogBFP95: q(bbArr, 0.95),
+	}
+}
+
+// oneBulkCacheKey builds a deterministic string key for the one-bulk cache.
+func oneBulkCacheKey(p simParams) string {
+	return fmt.Sprintf("%d_%.6f_%d_%d_%d_%d", p.highDepth, p.p0One, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize)
+}
+
+// simulateOneBulkCached returns cached results or runs the simulation once.
+func simulateOneBulkCached(p simParams) OneBulkThresholds {
+	key := oneBulkCacheKey(p)
+	if v, ok := oneBulkCache.Load(key); ok {
+		return v.(OneBulkThresholds)
+	}
+	v, _, _ := oneBulkFlight.Do(key, func() (interface{}, error) {
+		t := simulateOneBulk(p)
+		oneBulkCache.Store(key, t)
+		return t, nil
+	})
+	return v.(OneBulkThresholds)
+}
+
+// ── Empirical Z thresholds ───────────────────────────────────────────────────
+
+// empiricalZThresholds is the fallback used when calculateEmpiricalCompositeZThresholds
+// fails.  It uses standard-normal quantiles (2.576 / 1.960), which are a
+// reasonable approximation for high-depth, F2/RIL populations.  The primary
+// path always runs the full Monte Carlo simulation.
+func empiricalZThresholds(bsaType string) ZThresholds {
+	numStats := countZStats(bsaType)
+	return ZThresholds{
+		ZP99: 2.576, ZP95: 1.960,
+		CompositeZP99: 2.576, CompositeZP95: 1.960,
+		NumStats: numStats,
+	}
+}
+
+// ── Empirical CompositeZ thresholds from Monte Carlo simulation ──────────────
+
+// compositeZSimParams bundles parameters for CompositeZ null simulation.
+// All fields are used by the two-stage pipeline null simulation.
+type compositeZSimParams struct {
+	// repDepth is the representative sequencing depth used for null read sampling.
+	repDepth int
+	// highBulkSize / lowBulkSize / oneBulkSize are the number of individuals in
+	// each pool; they determine the between-individual variance added in Stage 1.
+	highBulkSize int
+	lowBulkSize  int
+	oneBulkSize  int
+	// p0 is the expected null allele frequency for the population structure.
+	p0 float64
+	// hasBothBulks / hasOneBulk mirror the bsaType flags.
+	hasBothBulks bool
+	hasOneBulk   bool
+	// numStats is the number of Z-scores combined into CompositeZ (k).
+	numStats int
+	// rep is the number of Monte Carlo draws.
+	rep        int
+	population string
+}
+
+// medianOfAbsDeviations computes MAD (median absolute deviation from median).
+func medianOfAbsDeviations(vals []float64, med float64) float64 {
+	absDevs := make([]float64, len(vals))
+	for i, v := range vals {
+		absDevs[i] = math.Abs(v - med)
+	}
+	return medianOf(absDevs)
+}
+
+// robustZNormCols normalises each column of a rep×k matrix in-place using the
+// same (median, 1.4826·MAD) estimator applied genome-wide in normalise().
+// This mimics the genome-wide MAD step so the simulated CompositeZ null matches
+// the scale of the real CompositeZ track.
+func robustZNormCols(mat []float64, rep, k int) {
+	const cf = 1.4826
+	col := make([]float64, rep)
+	for j := 0; j < k; j++ {
+		for i := 0; i < rep; i++ {
+			col[i] = mat[i*k+j]
+		}
+		med := medianOf(col)
+		mad := medianOfAbsDeviations(col, med) * cf
+		if mad == 0 {
+			// MAD=0 fallback: classical SD
+			var mean, ss float64
+			for _, v := range col {
+				mean += v
+			}
+			mean /= float64(rep)
+			for _, v := range col {
+				d := v - mean
+				ss += d * d
+			}
+			mad = math.Sqrt(ss/float64(rep)) * cf // use cf-scaled SD as proxy
+			if mad == 0 {
+				continue
+			}
+		}
+		for i := 0; i < rep; i++ {
+			mat[i*k+j] = (mat[i*k+j] - med) / mad
+		}
+	}
+}
+
+// simulateNullCompositeZTwoBulk generates the empirical null distribution of
+// CompositeZ for two-bulk experiments by running the full pipeline null:
+//
+//  1. Stage 1 — population sampling:
+//     hAF ~ population-specific genotype sampling(highBulkSize)
+//     lAF ~ population-specific genotype sampling(lowBulkSize)
+//
+//  2. Stage 2 — sequencing sampling:
+//     obs_hAlt ~ Binomial(repDepth, hAF)
+//     obs_lAlt ~ Binomial(repDepth, lAF)
+//
+//  3. Compute the same raw statistics (ΔSI, G-stat, ED⁴, LOD, BB log-BF, HighSI,
+//     LowSI) that the real pipeline computes from the same counts.
+//
+//  4. Robust-Z normalise each statistic column across all reps, mirroring the
+//     genome-wide normalise() step.
+//
+//  5. Combine: CompositeZ = Σ Zᵢ / √k.
+//
+// Because the statistics are derived from the same two allele-count vectors they
+// are strongly correlated; the resulting null distribution captures that
+// correlation and is therefore better calibrated than naïve N(0,1) Stouffer.
+func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
+	if p.repDepth <= 0 || p.highBulkSize <= 0 || p.lowBulkSize <= 0 || p.rep <= 0 {
+		return nil
+	}
+
+	rng := rand.New(rand.NewSource(nextSeed()))
+	k := p.numStats
+	mat := make([]float64, p.rep*k) // row-major: mat[i*k+j] = rep i, stat j
+
+	for i := 0; i < p.rep; i++ {
+		// Stage 1: realised allele frequencies in the two pools.
+		realHAF := samplePoolAF(rng, p.population, p.highBulkSize, p.p0)
+		realLAF := samplePoolAF(rng, p.population, p.lowBulkSize, p.p0)
+		// Guard boundary values so Stage 2 Binomial is valid.
+		if realHAF <= 0 {
+			realHAF = 0
+		}
+		if realHAF >= 1 {
+			realHAF = 1
+		}
+		if realLAF <= 0 {
+			realLAF = 0
+		}
+		if realLAF >= 1 {
+			realLAF = 1
+		}
+
+		// Stage 2: observed read counts.
+		distRH := distuv.Binomial{N: float64(p.repDepth), P: realHAF, Src: rng}
+		distRL := distuv.Binomial{N: float64(p.repDepth), P: realLAF, Src: rng}
+		hAlt := distRH.Rand()
+		lAlt := distRL.Rand()
+		hRef := float64(p.repDepth) - hAlt
+		lRef := float64(p.repDepth) - lAlt
+
+		hSI := hAlt / float64(p.repDepth)
+		lSI := lAlt / float64(p.repDepth)
+
+		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
+		//   col 0: |DeltaSI|  (|ZDeltaSI|) — absolute value mirrors consolidate()
+		//   col 1: Gstat      (ZGstat)
+		//   col 2: LOD        (ZLOD)
+		// Using |DeltaSI| ensures all three components are non-negative, producing
+		// a symmetric null so a single upper-tail threshold is correct and complete.
+		mat[i*k+0] = math.Abs(hSI - lSI)
+		mat[i*k+1] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
+		mat[i*k+2] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
+	}
+
+	// Step 4: robust-Z normalise columns (mirrors genome-wide normalise()).
+	robustZNormCols(mat, p.rep, k)
+
+	// Step 5: Stouffer combine.
+	nullCompositeZ := make([]float64, p.rep)
+	sqrtK := math.Sqrt(float64(k))
+	for i := 0; i < p.rep; i++ {
+		sum := 0.0
+		for j := 0; j < k; j++ {
+			sum += mat[i*k+j]
+		}
+		nullCompositeZ[i] = sum / sqrtK
+	}
+	return nullCompositeZ
+}
+
+// simulateNullCompositeZOneBulk generates the empirical null distribution of
+// CompositeZ for one-bulk experiments using the same two-stage pipeline null
+// approach as simulateNullCompositeZTwoBulk.
+//
+// Statistics computed (k=3, matching consolidate() and countZStats()):
+//
+//	[AFDev, OneBulkGstat, OneBulkLOD]
+//
+// OneBulkBBLogBF and any leading SI column are excluded from CompositeZ in
+// consolidate() and are therefore not simulated here.
+func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
+	bulkSize := p.oneBulkSize
+	if bulkSize <= 0 {
+		bulkSize = p.highBulkSize
+	}
+	if p.repDepth <= 0 || bulkSize <= 0 || p.rep <= 0 {
+		return nil
+	}
+
+	rng := rand.New(rand.NewSource(nextSeed()))
+	k := p.numStats
+	mat := make([]float64, p.rep*k)
+
+	for i := 0; i < p.rep; i++ {
+		// Stage 1: realised allele frequency in the pool.
+		realAF := samplePoolAF(rng, p.population, bulkSize, p.p0)
+		if realAF <= 0 {
+			realAF = 0
+		}
+		if realAF >= 1 {
+			realAF = 1
+		}
+
+		// Stage 2: observed reads.
+		distR := distuv.Binomial{N: float64(p.repDepth), P: realAF, Src: rng}
+		altF := distR.Rand()
+		alt := int(altF)
+		ref := p.repDepth - alt
+		si := altF / float64(p.repDepth)
+
+		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
+		//   col 0: |AFDev|       (|ZAFDev|) — absolute value mirrors consolidate()
+		//   col 1: OneBulkGstat  (ZOneBulkG)
+		//   col 2: OneBulkLOD    (ZOneBulkLOD)
+		// Using |AFDev| ensures all three components are non-negative, producing
+		// a symmetric null so a single upper-tail threshold is correct and complete.
+		mat[i*k+0] = math.Abs(si - p.p0) // |AFDev|
+		mat[i*k+1] = oneBulkGStatistic(alt, ref, p.p0)
+		mat[i*k+2] = oneBulkLOD(alt, ref, p.p0)
+	}
+
+	// Robust-Z normalise and Stouffer combine.
+	robustZNormCols(mat, p.rep, k)
+
+	nullCompositeZ := make([]float64, p.rep)
+	sqrtK := math.Sqrt(float64(k))
+	for i := 0; i < p.rep; i++ {
+		sum := 0.0
+		for j := 0; j < k; j++ {
+			sum += mat[i*k+j]
+		}
+		nullCompositeZ[i] = sum / sqrtK
+	}
+	return nullCompositeZ
+}
+
+// calculateEmpiricalCompositeZThresholds computes empirical CompositeZ thresholds
+// by running the full two-stage pipeline null through simulateNullCompositeZTwoBulk
+// or simulateNullCompositeZOneBulk.  Both the upper and lower tails are derived
+// directly from the simulated distribution so they are valid even for asymmetric
+// nulls (e.g. backcross populations where p0 ≠ 0.5).
+func calculateEmpiricalCompositeZThresholds(
+	cfg utils.AnalysisConfig,
+	bsaType string,
+	smoothed []SmoothedStats,
+	rep int,
+) (ZThresholds, error) {
+	if len(smoothed) == 0 {
+		return ZThresholds{}, fmt.Errorf("no smoothed data")
+	}
+	if rep <= 0 {
+		rep = cfg.Rep
+		if rep <= 0 {
+			rep = 1000
+		}
+	}
+
+	// Null allele frequency for the mapping population.
+	p0, err := ExpectedAF(cfg.Population)
+	if err != nil {
+		return ZThresholds{}, fmt.Errorf("cannot determine null AF: %w", err)
+	}
+
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+	numStats := countZStats(bsaType)
+
+	// Bulk sizes — fall back to 100 if not configured.
+	highBulkSize := cfg.HighBulkSize
+	lowBulkSize := cfg.LowBulkSize
+	oneBulkSize := cfg.OneBulkSize
+	if highBulkSize <= 0 {
+		highBulkSize = 100
+	}
+	if lowBulkSize <= 0 {
+		lowBulkSize = 100
+	}
+	if oneBulkSize <= 0 {
+		oneBulkSize = highBulkSize
+	}
+
+	// Representative sequencing depth: use the median across all smoothed variants.
+	repDepth := 100
+	if len(smoothed) > 0 {
+		depths := make([]int, len(smoothed))
+		for i, s := range smoothed {
+			depths[i] = s.Depth
+		}
+		sort.Ints(depths)
+		repDepth = depths[len(depths)/2]
+	}
+
+	var allNullCompositeZ []float64
+
+	if hasBothBulks {
+		params := compositeZSimParams{
+			repDepth:     repDepth,
+			highBulkSize: highBulkSize,
+			lowBulkSize:  lowBulkSize,
+			oneBulkSize:  oneBulkSize,
+			p0:           p0,
+			population:   cfg.Population,
+			hasBothBulks: true,
+			hasOneBulk:   false,
+			numStats:     numStats,
+			rep:          rep,
+		}
+		allNullCompositeZ = simulateNullCompositeZTwoBulk(params)
+	} else if hasOneBulk {
+		params := compositeZSimParams{
+			repDepth:     repDepth,
+			highBulkSize: highBulkSize,
+			lowBulkSize:  lowBulkSize,
+			oneBulkSize:  oneBulkSize,
+			p0:           p0,
+			population:   cfg.Population,
+			hasBothBulks: false,
+			hasOneBulk:   true,
+			numStats:     numStats,
+			rep:          rep,
+		}
+		allNullCompositeZ = simulateNullCompositeZOneBulk(params)
+	}
+
+	if len(allNullCompositeZ) == 0 {
+		return ZThresholds{}, fmt.Errorf("no null CompositeZ values generated")
+	}
+
+	sort.Float64s(allNullCompositeZ)
+
+	// CompositeZ is now always ≥ 0 (all components are non-negative after using
+	// |ZDeltaSI| / |ZAFDev| in consolidate()).  The null distribution is therefore
+	// one-sided, so we take the 99th and 95th percentiles directly rather than
+	// the 99.5th / 97.5th that a two-tailed test would require.
+	czP99 := r6(stat.Quantile(0.99, stat.Empirical, allNullCompositeZ, nil))
+	czP95 := r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil))
+
+	return ZThresholds{
+		ZP99:          2.576, // Retain theoretical for individual per-stat Z-scores
+		ZP95:          1.960,
+		CompositeZP99: czP99,
+		CompositeZP95: czP95,
+		NumStats:      numStats,
+	}, nil
 }
 
 // countZStats returns k, the number of Z-scores summed by consolidate() into
@@ -98,233 +715,198 @@ func countZStats(bsaType string) int {
 	return n
 }
 
+// ── Parallel warm-up ─────────────────────────────────────────────────────────
+
+// warmUpTwoBulkCache pre-computes thresholds for every unique depth observed in
+// the smoothed data.  Work is spread across all available CPU cores.
+func warmUpTwoBulkCache(smoothed []SmoothedStats, p simParams) {
+	// Collect unique depth values.
+	seen := make(map[int]struct{})
+	for _, sm := range smoothed {
+		if sm.Depth > 0 {
+			seen[sm.Depth] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return
+	}
+
+	depths := make([]int, 0, len(seen))
+	for d := range seen {
+		depths = append(depths, d)
+	}
+
+	bar := progressbar.NewOptions(len(depths),
+		progressbar.OptionSetDescription("Two-bulk threshold simulation"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+	)
+
+	jobs := make(chan int, len(depths))
+	for _, d := range depths {
+		jobs <- d
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < runtime.NumCPU(); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for depth := range jobs {
+				pp := p
+				pp.highDepth = depth
+				pp.lowDepth = depth
+				simulateTwoBulkCached(pp)
+				_ = bar.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println()
+}
+
+// warmUpOneBulkCache pre-computes thresholds for every unique depth.
+func warmUpOneBulkCache(smoothed []SmoothedStats, p simParams) {
+	seen := make(map[int]struct{})
+	for _, sm := range smoothed {
+		if sm.Depth > 0 {
+			seen[sm.Depth] = struct{}{}
+		}
+	}
+	if len(seen) == 0 {
+		return
+	}
+
+	depths := make([]int, 0, len(seen))
+	for d := range seen {
+		depths = append(depths, d)
+	}
+
+	bar := progressbar.NewOptions(len(depths),
+		progressbar.OptionSetDescription("One-bulk threshold simulation"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowCount(),
+	)
+
+	jobs := make(chan int, len(depths))
+	for _, d := range depths {
+		jobs <- d
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for w := 0; w < runtime.NumCPU(); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for depth := range jobs {
+				pp := p
+				pp.highDepth = depth
+				simulateOneBulkCached(pp)
+				_ = bar.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	fmt.Println()
+}
+
 // ── Public entry point ───────────────────────────────────────────────────────
 
-// CalculateThresholds derives genome-wide significance thresholds by
-// simulating cfg.Rep null genomes (see nullsim.go). They are genome-wide, so
-// one Thresholds value applies to every marker (the thresholds TSV still
-// lists it per marker for convenience).
+// CalculateThresholds computes per-variant empirical significance thresholds
+// for all statistics in the smoothed data, writes them to a TSV file, and
+// returns the threshold slice (one entry per smoothed variant).
 //
-// Interpretation: a "P99" threshold is exceeded anywhere in the genome by only
-// 1% of null genomes (genome-wide false-positive rate 1%); "P95" by 5%. Signed
-// tracks (SI, ΔSI, AFDev) split the error rate across both tails (99.5th
-// percentile of the per-genome maximum, 0.5th of the minimum).
+// p0 values are derived from cfg.Population via ExpectedAF — the expected
+// allele frequency under H₀ for the given mapping population structure.
+// The number of Monte Carlo draws is taken from cfg.SimRep (must be > 0).
 func CalculateThresholds(
 	cfg utils.AnalysisConfig,
 	bsaType string,
-	raw []BSAstats,
 	smoothed []SmoothedStats,
-) (Thresholds, error) {
-	var none Thresholds
+) ([]Thresholds, error) {
 
-	if len(smoothed) == 0 || len(raw) == 0 {
-		return none, fmt.Errorf("no data to calculate thresholds from")
+	if len(smoothed) == 0 {
+		return nil, fmt.Errorf("smoothed data slice is empty")
 	}
 	if cfg.Rep <= 0 {
-		return none, fmt.Errorf("--rep must be > 0, got %d", cfg.Rep)
+		return nil, fmt.Errorf("cfg.SimRep must be > 0, got %d", cfg.Rep)
 	}
-	if cfg.WindowSize <= 0 {
-		return none, fmt.Errorf("WindowSize must be > 0, got %d", cfg.WindowSize)
-	}
+
+	// Derive the null allele frequency from the population structure.
+	// Both bulks share the same expected AF under H₀ (no QTL).
 	p0, err := ExpectedAF(cfg.Population)
 	if err != nil {
-		return none, fmt.Errorf("cannot determine null AF: %w", err)
-	}
-	design, err := parseCrossDesign(cfg.Population)
-	if err != nil {
-		return none, err
+		return nil, fmt.Errorf("cannot determine null AF: %w", err)
 	}
 
-	hasHigh, hasLow, hasBoth, hasOne := BulkFlags(bsaType)
-	highSize, lowSize, oneSize := bulkSizes(cfg, bsaType)
-	if !(cfg.BrmAlpha > 0 && cfg.BrmAlpha < 1) {
-		return none, fmt.Errorf("--brm-alpha must be between 0 and 1, got %v", cfg.BrmAlpha)
-	}
-	if (hasHigh && !hasOne && highSize <= 0) || (hasLow && !hasOne && lowSize <= 0) || (hasOne && oneSize <= 0) {
-		return none, fmt.Errorf("bulk sizes must be > 0 (got high=%d low=%d); set them with --bulk-sizes", highSize, lowSize)
-	}
-
-	sigma := float64(cfg.WindowSize) / 2
-	layout := buildNullLayout(raw, smoothed, bsaType, sigma, contigLengths(cfg), design, p0, highSize, lowSize, oneSize)
-	layout.brmScale = PopulationVarianceScale(cfg.Population)
+	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 
 	color.Cyan(
-		"\n============================ Calculating Thresholds (%s, p₀=%.4f, %d null genomes) ============================\n",
+		"\n============================ Calculating Thresholds (%s, p₀=%.4f, %d simulations) ============================\n",
 		bsaType, p0, cfg.Rep,
 	)
-	color.Blue("Null model: %s bulks of %s, %.0f cM per chromosome (assumed), observed marker positions and depths, seed %d",
-		strings.ToUpper(cfg.Population), bulkSizeLabel(hasBoth, highSize, lowSize, oneSize), morgansPerChromosome*100, cfg.Seed)
 
-	// Z-score scales from a separate batch of null genomes; the real data and
-	// every threshold genome are normalised with the same fixed transform.
-	layout.scales, layout.scalesSet = layout.estimateScales(cfg.Rep, cfg.Seed), true
-	normaliseToNull(smoothed, layout.scales, hasHigh, hasLow, hasBoth, hasOne)
-	if err := writeSmoothedOutput(cfg, bsaType, smoothed); err != nil {
-		return none, err
-	}
-	if err := writeNullScalesTSV(filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.null_scales.tsv", bsaType)), layout); err != nil {
-		return none, fmt.Errorf("failed to write null scales TSV: %w", err)
-	}
-
-	ext := simulateNullExtremes(layout, cfg.Rep, cfg.Seed)
-
-	col := func(f func(nullExtremes) float64) []float64 {
-		xs := make([]float64, len(ext))
-		for i, e := range ext {
-			xs[i] = f(e)
-		}
-		sort.Float64s(xs)
-		return xs
-	}
-	q := func(xs []float64, p float64) float64 { return r6(stat.Quantile(p, stat.Empirical, xs, nil)) }
-	// upper/lower for signed tracks: both tails share the error rate.
-	upper := func(f func(nullExtremes) float64) (p99, p95 float64) {
-		xs := col(f)
-		return q(xs, 0.995), q(xs, 0.975)
-	}
-	lower := func(f func(nullExtremes) float64) (p99, p95 float64) {
-		xs := col(f)
-		return q(xs, 0.005), q(xs, 0.025)
-	}
-	oneSided := func(f func(nullExtremes) float64) (p99, p95 float64) {
-		xs := col(f)
-		return q(xs, 0.99), q(xs, 0.95)
+	// Base simParams; depth is overridden per variant inside the warm-up loops.
+	// Include bulk sizes for more accurate null model
+	base := simParams{
+		p0High:       p0,
+		p0Low:        p0,
+		p0One:        p0,
+		rep:          cfg.Rep,
+		highBulkSize: cfg.HighBulkSize,
+		lowBulkSize:  cfg.LowBulkSize,
+		oneBulkSize:  cfg.OneBulkSize,
+		population:   cfg.Population,
 	}
 
-	var t Thresholds
-	tb := &t.TwoBulk
-	if hasHigh {
-		tb.HighSIP99, tb.HighSIP95 = upper(func(e nullExtremes) float64 { return e.HighSIMax })
-		tb.HighSIMp99, tb.HighSIMp95 = lower(func(e nullExtremes) float64 { return e.HighSIMin })
+	// Pre-populate the cache in parallel for every depth in the dataset.
+	if hasBothBulks {
+		warmUpTwoBulkCache(smoothed, base)
 	}
-	if hasLow {
-		tb.LowSIP99, tb.LowSIP95 = upper(func(e nullExtremes) float64 { return e.LowSIMax })
-		tb.LowSIMp99, tb.LowSIMp95 = lower(func(e nullExtremes) float64 { return e.LowSIMin })
-	}
-	if hasBoth {
-		tb.DeltaSIP99, tb.DeltaSIP95 = upper(func(e nullExtremes) float64 { return e.DeltaSIMax })
-		tb.DeltaSIMp99, tb.DeltaSIMp95 = lower(func(e nullExtremes) float64 { return e.DeltaSIMin })
-		tb.GstatP99, tb.GstatP95 = oneSided(func(e nullExtremes) float64 { return e.GstatMax })
-		tb.ED4P99, tb.ED4P95 = oneSided(func(e nullExtremes) float64 { return e.ED4Max })
-		tb.LODP99, tb.LODP95 = oneSided(func(e nullExtremes) float64 { return e.LODMax })
-		tb.BBLogBFP99, tb.BBLogBFP95 = oneSided(func(e nullExtremes) float64 { return e.BBLogBFMax })
-	}
-	if hasOne {
-		ob := &t.OneBulk
-		ob.AFDevP99, ob.AFDevP95 = upper(func(e nullExtremes) float64 { return e.AFDevMax })
-		ob.AFDevMp99, ob.AFDevMp95 = lower(func(e nullExtremes) float64 { return e.AFDevMin })
-		ob.OneBulkGstatP99, ob.OneBulkGstatP95 = oneSided(func(e nullExtremes) float64 { return e.OneGMax })
-		ob.OneBulkLODP99, ob.OneBulkLODP95 = oneSided(func(e nullExtremes) float64 { return e.OneLODMax })
-		ob.OneBulkBBLogBFP99, ob.OneBulkBBLogBFP95 = oneSided(func(e nullExtremes) float64 { return e.OneBBMax })
-	}
-	czP99, czP95 := oneSided(func(e nullExtremes) float64 { return e.CompositeZMax })
-	t.Z = ZThresholds{
-		ZP99: 2.576, ZP95: 1.960, // nominal per-stat Z guides for plots only
-		CompositeZP99: czP99, CompositeZP95: czP95,
-		NumStats: countZStats(bsaType),
+	if hasOneBulk {
+		warmUpOneBulkCache(smoothed, base)
 	}
 
-	brmZ := col(func(e nullExtremes) float64 { return e.BRMZMax })
-	t.BRM = BRMThreshold{U: q(brmZ, 1-cfg.BrmAlpha), Alpha: cfg.BrmAlpha}
-	if tail := cfg.BrmAlpha * float64(cfg.Rep); tail < 10 {
-		color.Yellow("Note: the BRM threshold (alpha %.3g) rests on %.0f simulated genome(s) in the tail; increase --rep for a stable value.", cfg.BrmAlpha, tail)
-	}
-
-	lodTrack := tLOD
-	if !hasBoth {
-		lodTrack = tLOD1
-	}
-	t.SupportDrop = SupportZDrop * layout.scales[lodTrack].Scale
-
-	color.Green("✔ Genome-wide thresholds: CompositeZ P99=%.3f P95=%.3f; BRM u=%.3f (genome-wide alpha %.3g); support-interval drop %.3f LOD", czP99, czP95, t.BRM.U, t.BRM.Alpha, t.SupportDrop)
-
-	outDir := filepath.Join(cfg.OutputDir, "stats")
-	if err := writeNullExtremesTSV(filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.null_genome_extremes.tsv", bsaType)), ext, hasBoth, hasOne); err != nil {
-		return t, fmt.Errorf("failed to write null extremes TSV: %w", err)
-	}
-	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType))
-	if err := writeThresholdsTSV(outPath, smoothed, t, bsaType); err != nil {
-		return t, fmt.Errorf("failed to write thresholds TSV: %w", err)
-	}
-	return t, nil
-}
-
-func bulkSizeLabel(hasBoth bool, high, low, one int) string {
-	if hasBoth {
-		return fmt.Sprintf("%d (high) and %d (low) individuals", high, low)
-	}
-	return fmt.Sprintf("%d individuals", one)
-}
-
-// contigLengths returns contig lengths (bp) from the VCF header when present.
-func contigLengths(cfg utils.AnalysisConfig) map[string]float64 {
-	out := map[string]float64{}
-	if cfg.Rdr == nil || cfg.Rdr.Header == nil {
-		return out
-	}
-	for _, c := range cfg.Rdr.Header.Contigs {
-		var n float64
-		if _, err := fmt.Sscan(c["length"], &n); err == nil && n > 0 {
-			out[c["ID"]] = n
-		}
-	}
-	return out
-}
-
-// writeNullScalesTSV writes the null median and scale used for each Z-score.
-func writeNullScalesTSV(path string, L *nullLayout) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	names := [nTracks]string{
-		tHighSI: "HighSI", tLowSI: "LowSI", tDeltaSI: "DeltaSI", tG: "Gstat", tED4: "ED4",
-		tLOD: "LOD", tBB: "BBLogBF", tAFDev: "AFDev", tG1: "OneBulkGstat", tLOD1: "OneBulkLOD", tBB1: "OneBulkBBLogBF",
-	}
-	var b strings.Builder
-	b.WriteString("Statistic\tNullMedian\tNullScale\n")
-	for _, tr := range L.activeTracks() {
-		fmt.Fprintf(&b, "%s\t%.6g\t%.6g\n", names[tr], L.scales[tr].Med, L.scales[tr].Scale)
-	}
-	return os.WriteFile(path, []byte(b.String()), 0644)
-}
-
-// writeNullExtremesTSV writes the per-genome extremes behind the thresholds,
-// so calibration can be inspected or re-derived at other error rates.
-func writeNullExtremesTSV(path string, ext []nullExtremes, hasBoth, hasOne bool) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	f, err := os.Create(path)
+	// Use empirical CompositeZ thresholds from Monte Carlo simulation
+	zThresh, err := calculateEmpiricalCompositeZThresholds(cfg, bsaType, smoothed, cfg.Rep)
 	if err != nil {
-		return err
+		color.Yellow("Warning: falling back to theoretical Z thresholds: %v", err)
+		zThresh = empiricalZThresholds(bsaType)
 	}
-	w := bufio.NewWriter(f)
-	cols := []string{"Replicate"}
-	if hasBoth {
-		cols = append(cols, "DeltaSI_max", "DeltaSI_min", "Gstat_max", "ED4_max", "LOD_max", "BBLogBF_max")
-	}
-	if hasOne {
-		cols = append(cols, "AFDev_max", "AFDev_min", "OneBulkGstat_max", "OneBulkLOD_max", "OneBulkBBLogBF_max")
-	}
-	cols = append(cols, "CompositeZ_max", "BRM_maxAbsZ")
-	fmt.Fprintln(w, strings.Join(cols, "\t"))
-	f6 := func(v float64) string { return fmt.Sprintf("%.6f", v) }
-	for i, e := range ext {
-		row := []string{fmt.Sprint(i)}
-		if hasBoth {
-			row = append(row, f6(e.DeltaSIMax), f6(e.DeltaSIMin), f6(e.GstatMax), f6(e.ED4Max), f6(e.LODMax), f6(e.BBLogBFMax))
+
+	// Assign thresholds to each variant by depth lookup (cache hit guaranteed).
+	thresholds := make([]Thresholds, len(smoothed))
+	for i, sm := range smoothed {
+		t := Thresholds{Z: zThresh}
+
+		if hasBothBulks {
+			p := base
+			p.highDepth = sm.Depth
+			p.lowDepth = sm.Depth
+			t.TwoBulk = simulateTwoBulkCached(p)
 		}
-		if hasOne {
-			row = append(row, f6(e.AFDevMax), f6(e.AFDevMin), f6(e.OneGMax), f6(e.OneLODMax), f6(e.OneBBMax))
+		if hasOneBulk {
+			p := base
+			p.highDepth = sm.Depth
+			t.OneBulk = simulateOneBulkCached(p)
 		}
-		row = append(row, f6(e.CompositeZMax), f6(e.BRMZMax))
-		fmt.Fprintln(w, strings.Join(row, "\t"))
+
+		thresholds[i] = t
 	}
-	if err := w.Flush(); err != nil {
-		f.Close()
-		return err
+
+	color.Green("✔ Threshold simulations complete.\n")
+
+	outPath := filepath.Join(
+		cfg.OutputDir, "stats",
+		fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType),
+	)
+	if err := writeThresholdsTSV(outPath, smoothed, thresholds, bsaType); err != nil {
+		return thresholds, fmt.Errorf("failed to write thresholds TSV: %w", err)
 	}
-	return f.Close()
+
+	return thresholds, nil
 }
 
 // ── TSV output ───────────────────────────────────────────────────────────────
@@ -335,7 +917,7 @@ func writeNullExtremesTSV(path string, ext []nullExtremes, hasBoth, hasOne bool)
 func writeThresholdsTSV(
 	path string,
 	smoothed []SmoothedStats,
-	t Thresholds,
+	thresholds []Thresholds,
 	bsaType string,
 ) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -378,7 +960,6 @@ func writeThresholdsTSV(
 	header = append(header,
 		"Z_P99", "Z_P95",
 		"CompositeZ_P99", "CompositeZ_P95",
-		"BRM_U",
 	)
 
 	if err := w.Write(header); err != nil {
@@ -388,7 +969,8 @@ func writeThresholdsTSV(
 	// ── rows ─────────────────────────────────────────────────────────────────
 	f4 := func(v float64) string { return fmt.Sprintf("%.4f", v) }
 
-	for _, sm := range smoothed {
+	for i, sm := range smoothed {
+		t := thresholds[i]
 		row := []string{
 			sm.CHROM,
 			fmt.Sprintf("%d", sm.POS),
@@ -421,7 +1003,6 @@ func writeThresholdsTSV(
 		row = append(row,
 			f4(z.ZP99), f4(z.ZP95),
 			f4(z.CompositeZP99), f4(z.CompositeZP95),
-			f4(t.BRM.U),
 		)
 
 		if err := w.Write(row); err != nil {

@@ -141,7 +141,7 @@ max-depth cap (1.b) is the next-biggest quality lever.
 
 ## 5. QTL detection (`stats/detect.go`, `run/run.go`)
 
-- [x] 🔴 **`MinQTLWidth` and `MinQTLMarkers` are parsed but never used.** (Fixed: see CHANGES.md §13.) No
+- [ ] 🔴 **`MinQTLWidth` and `MinQTLMarkers` are parsed but never used.** No
   minimum-width or minimum-supporting-marker filter is applied, so single-marker
   and ultra-narrow spurious peaks are reported as QTLs. Wire both into
   `ConsolidateQTLs` / final QTL emission.

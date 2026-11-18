@@ -6,10 +6,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -102,6 +100,8 @@ type SmoothedStats struct {
 	CompositeZ float64
 	// max|Z| across all valid statistics (unsigned)
 	MaxAbsZ float64
+
+	thresholds Thresholds
 }
 
 func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
@@ -131,26 +131,24 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 		return nil, err
 	}
 
-	// Z-scores, CompositeZ and MaxAbsZ need the null scales from the
-	// null-genome simulation, so CalculateThresholds fills them (via
-	// normaliseToNull) and writes the smoothed TSV.
-	color.Green("Smoothed %d variants\n", len(smoothed))
-	return smoothed, nil
-}
+	// ── 2. Robust Z-score normalisation (global, across all chroms) ───────
+	normalise(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
 
-// writeSmoothedOutput writes GoBSAseq.<type>.smoothed_and_normalised.tsv.
-func writeSmoothedOutput(cfg utils.AnalysisConfig, bsaType string, smoothed []SmoothedStats) error {
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+	// ── 3. Stouffer's Z consolidation ─────────────────────────────────────
+	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+
+	// ── 4. Write TSV ───────────────────────────────────────────────────────
 	outDir := filepath.Join(cfg.OutputDir, "stats")
 	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return err
+		return nil, err
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.smoothed_and_normalised.tsv", bsaType))
 	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk); err != nil {
-		return err
+		return nil, err
 	}
+
 	color.Green("Smoothed & normalised stats written to %s (%d variants)\n", outPath, len(smoothed))
-	return nil
+	return smoothed, nil
 }
 
 // ─── smoothing ─────────────────────────────────────────────────────────────────
@@ -199,6 +197,35 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			depth[k] = math.Max(float64(raw[ci].Depth), 1)
 		}
 
+		// smooth1 computes one depth-weighted Gaussian smoothed slice.
+		// The inner loop uses binary search to find the [lo, hi) range of
+		// variants within the cutoff, avoiding a full O(n) scan per query.
+		smooth1 := func(vals []float64) ([]float64, []int) {
+			smVals := make([]float64, n)
+			nContrib := make([]int, n) // number of variants with w > 0
+			for k := 0; k < n; k++ {
+				pK := pos[k]
+				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
+				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
+
+				wSum, wValSum := 0.0, 0.0
+				for m := lo; m < hi; m++ {
+					d := (pos[m] - pK) / bw
+					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
+					if w <= 0 {
+						continue
+					}
+					wSum += w
+					wValSum += w * vals[m]
+					nContrib[k]++
+				}
+				if wSum > 0 {
+					smVals[k] = wValSum / wSum
+				}
+			}
+			return smVals, nContrib
+		}
+
 		// Collect (raw values, setter) pairs for every active statistic.
 		type statPair struct {
 			vals   []float64
@@ -241,16 +268,18 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			)
 		}
 
-		// Smooth every statistic in one pass: the Gaussian × depth weight of
-		// each (query, neighbour) pair is computed once and applied to all
-		// statistics, and query positions are split across all cores. Each
-		// statistic accumulates in the same order as a per-statistic pass would,
-		// so results are bit-for-bit identical to smoothing them one at a time.
-		vals := make([][]float64, len(pairs))
+		// Smooth each statistic and record the per-position contributor count
+		// from the first stat (all stats share the same position grid and depth
+		// weights, so counts are identical regardless of which stat is used).
+		smoothedVals := make([][]float64, len(pairs))
+		var nContrib []int
 		for p, sp := range pairs {
-			vals[p] = sp.vals
+			sv, nc := smooth1(sp.vals)
+			smoothedVals[p] = sv
+			if nContrib == nil {
+				nContrib = nc
+			}
 		}
-		smoothedVals, nContrib := smoothAll(pos, depth, vals, bw, cutoff)
 
 		// Assign to output; skip positions with insufficient kernel coverage.
 		for k, ci := range chromIdx {
@@ -292,63 +321,6 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 	return valid, nil
 }
 
-// smoothAll computes depth-weighted Gaussian smoothed values of every series
-// in vals at every position in pos (sorted). It returns the smoothed series
-// and, per position, the number of contributing neighbours within cutoff.
-func smoothAll(pos, depth []float64, vals [][]float64, bw, cutoff float64) ([][]float64, []int) {
-	n := len(pos)
-	nv := len(vals)
-	out := make([][]float64, nv)
-	for p := range out {
-		out[p] = make([]float64, n)
-	}
-	nContrib := make([]int, n)
-
-	workers := runtime.GOMAXPROCS(0)
-	chunk := (n + workers - 1) / workers
-	if chunk < 256 {
-		chunk = 256
-	}
-	var wg sync.WaitGroup
-	for start := 0; start < n; start += chunk {
-		end := min(start+chunk, n)
-		wg.Add(1)
-		go func(start, end int) {
-			defer wg.Done()
-			wv := make([]float64, nv)
-			for k := start; k < end; k++ {
-				pK := pos[k]
-				lo := sort.Search(n, func(m int) bool { return pos[m] >= pK-cutoff })
-				hi := sort.Search(n, func(m int) bool { return pos[m] > pK+cutoff })
-
-				for p := range wv {
-					wv[p] = 0
-				}
-				wSum := 0.0
-				for m := lo; m < hi; m++ {
-					d := (pos[m] - pK) / bw
-					w := depth[m] * math.Exp(-0.5*d*d) // depth × Gaussian
-					if w <= 0 {
-						continue
-					}
-					wSum += w
-					for p := range wv {
-						wv[p] += w * vals[p][m]
-					}
-					nContrib[k]++
-				}
-				if wSum > 0 {
-					for p := range wv {
-						out[p][k] = wv[p] / wSum
-					}
-				}
-			}
-		}(start, end)
-	}
-	wg.Wait()
-	return out, nContrib
-}
-
 // extractFloat builds a float64 slice for the variants referenced by chromIdx.
 func extractFloat(raw []BSAstats, chromIdx []int, fn func(BSAstats) float64) []float64 {
 	vals := make([]float64, len(chromIdx))
@@ -360,51 +332,118 @@ func extractFloat(raw []BSAstats, chromIdx []int, fn func(BSAstats) float64) []f
 
 // ─── normalisation ─────────────────────────────────────────────────────────────
 
-// normaliseToNull fills the Z-score fields with z = (x − median) / scale,
-// where median and scale (1.4826 × MAD) come from simulated null genomes
-// (NullScales, see nullsim.go), then fills CompositeZ and MaxAbsZ. The same
-// fixed transform is applied to every simulated genome, so CompositeZ and
-// its threshold are on the same scale.
-func normaliseToNull(sm []SmoothedStats, sc NullScales, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+// normalise computes global robust Z-scores for every smoothed statistic.
+// The Z-scores are stored in place (Z* fields of each SmoothedStats).
+func normalise(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
 	type field struct {
-		track int
-		get   func(*SmoothedStats) float64
-		set   func(*SmoothedStats, float64)
+		get func(*SmoothedStats) float64
+		set func(*SmoothedStats, float64)
 	}
 	var fields []field
 	if hasHighBulk {
 		fields = append(fields,
-			field{tHighSI, func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }},
 		)
 	}
 	if hasLowBulk {
 		fields = append(fields,
-			field{tLowSI, func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }},
 		)
 	}
 	if hasBothBulks {
 		fields = append(fields,
-			field{tDeltaSI, func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
-			field{tG, func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
-			field{tED4, func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
-			field{tLOD, func(s *SmoothedStats) float64 { return s.SmLOD }, func(s *SmoothedStats, v float64) { s.ZLOD = v }},
-			field{tBB, func(s *SmoothedStats) float64 { return s.SmBBLogBF }, func(s *SmoothedStats, v float64) { s.ZBBLogBF = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmLOD }, func(s *SmoothedStats, v float64) { s.ZLOD = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmBBLogBF }, func(s *SmoothedStats, v float64) { s.ZBBLogBF = v }},
 		)
 	}
 	if hasOneBulk {
 		fields = append(fields,
-			field{tAFDev, func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
-			field{tG1, func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
-			field{tLOD1, func(s *SmoothedStats) float64 { return s.SmOneBulkLOD }, func(s *SmoothedStats, v float64) { s.ZOneBulkLOD = v }},
-			field{tBB1, func(s *SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(s *SmoothedStats, v float64) { s.ZOneBulkBBLogBF = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkLOD }, func(s *SmoothedStats, v float64) { s.ZOneBulkLOD = v }},
+			field{func(s *SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(s *SmoothedStats, v float64) { s.ZOneBulkBBLogBF = v }},
 		)
 	}
+
 	for _, f := range fields {
+		vals := make([]float64, len(sm))
 		for i := range sm {
-			f.set(&sm[i], sc[f.track].z(f.get(&sm[i])))
+			vals[i] = f.get(&sm[i])
+		}
+		zs := robustZScores(vals)
+		for i := range sm {
+			f.set(&sm[i], zs[i])
 		}
 	}
-	consolidate(sm, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+}
+
+// robustZScores returns Z = (x − median) / (1.4826 × MAD) for a slice.
+// When MAD = 0 (all values identical or one outlier drives deviations to zero),
+// falls back to classical Z = (x − mean) / SD.
+// If SD is also 0 (fully constant), returns a zero slice.
+// The 1.4826 factor makes MAD a consistent estimator of σ under normality
+// (Rousseeuw & Croux 1993).
+func robustZScores(vals []float64) []float64 {
+	const consistencyFactor = 1.4826 // MAD → σ consistency factor
+
+	n := len(vals)
+	if n == 0 {
+		return nil
+	}
+
+	med := medianOf(vals)
+	absDeviations := make([]float64, n)
+	for i, v := range vals {
+		absDeviations[i] = math.Abs(v - med)
+	}
+	mad := medianOf(absDeviations) * consistencyFactor
+
+	zs := make([]float64, n)
+	if mad > 0 {
+		for i, v := range vals {
+			zs[i] = math.Round(((v-med)/mad)*1e6) / 1e6
+		}
+		return zs
+	}
+
+	// MAD = 0 fallback: classical Z-score.
+	var mean float64
+	for _, v := range vals {
+		mean += v
+	}
+	mean /= float64(n)
+
+	var variance float64
+	for _, v := range vals {
+		d := v - mean
+		variance += d * d
+	}
+	sd := math.Sqrt(variance / float64(n))
+	if sd == 0 {
+		return zs // all zeros; caller handles this gracefully
+	}
+	for i, v := range vals {
+		zs[i] = math.Round(((v-mean)/sd)*1e6) / 1e6
+	}
+	return zs
+}
+
+// medianOf returns the median of a float64 slice without modifying the original.
+func medianOf(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(vals))
+	copy(sorted, vals)
+	sort.Float64s(sorted)
+	n := len(sorted)
+	if n%2 == 1 {
+		return sorted[n/2]
+	}
+	return (sorted[n/2-1] + sorted[n/2]) / 2
 }
 
 // ─── consolidation ─────────────────────────────────────────────────────────────
@@ -484,7 +523,11 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 			continue
 		}
 
-		s.CompositeZ = stoufferSum(czs)
+		sum := 0.0
+		for _, z := range czs {
+			sum += z
+		}
+		s.CompositeZ = math.Round((sum/math.Sqrt(float64(len(czs))))*1e6) / 1e6
 
 		maxAbs := 0.0
 		for _, z := range allZs {
@@ -494,23 +537,6 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 		}
 		s.MaxAbsZ = math.Round(maxAbs*1e6) / 1e6
 	}
-}
-
-// compositeZ is the CompositeZ of one marker from its signed-difference
-// Z-score (ZDeltaSI or ZAFDev) and its two magnitude Z-scores (G and LOD).
-// The null simulation (nullsim.go) calls this so the simulated statistic is
-// computed by exactly the same formula as the observed one.
-func compositeZ(zSigned, zG, zLOD float64) float64 {
-	return stoufferSum([]float64{math.Abs(zSigned), zG, zLOD})
-}
-
-// stoufferSum returns Σz/√k rounded to 6 decimals.
-func stoufferSum(czs []float64) float64 {
-	sum := 0.0
-	for _, z := range czs {
-		sum += z
-	}
-	return math.Round((sum/math.Sqrt(float64(len(czs))))*1e6) / 1e6
 }
 
 // ─── TSV output ────────────────────────────────────────────────────────────────

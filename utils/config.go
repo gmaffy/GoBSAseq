@@ -42,10 +42,6 @@ type AnalysisConfig struct {
 	StepSize   int
 	Rep        int
 	BrmAlpha   float64
-	// Seed is the base random seed for the Monte Carlo threshold simulations.
-	// Each simulation derives its own seed from Seed and its parameters, so
-	// results are reproducible regardless of goroutine scheduling.
-	Seed int64
 	// MinGQ is the minimum genotype quality (FORMAT/GQ) required of the parent
 	// samples at a site. Zero disables the check and is applied only when GQ is
 	// present (e.g. DeepVariant VCFs). It is deliberately NOT applied to bulks:
@@ -100,13 +96,8 @@ type AnalysisConfig struct {
 	Protein  string
 	Gff      string
 	Cds      string
-	GeneDesc string // optional
-
-	// Gene-space scoring (genome-whisperer genespace.Options).
-	GeneSpaceTrait string  // trait profile, e.g. "disease-resistance"
-	MinConcordance float64 // (0, 1]: genotype concordance for a variant to follow the R/S split
-	PromoterLength int     // bp upstream of a gene attributed to it; 0 disables
-	Prg            string
+	GeneDesc string
+	Prg      string
 
 	Merger             string
 	Caller             string
