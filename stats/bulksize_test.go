@@ -3,6 +3,8 @@ package stats
 import (
 	"math"
 	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -71,9 +73,65 @@ func TestBulkSizesPerMode(t *testing.T) {
 }
 
 func TestCalculateThresholdsRejectsMissingBulkSize(t *testing.T) {
-	cfg := utils.AnalysisConfig{Population: "F2", Rep: 10, OutputDir: t.TempDir(), HighBulkSize: 20}
-	sm := []SmoothedStats{{CHROM: "chr1", POS: 1, Depth: 30}}
-	if _, err := CalculateThresholds(cfg, "lplb", nil, sm); err == nil {
+	cfg := utils.AnalysisConfig{Population: "F2", OutputDir: t.TempDir(), HighBulkSize: 20}
+	raw := []BSAstats{{CHROM: "chr1", POS: 1, Depth: 30, LowDepth: 30}}
+	if _, err := CalculateThresholds(cfg, "lplb", raw); err == nil {
 		t.Fatal("expected error when the low bulk size is missing")
 	}
+}
+
+// samplePoolAF draws the high-parent allele frequency of a pool of bulkSize
+// diploid plants by genotype dosage (F2/F3/F4 selfing, RIL, BCn, BCnF2): a
+// plant-level reference for PopulationVarianceScale, which the HMM pool model
+// and the marker weights use.
+func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) float64 {
+	p := strings.ToUpper(strings.TrimSpace(population))
+	selfGenerations := map[string]int{"F2": 1, "F3": 2, "F4": 3}
+	if g, ok := selfGenerations[p]; ok || p == "RIL" {
+		het := 0.0
+		if p != "RIL" {
+			het = math.Pow(0.5, float64(g))
+		}
+		pHom := (1 - het) / 2
+		copies := 0
+		for range bulkSize {
+			u := rng.Float64()
+			switch {
+			case u < pHom:
+			case u < pHom+het:
+				copies++
+			default:
+				copies += 2
+			}
+		}
+		return float64(copies) / float64(2*bulkSize)
+	}
+	// BCn[F2]H/L: recurrent homozygote, heterozygote q = 0.5^n (BCnF2: q/2,
+	// donor homozygote q/4); SI is the recurrent allele for H, donor for L.
+	s := p[2:]
+	isHigh := strings.HasSuffix(s, "H")
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "H"), "L")
+	isF2 := strings.HasSuffix(s, "F2")
+	n, _ := strconv.Atoi(strings.TrimSuffix(s, "F2"))
+	q := math.Pow(0.5, float64(n))
+	pHet, pDonor := q, 0.0
+	if isF2 {
+		pHet, pDonor = q/2, q/4
+	}
+	recurrent := 0
+	for range bulkSize {
+		u := rng.Float64()
+		switch {
+		case u < pDonor:
+		case u < pDonor+pHet:
+			recurrent++
+		default:
+			recurrent += 2
+		}
+	}
+	f := float64(recurrent) / float64(2*bulkSize)
+	if !isHigh {
+		f = 1 - f
+	}
+	return f
 }

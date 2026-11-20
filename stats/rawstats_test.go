@@ -109,9 +109,6 @@ func TestRawStatsBulkDepths(t *testing.T) {
 	if s.HighDepth != 80 || s.LowDepth != 25 || s.Depth != 38 { // 2·80·25/105 = 38.1
 		t.Fatalf("HighDepth/LowDepth/Depth = %d/%d/%d, want 80/25/38", s.HighDepth, s.LowDepth, s.Depth)
 	}
-	if h, l := siteBulkDepths(SmoothedStats{Depth: 38, HighDepth: 80, LowDepth: 25}); h != 80 || l != 25 {
-		t.Fatalf("threshold depth pair = %d/%d, want 80/25", h, l)
-	}
 }
 
 // sitesHPHB builds one-parent one-bulk sites whose bulk shows a REF mapping

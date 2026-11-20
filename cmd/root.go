@@ -234,7 +234,6 @@ var rootCmd = &cobra.Command{
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
-		rep, _ := cmd.Flags().GetInt("rep")
 		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
 		minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
 		mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
@@ -435,7 +434,6 @@ var rootCmd = &cobra.Command{
 			Population:             population,
 			WindowSize:             winSize,
 			StepSize:               step,
-			Rep:                    rep,
 			BrmAlpha:               brmAlpha,
 			MinQTLWidth:            minQTLWidth,
 			MergeDistance:          mergeDistance,
@@ -540,7 +538,8 @@ func init() {
 	// ------------------------------------------------- Threshold -------------------------------------------------- //
 	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, RIL, BC1H, BC1L, BC2H, BC2L, ...)")
-	rootCmd.Flags().Int("rep", 1000, "Number of simulations")
+	rootCmd.Flags().Int("rep", 1000, "Ignored: thresholds come from the genome-wide null (--null-reps)")
+	_ = rootCmd.Flags().MarkDeprecated("rep", "thresholds now come from the genome-wide null simulation; use --null-reps")
 
 	// ----------------------------------------------- Filtering ---------------------------------------------------- //
 	rootCmd.Flags().Bool("light-filtering", false, "Enable light filtering")

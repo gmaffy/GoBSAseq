@@ -17,7 +17,7 @@ As implemented in `stats/smoothing.go`.
 | Depth, HighDepth, LowDepth | None | The site's own values. They feed the marker weight and the threshold lookup. |
 | NEff | Derived from the kernel | (ΣK)²/ΣK², the effective number of markers behind the smoothed value. Markers with NEff < 5 are dropped. |
 | Z_* (each smoothed track) | None (normalisation) | Genome-wide robust Z: (value − median) / (1.4826·MAD), falling back to the ordinary mean/SD Z when MAD = 0. For the non-negative, right-skewed tracks (G′, G1, ED⁴) it is computed on log(x + c), with c = 10% of the median; on simulated no-QTL genomes this cuts the skew of G′/ED⁴ from +0.36/+0.49 to +0.14/+0.17. These log-based Z-scores are for display; CompositeZ uses the untransformed robust Z (see below). |
-| CompositeZ | None (combination) | (\|Z_ΔSI\| + Z_G)/√2, or (\|Z_AFDev\| + Z_G1)/√2 in one-bulk modes. In `2b` without `--ref-parent`: (Z(\|ΔSI\|) + Z_G)/√2, with \|ΔSI\| not folded again. The HMM LOD is not included. G′ and G1 enter as their untransformed robust Z: with the log-based Z, the pointwise false-positive rate on overdispersed data rose from 1.0% to 1.4%. Thresholds from the genome-wide null simulation. |
+| CompositeZ | None (combination) | (\|Z_ΔSI\| + Z_G)/√2, or (\|Z_AFDev\| + Z_G1)/√2 in one-bulk modes. In `2b` without `--ref-parent`: (Z(\|ΔSI\|) + Z_G)/√2, with \|ΔSI\| not folded again. The HMM LOD is not included. G′ and G1 enter as their untransformed robust Z: with the log-based Z, the pointwise false-positive rate on overdispersed data rose from 1.0% to 1.4%. Thresholds are genome-wide: the 99%/95% quantiles of each simulated no-QTL genome's maximum CompositeZ (generalized extreme-value fit), with reads simulated at the read overdispersion estimated from the data. |
 | MaxAbsZ | None (combination) | Largest deviation over the normalised tracks: \|Z\| for signed tracks (ΔSI, AFDev, one-bulk SI), the positive part of Z for one-sided tracks (G′, G1, ED⁴, \|ΔSI\|); the HMM LOD is not included. |
 
 The marker weight is 1 / Σ_bulks [1/(c·n) + 1/depth], with c the population variance scale and n the bulk size. Gaussian kernel term: weight_m × exp(−½((pos_m − pos_k)/σ)²), σ = window/2, over ±3σ. Tricube term (G′, loess): weight_m × (1 − |Δ/h|³)³, h = window, over |Δ| < h.
@@ -79,11 +79,21 @@ Ratings out of 10, for biological and code correctness and accuracy.
 - Log-scale tracks have two Z-scores: the column shows the log-scale Z, while CompositeZ uses the untransformed one. This is correct but easy to misread.
 
 **Consolidating.** The code is clean and driven by the track table.
-- CompositeZ thresholds come from a binomial null simulation, so overdispersed data (ρ = 0.01) give 1.43% of null sites over p99 instead of about 1%. This is the most important fix remaining.
+- ~~CompositeZ thresholds come from a binomial null simulation, so overdispersed data (ρ = 0.01) give 1.43% of null sites over p99 instead of about 1%.~~ Fixed: the null uses the estimated overdispersion and the thresholds are genome-wide (1–3 of 100 null genomes over p99 in calibration).
 - ΔSI and G′ come from the same reads and are highly correlated, so Stouffer's √2 is nominal and CompositeZ adds little beyond G′ alone. The empirical thresholds keep it valid.
 - \|Z_ΔSI\| is always non-negative but Z_G′ can be negative, so the two components are not symmetric.
 
 **Suggested fixes, in order**
-1. Add overdispersion, estimated from the data, to the null simulation.
+1. ~~Add overdispersion, estimated from the data, to the null simulation.~~ Done.
 2. Drop the marker weight from G′ (plain tricube, as Magwene).
 3. Allow bandwidths in cM (a genetic map or `--cm-per-mb`) for the kernels.
+
+# Thresholds (2026-11-20)
+
+All thresholds now come from the genome-wide null simulation (`stats/hmmnull.go`); the single-SNP per-depth simulation is gone.
+- **What:** for every scanned statistic (smoothed SI, ΔSI or |ΔSI|, G′, ED⁴, AFDev, G1; the HMM LOD; CompositeZ), the 99%/95% quantile of its maximum over a simulated no-QTL genome. Two-tailed tracks (SI, ΔSI, AFDev) split the level: 99.5%/97.5% of the maxima and of the minima. A p99 threshold has a 1% chance of being crossed anywhere in a genome without QTLs.
+- **Why:** detection compares smoothed tracks, but the old thresholds were quantiles of a single SNP at that marker's depth, which is badly over-conservative for G′ and ignores linkage. The old ones were also inconsistent (99.5% for one-sided G/ED⁴), not reproducible (seeding depended on goroutine scheduling) and stored about 230 B per marker.
+- **Null model:** real markers, depths and bulk sizes; linked pool frequencies from the HMM pool model; beta-binomial reads at the read overdispersion ρ estimated from the data (from tightly linked neighbours, so pool variation and QTLs do not inflate it); then the same scoring code as the data. Seeded, with per-chromosome streams: reproducible.
+- **Quantiles:** a generalized extreme-value fit by probability-weighted moments (Hosking 1985) to the 200 genome extremes. A Gumbel fit understated the CompositeZ tail (q99 16.7 against 20.4 empirical); the GEV fit gives 22.3, against 22.1 from an independent plant-level simulator.
+- **Calibration** (100 plant-simulated null genomes per case: 2p2b at ρ = 0 and 0.01, and 2b without `--ref-parent`): any detection track over its p99 in 0–2, over p95 in 2–5; CompositeZ 0–3 / 3–7; HMM LOD 0–1 / 1–4.
+- `--rep` is deprecated and ignored.

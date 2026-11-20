@@ -8,7 +8,7 @@ package plots
 //   • SmoothedStats   (smoothing.go)  — Gaussian-kernel smoothed values and
 //                                       robust Z-scores produced by
 //                                       SmoothAndNormalise.
-//   • Thresholds      (thresholds.go) — per-variant empirical significance
+//   • Thresholds      (thresholds.go) — genome-wide significance
 //                                       thresholds produced by
 //                                       CalculateThresholds.
 //   • BRMBlock        (brm.go)        — BRM block intervals produced by
@@ -59,31 +59,21 @@ const posFormatter = `function(value) {
 
 // ── public entry point ───────────────────────────────────────────────────────
 
-func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, thresholds []stats.Thresholds, brmBlocks []stats.BRMBlock) error {
+func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.SmoothedStats, th stats.Thresholds, brmBlocks []stats.BRMBlock) error {
 	color.Cyan("\n================================ Generating plots for %s... ==========================================", bsaType)
 	if len(smoothed) == 0 {
 		return nil
-	}
-	if len(thresholds) != len(smoothed) {
-		return fmt.Errorf("GeneratePlots: len(thresholds)=%d != len(smoothed)=%d",
-			len(thresholds), len(smoothed))
 	}
 
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := stats.BulkFlags(bsaType)
 	signedDSI := cfg.SignedDeltaSI(bsaType)
 	hmmOn := stats.HMMAvailable(cfg, bsaType)
 
-	// ── group by chromosome, preserve sort order ─────────────────────────────
+	// ── group by chromosome, preserving order ────────────────────────────────
 
-	// Build a map from chrom → [(smoothed, threshold)] preserving index order so
-	// that per-variant thresholds stay aligned with their smoothed values.
-	type indexedStat struct {
-		sm stats.SmoothedStats
-		t  stats.Thresholds
-	}
-	byChr := make(map[string][]indexedStat)
-	for i, s := range smoothed {
-		byChr[s.CHROM] = append(byChr[s.CHROM], indexedStat{s, thresholds[i]})
+	byChr := make(map[string][]int)
+	for i := range smoothed {
+		byChr[smoothed[i].CHROM] = append(byChr[smoothed[i].CHROM], i)
 	}
 	chroms := make([]string, 0, len(byChr))
 	for c := range byChr {
@@ -95,6 +85,15 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	brmByChr := make(map[string][]stats.BRMBlock)
 	for _, b := range brmBlocks {
 		brmByChr[b.Chrom] = append(brmByChr[b.Chrom], b)
+	}
+
+	// Thresholds are genome-wide: the same lines on every chromosome.
+	tb, ob := th.TwoBulk, th.OneBulk
+	finite := func(v float64) float64 { // JSON can't carry NaN/±Inf
+		if math.IsInf(v, 0) || math.IsNaN(v) {
+			return 0
+		}
+		return v
 	}
 
 	// ── create page containers ───────────────────────────────────────────────
@@ -110,165 +109,68 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	// ── per-chromosome chart generation ─────────────────────────────────────
 
 	for _, chrom := range chroms {
-		entries := byChr[chrom]
-		if len(entries) == 0 {
-			continue
-		}
-
-		n := len(entries)
+		idx := byChr[chrom]
+		n := len(idx)
 		chromBRM := brmByChr[chrom]
 
-		// Extract position arrays and per-variant threshold arrays.
 		x := make([]int64, n)
-
-		// Two-bulk smoothed values.
-		hi := make([]float64, n)
-		li := make([]float64, n)
-		dsi := make([]float64, n)
-		gs := make([]float64, n)
-		ed := make([]float64, n)
-		hmm := make([]float64, n) // pool-HMM LOD (not smoothed)
-
-		// One-bulk smoothed values.
-		afDev := make([]float64, n)
-		obG := make([]float64, n)
-
-		// Z-scores (all available for every bsaType).
-		compositeZ := make([]float64, n)
-		maxAbsZ := make([]float64, n)
-
-		// Per-variant threshold arrays for two-bulk individual charts.
-		hiT99, hiTM99 := make([]float64, n), make([]float64, n)
-		hiT95, hiTM95 := make([]float64, n), make([]float64, n)
-		liT99, liTM99 := make([]float64, n), make([]float64, n)
-		liT95, liTM95 := make([]float64, n), make([]float64, n)
-		dsiT99, dsiTM99 := make([]float64, n), make([]float64, n)
-		dsiT95, dsiTM95 := make([]float64, n), make([]float64, n)
-		gsT99, gsT95 := make([]float64, n), make([]float64, n)
-		edT99, edT95 := make([]float64, n), make([]float64, n)
-
-		// Per-variant threshold arrays for one-bulk individual charts.
-		afDevT99, afDevTM99 := make([]float64, n), make([]float64, n)
-		afDevT95, afDevTM95 := make([]float64, n), make([]float64, n)
-		obGT99, obGT95 := make([]float64, n), make([]float64, n)
-
-		for i, e := range entries {
-			s, t := e.sm, e.t
-			x[i] = s.POS
-
-			if hasBothBulks {
-				hi[i], li[i], dsi[i] = s.SmHighSI, s.SmLowSI, s.SmDeltaSI
-				gs[i], ed[i] = s.SmGstat, s.SmED
-
-				tb := t.TwoBulk
-				hiT99[i], hiTM99[i] = tb.HighSIP99, tb.HighSIMp99
-				hiT95[i], hiTM95[i] = tb.HighSIP95, tb.HighSIMp95
-				liT99[i], liTM99[i] = tb.LowSIP99, tb.LowSIMp99
-				liT95[i], liTM95[i] = tb.LowSIP95, tb.LowSIMp95
-				dsiT99[i], dsiTM99[i] = tb.DeltaSIP99, tb.DeltaSIMp99
-				dsiT95[i], dsiTM95[i] = tb.DeltaSIP95, tb.DeltaSIMp95
-				gsT99[i], gsT95[i] = tb.GstatP99, tb.GstatP95
-				edT99[i], edT95[i] = tb.ED4P99, tb.ED4P95
+		col := func(get func(*stats.SmoothedStats) float64) []float64 {
+			v := make([]float64, n)
+			for i, j := range idx {
+				v[i] = get(&smoothed[j])
 			}
-			hmm[i] = s.HMMLOD
-
-			if hasHighBulk && !hasBothBulks {
-				// High-bulk-only: HighSI Z-score available.
-				hi[i] = s.SmHighSI
-				hiT99[i], hiTM99[i] = t.TwoBulk.HighSIP99, t.TwoBulk.HighSIMp99
-				hiT95[i], hiTM95[i] = t.TwoBulk.HighSIP95, t.TwoBulk.HighSIMp95
-			}
-			if hasLowBulk && !hasBothBulks {
-				li[i] = s.SmLowSI
-				liT99[i], liTM99[i] = t.TwoBulk.LowSIP99, t.TwoBulk.LowSIMp99
-				liT95[i], liTM95[i] = t.TwoBulk.LowSIP95, t.TwoBulk.LowSIMp95
-			}
-
-			if hasOneBulk {
-				afDev[i] = s.SmAFDev
-				obG[i] = s.SmOneBulkG
-
-				ob := t.OneBulk
-				afDevT99[i], afDevTM99[i] = ob.AFDevP99, ob.AFDevMp99
-				afDevT95[i], afDevTM95[i] = ob.AFDevP95, ob.AFDevMp95
-				obGT99[i], obGT95[i] = ob.OneBulkGstatP99, ob.OneBulkGstatP95
-			}
-
-			compositeZ[i] = s.CompositeZ
-			maxAbsZ[i] = s.MaxAbsZ
+			return v
 		}
-
-		// ── average per-variant thresholds for the reference lines ───────────
-		// The individual raw-value charts draw flat average threshold lines
-		// (as in the legacy code) to give the reader a quick visual anchor.
-		// The adaptive per-variant thresholds are still used for QTL detection;
-		// here we only need averages for drawing.
-		nf := float64(n)
-		avg := func(arr []float64) float64 {
-			var s float64
-			for _, v := range arr {
-				s += v
-			}
-			return s / nf
+		for i, j := range idx {
+			x[i] = smoothed[j].POS
 		}
-
-		// ── individual raw-value charts ──────────────────────────────────────
 
 		if hasBothBulks {
+			hi := col(func(s *stats.SmoothedStats) float64 { return s.SmHighSI })
+			li := col(func(s *stats.SmoothedStats) float64 { return s.SmLowSI })
 			individualPage.AddCharts(siCharts(chrom, x, hi, li,
-				[4]float64{avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95)},
-				[4]float64{avg(liT99), avg(liT95), avg(liTM99), avg(liTM95)}, signedDSI, chromBRM)...)
+				[4]float64{tb.HighSIP99, tb.HighSIP95, tb.HighSIMp99, tb.HighSIMp95},
+				[4]float64{tb.LowSIP99, tb.LowSIP95, tb.LowSIMp99, tb.LowSIMp95}, signedDSI, chromBRM)...)
 			individualPage.AddCharts(
-				dsiChart(chrom, x, dsi, avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), signedDSI, chromBRM),
-				createRawValueChart(chrom+" G-statistic", x, gs,
-					avg(gsT99), avg(gsT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" ED⁴", x, ed,
-					avg(edT99), avg(edT95), 0, 0, false, chromBRM),
+				dsiChart(chrom, x, col(func(s *stats.SmoothedStats) float64 { return s.SmDeltaSI }),
+					tb.DeltaSIP99, tb.DeltaSIP95, tb.DeltaSIMp99, tb.DeltaSIMp95, signedDSI, chromBRM),
+				createRawValueChart(chrom+" G-statistic", x, col(func(s *stats.SmoothedStats) float64 { return s.SmGstat }),
+					tb.GstatP99, tb.GstatP95, 0, 0, false, chromBRM),
+				createRawValueChart(chrom+" ED⁴", x, col(func(s *stats.SmoothedStats) float64 { return s.SmED }),
+					tb.ED4P99, tb.ED4P95, 0, 0, false, chromBRM),
 			)
 		}
-
 		if hasHighBulk && !hasBothBulks {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" HighSI", x, hi,
-					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromBRM),
+				createRawValueChart(chrom+" HighSI", x, col(func(s *stats.SmoothedStats) float64 { return s.SmHighSI }),
+					tb.HighSIP99, tb.HighSIP95, tb.HighSIMp99, tb.HighSIMp95, true, chromBRM),
 			)
 		}
 		if hasLowBulk && !hasBothBulks {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" LowSI", x, li,
-					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromBRM),
+				createRawValueChart(chrom+" LowSI", x, col(func(s *stats.SmoothedStats) float64 { return s.SmLowSI }),
+					tb.LowSIP99, tb.LowSIP95, tb.LowSIMp99, tb.LowSIMp95, true, chromBRM),
 			)
 		}
 		if hasOneBulk {
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" AF Deviation", x, afDev,
-					avg(afDevT99), avg(afDevT95), avg(afDevTM99), avg(afDevTM95), true, chromBRM),
-				createRawValueChart(chrom+" One-bulk G-statistic", x, obG,
-					avg(obGT99), avg(obGT95), 0, 0, false, chromBRM),
+				createRawValueChart(chrom+" AF Deviation", x, col(func(s *stats.SmoothedStats) float64 { return s.SmAFDev }),
+					ob.AFDevP99, ob.AFDevP95, ob.AFDevMp99, ob.AFDevMp95, true, chromBRM),
+				createRawValueChart(chrom+" One-bulk G-statistic", x, col(func(s *stats.SmoothedStats) float64 { return s.SmOneBulkG }),
+					ob.OneBulkGstatP99, ob.OneBulkGstatP95, 0, 0, false, chromBRM),
 			)
 		}
 		if hmmOn {
-			ht := entries[0].t.HMM              // genome-wide, the same at every site
-			finite := func(v float64) float64 { // a failed null leaves +Inf; JSON can't carry it
-				if math.IsInf(v, 0) || math.IsNaN(v) {
-					return 0
-				}
-				return v
-			}
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" HMM LOD (genome-wide thresholds)", x, hmm,
-					finite(ht.LODP99), finite(ht.LODP95), 0, 0, false, chromBRM),
+				createRawValueChart(chrom+" HMM LOD (genome-wide thresholds)", x, col(func(s *stats.SmoothedStats) float64 { return s.HMMLOD }),
+					finite(th.HMM.LODP99), finite(th.HMM.LODP95), 0, 0, false, chromBRM),
 			)
 		}
 
 		// ── composite signal chart ───────────────────────────────────────────
-		// Use the empirical CompositeZ thresholds from the first variant on this
-		// chromosome (they are global — identical for every variant — so any entry
-		// gives the same value).
-		czThresh := entries[0].t.Z
-
 		compositePage.AddCharts(
-			createCompositeChart(chrom, x, compositeZ, maxAbsZ, chromBRM, czThresh),
+			createCompositeChart(chrom, x, col(func(s *stats.SmoothedStats) float64 { return s.CompositeZ }),
+				col(func(s *stats.SmoothedStats) float64 { return s.MaxAbsZ }), chromBRM, th.Z),
 		)
 	}
 
@@ -497,7 +399,7 @@ func createRawValueChart(
 
 // createCompositeChart renders both the Stouffer CompositeZ (signed, from
 // smoothing.go) and MaxAbsZ (unsigned envelope) on the same chart.
-// Threshold lines are drawn from the empirical MC-derived ZThresholds (P99 / P95)
+// Threshold lines are the genome-wide CompositeZ thresholds (P99 / P95)
 // rather than the legacy hard-coded ±3 / ±2 constants.
 // BRM block shading is included.
 func createCompositeChart(
@@ -514,7 +416,7 @@ func createCompositeChart(
 	title := chrom + " — Composite Signal"
 	subtitle := fmt.Sprintf(
 		"Stouffer CompositeZ (ΔSI + G′, k=%d; the HMM LOD is a separate track) and max |Z| envelope. "+
-			"Dashed lines: genome-null simulation p99 (%.3f) and p95 (%.3f). "+
+			"Dashed lines: genome-wide p99 (%.3f) and p95 (%.3f) from simulated no-QTL genomes. "+
 			"Shaded bands: BRM blocks.",
 		czThresh.NumStats, czP99, czP95,
 	)

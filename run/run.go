@@ -293,7 +293,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 4/10: Calculating thresholds ...\n")
 
 	// ----------------------------------------- Threshold calculation -----------------------------------------------//
-	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats, smoothedStats)
+	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats)
 	if err != nil {
 		return err
 	}

@@ -205,9 +205,12 @@ const (
 //	return peaks
 //}
 
-func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds []Thresholds, valueFn func(SmoothedStats) float64, threshFn func(Thresholds) float64, tail Tail) []PeakIntersection {
+// FindPeakIntersections returns the regions of one chromosome's smoothed
+// markers where valueFn crosses the genome-wide threshold (above it for
+// UpperTail, below it for LowerTail), with interpolated ends and each region's peak.
+func FindPeakIntersections(statName string, smoothed []SmoothedStats, threshold float64, valueFn func(SmoothedStats) float64, tail Tail) []PeakIntersection {
 
-	if len(smoothed) != len(thresholds) || len(smoothed) < 2 {
+	if len(smoothed) < 2 || math.IsNaN(threshold) || math.IsInf(threshold, 0) {
 		return nil
 	}
 
@@ -229,9 +232,9 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	var d0 float64
 	switch tail {
 	case UpperTail:
-		d0 = y0 - threshFn(thresholds[0])
+		d0 = y0 - threshold
 	case LowerTail:
-		d0 = threshFn(thresholds[0]) - y0
+		d0 = threshold - y0
 	}
 
 	if d0 > 0 {
@@ -240,7 +243,7 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		startIndex = 0
 		peakPos = smoothed[0].POS
 		peakValue = y0
-		peakThresh = threshFn(thresholds[0])
+		peakThresh = threshold
 		peakIndex = 0
 	}
 
@@ -249,8 +252,7 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 		y1 := valueFn(smoothed[i])
 		y2 := valueFn(smoothed[i+1])
 
-		t1 := threshFn(thresholds[i])
-		t2 := threshFn(thresholds[i+1])
+		t1, t2 := threshold, threshold
 
 		var d1, d2 float64
 
@@ -358,11 +360,13 @@ func FindPeakIntersections(statName string, smoothed []SmoothedStats, thresholds
 	return peaks
 }
 
-func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds, valueFn func(SmoothedStats) float64, threshP99 func(Thresholds) float64, threshP95 func(Thresholds) float64, tail Tail, label string) []PeakIntersection {
+// findPeaksWithFallback scans at the p99 threshold, and at p95 if nothing
+// crosses p99.
+func findPeaksWithFallback(statName string, sm []SmoothedStats, p99, p95 float64, valueFn func(SmoothedStats) float64, tail Tail) []PeakIntersection {
 	chrom := sm[0].CHROM
 
-	tryLevel := func(threshFn func(Thresholds) float64, level string) []PeakIntersection {
-		peaks := FindPeakIntersections(statName, sm, th, valueFn, threshFn, tail)
+	tryLevel := func(threshold float64, level string) []PeakIntersection {
+		peaks := FindPeakIntersections(statName, sm, threshold, valueFn, tail)
 		if len(peaks) == 0 {
 			return nil
 		}
@@ -373,10 +377,10 @@ func findPeaksWithFallback(statName string, sm []SmoothedStats, th []Thresholds,
 		return peaks
 	}
 
-	if peaks := tryLevel(threshP99, "p99"); peaks != nil {
+	if peaks := tryLevel(p99, "p99"); peaks != nil {
 		return peaks
 	}
-	return tryLevel(threshP95, "p95")
+	return tryLevel(p95, "p95")
 }
 
 type peakStatConfig struct {
@@ -425,10 +429,10 @@ var oneBulkStatConfigs = []peakStatConfig{
 	hmmLODStatConfig,
 }
 
-func collectPeaks(sm []SmoothedStats, th []Thresholds, configs []peakStatConfig) []PeakIntersection {
+func collectPeaks(sm []SmoothedStats, th Thresholds, configs []peakStatConfig) []PeakIntersection {
 	var peaks []PeakIntersection
 	for _, cfg := range configs {
-		if found := findPeaksWithFallback(cfg.name, sm, th, cfg.valueFn, cfg.p99, cfg.p95, cfg.tail, cfg.label); found != nil {
+		if found := findPeaksWithFallback(cfg.name, sm, cfg.p99(th), cfg.p95(th), cfg.valueFn, cfg.tail); found != nil {
 			peaks = append(peaks, found...)
 		}
 	}
@@ -736,7 +740,7 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 }
 
 // signedDSI is cfg.SignedDeltaSI(bsaType): false selects the |ΔSI| track set.
-func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, signedDSI bool, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
+func DetectIndividualQTLs(smoothed []SmoothedStats, th Thresholds, bsaType string, signedDSI bool, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 	twoBulkConfigs := twoBulkStatConfigs
 	if !signedDSI {
@@ -753,11 +757,8 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 
 	for _, idx := range byChr {
 		sm := make([]SmoothedStats, len(idx))
-		th := make([]Thresholds, len(idx))
-
 		for i, j := range idx {
 			sm[i] = smoothed[j]
-			th[i] = thresholds[j]
 		}
 
 		var chrPeaks []PeakIntersection
@@ -775,7 +776,7 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 	return peaks, qtls
 }
 
-func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) []PeakIntersection {
+func DetectCompositeZQTLs(smoothed []SmoothedStats, th Thresholds, bsaType string, mergeGap int64) []PeakIntersection {
 	_ = bsaType
 
 	var peaks []PeakIntersection
@@ -787,23 +788,12 @@ func DetectCompositeZQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 
 	for _, idx := range byChr {
 		sm := make([]SmoothedStats, len(idx))
-		th := make([]Thresholds, len(idx))
-
 		for i, j := range idx {
 			sm[i] = smoothed[j]
-			th[i] = thresholds[j]
 		}
 
-		if found := findPeaksWithFallback(
-			"CompositeZ",
-			sm,
-			th,
-			func(s SmoothedStats) float64 { return s.CompositeZ },
-			func(t Thresholds) float64 { return t.Z.CompositeZP99 },
-			func(t Thresholds) float64 { return t.Z.CompositeZP95 },
-			UpperTail,
-			"CompositeZ",
-		); found != nil {
+		if found := findPeaksWithFallback("CompositeZ", sm, th.Z.CompositeZP99, th.Z.CompositeZP95,
+			func(s SmoothedStats) float64 { return s.CompositeZ }, UpperTail); found != nil {
 			peaks = append(peaks, mergePeakIntersections(found, mergeGap)...)
 		}
 	}

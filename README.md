@@ -80,7 +80,7 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `-s` / `--step-size` | int64 | `100000` | Reserved for future regular-grid summaries; marker-centred smoothing does not currently use it |
 | `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC{n}H`, `BC{n}L`, `BC{n}F2H`, `BC{n}F2L` |
 | `--brm-alpha` | float64 | `0.05` | BRM significance level |
-| `--rep` | int | `1000` | Number of simulations for thresholds |
+| `--rep` | int | — | Deprecated and ignored: all thresholds come from the genome-wide null (`--null-reps`) |
 
 #### Variant Filtering
 
@@ -164,7 +164,7 @@ The mode is auto-detected based on which samples are provided (`None` = not prov
 **`2b` polarity.** Without a parent sample, SI is the REF-allele fraction. Unless the reference genome is one of the parents, REF comes from the high parent at some SNPs and the low parent at others, so the sign of ΔSI is arbitrary per SNP and would cancel when smoothed. With `--ref-parent none` (the default), `2b` therefore uses \|ΔSI\| (columns `AbsDeltaSI`, `Sm_AbsDeltaSI`, `Z_AbsDeltaSI`): its thresholds are upper-tail only, there is no `DeltaSI-` track, CompositeZ uses Z(\|ΔSI\|), and BRM uses the polarity-free form described below. QTLs can be located, but not which bulk carries which parent's allele. G and ED⁴ do not depend on polarity. The HMM LOD needs polarity and is not computed in this case; CompositeZ then uses \|ΔSI\| and G′ only. BRM uses a polarity-free form. It smooths the bias-corrected ΔSI², that is (SI_H − SI_L)² minus each bulk's read-sampling variance SI(1−SI)/(d−1), which estimates the squared pool frequency difference whatever allele is REF. BRM then tests its square root (\|ΔAF\|) against the usual threshold, with af at the population's expected frequency. Blocks have no direction. On simulated no-QTL genomes its false-block rate matched the signed BRM's (24 vs 22 of 100 genomes). If the reference is a parent, pass `--ref-parent high` or `low` to get signed ΔSI and BRM.
 **One-bulk modes** compute: AF deviation, one-bulk G-stat and the pool-HMM LOD.
 
-**HMM LOD** (after MULTIPOOL, Edwards & Gifford 2012). Each bulk is modelled as a pool whose hidden high-parent allele count changes along the chromosome only through crossovers, so all linked SNPs inform the same pool frequency, and pool sampling of the plants is part of the model. The pool prior and linkage depend on the population type (F2, F3, F4, RIL, BCn, BCnF2); recombination defaults to 1 Morgan per chromosome (`--cm-per-mb` sets a genome-wide rate); markers within 0.01 cM share one HMM step. Two-bulk LOD tests whether the bulks differ, with their shared frequency free, so segregation distortion that shifts both bulks is not scored as a QTL. One-bulk LOD tests the bulk against P0 (with the mapping-bias correction). It is computed in the raw-statistics stage and written to the raw TSV. The LOD is already linkage-aware, so it is not smoothed or normalised and is not part of CompositeZ: it stays in LOD units, as its own track with its own thresholds. Its thresholds are genome-wide: the 95%/99% quantiles of the maximum LOD over `--null-reps` simulated no-QTL genomes at the real markers and depths, run through the same scoring code. The same simulated genomes give the CompositeZ thresholds. The HMM LOD replaces the earlier per-SNP LOD and beta-binomial Bayes factor, which ignored pool sampling and linkage.
+**HMM LOD** (after MULTIPOOL, Edwards & Gifford 2012). Each bulk is modelled as a pool whose hidden high-parent allele count changes along the chromosome only through crossovers, so all linked SNPs inform the same pool frequency, and pool sampling of the plants is part of the model. The pool prior and linkage depend on the population type (F2, F3, F4, RIL, BCn, BCnF2); recombination defaults to 1 Morgan per chromosome (`--cm-per-mb` sets a genome-wide rate); markers within 0.01 cM share one HMM step. Two-bulk LOD tests whether the bulks differ, with their shared frequency free, so segregation distortion that shifts both bulks is not scored as a QTL. One-bulk LOD tests the bulk against P0 (with the mapping-bias correction). It is computed in the raw-statistics stage and written to the raw TSV. The LOD is already linkage-aware, so it is not smoothed or normalised and is not part of CompositeZ: it stays in LOD units, as its own track with its own thresholds. Its thresholds are genome-wide: the 95%/99% quantiles of the maximum LOD over `--null-reps` simulated no-QTL genomes at the real markers and depths, run through the same scoring code. The same simulated genomes give the CompositeZ thresholds, also genome-wide (the quantiles of each genome's maximum CompositeZ), so a 99% threshold means a 1% chance that a genome without QTLs has any marker above it. Every scanned statistic gets its threshold the same way (see Thresholds below). Quantiles come from a generalized extreme-value fit to the genome maxima (probability-weighted moments), which is stable at 200 genomes and allows the heavier-than-Gumbel tail of CompositeZ maxima. The simulated reads carry the read-level overdispersion ρ estimated from the data (beta-binomial; from tightly linked neighbouring markers, whose difference has no pool or QTL component; single sites in `2b` without `--ref-parent`), so overdispersed data are not scored against a binomial null. ρ is printed in the log. The HMM LOD replaces the earlier per-SNP LOD and beta-binomial Bayes factor, which ignored pool sampling and linkage.
 
 ---
 
@@ -194,11 +194,12 @@ Results are written to `<out>/goBSAseqResults/<timestamp>/`:
 stats/
   *.raw.tsv                        # Per-variant raw statistics
   *.smoothed_and_normalised.tsv    # Gaussian smoothed + robust Z-scores
+  *.thresholds.tsv                 # Genome-wide thresholds (one row per statistic and tail), with ρ and --null-reps
   *.brm_blocks.tsv                 # BRM-detected blocks
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
   *.lowqual.vcf.gz                 # Records where no ALT passed (kept samples only)
 qtls/
-  *.compositez.qtl.xlsx            # CompositeZ QTL intervals (empirical threshold)
+  *.compositez.qtl.xlsx            # CompositeZ QTL intervals (genome-wide threshold)
   *.final.qtl.xlsx                 # Interval-level union of CompositeZ + BRM evidence
 plots/
   *.individual_plots.html          # Per-statistic charts with thresholds
@@ -244,11 +245,14 @@ genespace/  (if annotation enabled)
                           In 2b without --ref-parent, SI is the REF fraction: its plots are labelled as such,
                           drawn without thresholds. In two-bulk modes HighSI/LowSI are smoothed but not
                           normalised (no Z_HighSI/Z_LowSI): ΔSI carries the contrast.
-4. Thresholds          → **Two-stage Monte Carlo simulation** for per-statistic thresholds per depth + bulk size;
-                          genome-wide null simulation (--null-reps genomes) for the HMM LOD and CompositeZ
+4. Thresholds          → Genome-wide null simulation (--null-reps no-QTL genomes at the real markers,
+                          depths and bulk sizes, with the estimated read overdispersion), scored by the
+                          same code as the data. Every scanned statistic (smoothed ΔSI, G′, ED⁴, AFDev, G1,
+                          SI; HMM LOD; CompositeZ) gets genome-wide thresholds: quantiles of its genome
+                          maximum (and minimum for lower tails; two-tailed tracks split the level)
 5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
-6. QTL Detection       → Regions exceeding the empirical CompositeZ threshold
-7. Individual QTLs     → Per-statistic intervals using depth-specific thresholds
+6. QTL Detection       → Regions exceeding the genome-wide CompositeZ threshold
+7. Individual QTLs     → Per-statistic intervals above their genome-wide thresholds
 8. Merge               → Union of Z-score and BRM intervals
 9. Plots               → Interactive HTML charts (echarts) with all thresholds
 10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
@@ -306,11 +310,11 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 
 | Method | Threshold | Primary/Secondary | Output File |
 |--------|-----------|----------------|-------------|
-| **Composite Z-score** | Empirical Monte Carlo threshold | **Primary** | `*.compositez.qtl.xlsx` |
-| **Individual statistics** | Empirical depth-specific thresholds | **Secondary** | `*.individual.qtl.xlsx` |
+| **Composite Z-score** | Genome-wide null simulation (extreme-value fit to genome maxima) | **Primary** | `*.compositez.qtl.xlsx` |
+| **Individual statistics** | Genome-wide null simulation (per statistic) | **Secondary** | `*.individual.qtl.xlsx` |
 | **BRM Blocks** | Analytical window-based | **Secondary** | `*.brm_blocks.tsv` |
 
-**CompositeZ and individual-statistic detection are run by default.** The threshold TSV records the exact threshold used for every retained marker.
+**CompositeZ and individual-statistic detection are run by default.** The threshold TSV records every threshold used: they are genome-wide, so a p99 threshold has a 1% chance of being crossed anywhere in a genome without QTLs.
 
 ---
 
@@ -325,7 +329,7 @@ GoBSAseq provides **two complementary QTL detection approaches**:
   -B phenotype_high,phenotype_low \
   -p 10,10 -b 100,100 -S 250,250 \
   -w 1000000 -s 50000 \
-  -m F2 --brm-alpha 0.05 --rep 1000 \
+  -m F2 --brm-alpha 0.05 \
   -o results
 ```
 
@@ -353,7 +357,7 @@ GoBSAseq provides **two complementary QTL detection approaches**:
   -p 20,20 -b 200,200 \
   -S 150,150  # <-- Bulk sizes: 150 individuals each
   -w 2000000 -s 100000 \
-  -m F2 --rep 2000  # More simulations for deep data
+  -m F2 --null-reps 500  # More null genomes: tighter thresholds, longer run
   -o results_deep
 
 # The two-stage Monte Carlo model will automatically use bulk sizes

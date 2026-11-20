@@ -1,24 +1,26 @@
 package stats
 
 import (
+	"math"
 	"math/rand"
 	"testing"
 )
 
-func TestFindPeakIntersectionsUsesLocalThresholds(t *testing.T) {
+func TestFindPeakIntersectionsGenomeWideThreshold(t *testing.T) {
 	sm := []SmoothedStats{
 		{CHROM: "chr1", POS: 100, SmGstat: 0.1},
 		{CHROM: "chr1", POS: 200, SmGstat: 0.6},
+		{CHROM: "chr1", POS: 300, SmGstat: 0.9},
+		{CHROM: "chr1", POS: 400, SmGstat: 0.3},
 	}
-	th := []Thresholds{
-		{TwoBulk: TwoBulkThresholds{GstatP99: 0.2}},
-		{TwoBulk: TwoBulkThresholds{GstatP99: 0.8}},
+	g := func(s SmoothedStats) float64 { return s.SmGstat }
+	peaks := FindPeakIntersections("Gstat", sm, 0.5, g, UpperTail)
+	if len(peaks) != 1 || peaks[0].PeakPos != 300 || peaks[0].Threshold != 0.5 ||
+		math.Abs(peaks[0].Start-180) > 1e-9 || math.Abs(peaks[0].End-(300+100*0.4/0.6)) > 1e-9 {
+		t.Fatalf("peaks %#v", peaks)
 	}
-	peaks := FindPeakIntersections("Gstat", sm, th,
-		func(s SmoothedStats) float64 { return s.SmGstat },
-		func(t Thresholds) float64 { return t.TwoBulk.GstatP99 }, UpperTail)
-	if len(peaks) != 0 {
-		t.Fatalf("expected no peak below its local threshold, got %#v", peaks)
+	if p := FindPeakIntersections("Gstat", sm, math.NaN(), g, UpperTail); p != nil {
+		t.Fatalf("NaN threshold (no tail) gave peaks %#v", p)
 	}
 }
 

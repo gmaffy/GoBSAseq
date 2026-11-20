@@ -44,7 +44,6 @@ type AnalysisConfig struct {
 	Population string
 	WindowSize int
 	StepSize   int
-	Rep        int
 	BrmAlpha   float64
 	// MinGQ is the minimum genotype quality (FORMAT/GQ) required of the parent
 	// samples at a site. Zero disables the check and is applied only when GQ is

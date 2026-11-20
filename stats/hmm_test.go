@@ -3,10 +3,13 @@ package stats
 import (
 	"io"
 	"math"
+	"math/rand"
+	"sort"
 	"testing"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
+	"gonum.org/v1/gonum/stat"
 )
 
 // f2Model is the worked example: F2 bulk of 20 plants (U = 40), no
@@ -107,12 +110,16 @@ func TestGenomeNullThresholdsRuns(t *testing.T) {
 		}
 	}
 	cfg := utils.AnalysisConfig{WindowSize: 2_000_000, Population: "F2", HighBulkSize: 20, LowBulkSize: 20, RefParent: "high", NullReps: 20}
-	zt, ht, err := genomeNullThresholds(cfg, "2p2b", raw)
+	th, err := genomeNullThresholds(cfg, "2p2b", raw)
+	zt, ht := th.Z, th.HMM
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !(ht.LODP99 >= ht.LODP95 && ht.LODP95 > 0 && zt.CompositeZP99 >= zt.CompositeZP95) || math.IsInf(ht.LODP99, 0) {
 		t.Fatalf("thresholds HMM %+v, Z %+v", ht, zt)
+	}
+	if tb := th.TwoBulk; !(tb.GstatP99 >= tb.GstatP95 && tb.GstatP95 > 0 && tb.DeltaSIP99 > 0 && tb.DeltaSIMp99 < 0 && tb.ED4P99 > 0) {
+		t.Fatalf("per-statistic thresholds %+v", tb)
 	}
 	if zt.NumStats != 2 {
 		t.Fatalf("NumStats = %d, want 2", zt.NumStats)
@@ -143,6 +150,38 @@ func TestHMMIgnoresDuplicateViews(t *testing.T) {
 	for i := range single {
 		if single[i].HMMLOD != dup[i].HMMLOD {
 			t.Fatalf("marker %d: LOD %v without the duplicate view, %v with it", i, single[i].HMMLOD, dup[i].HMMLOD)
+		}
+	}
+}
+
+// extremeQuantile recovers the 99% quantile of a Gumbel (light) and a
+// Fréchet-type GEV (heavy tail, shape 0.2) from 200 maxima with lower error
+// than the empirical quantile.
+func TestExtremeQuantile(t *testing.T) {
+	const mu, beta = 3.0, 0.5
+	for _, shape := range []float64{0, 0.2} {
+		draw := func(u float64) float64 { // GEV(μ, β, ξ) inverse CDF
+			if shape == 0 {
+				return mu - beta*math.Log(-math.Log(u))
+			}
+			return mu + beta*(math.Pow(-math.Log(u), -shape)-1)/shape
+		}
+		want := draw(0.99)
+		rng := rand.New(rand.NewSource(3))
+		var errG, errE float64
+		for range 300 {
+			x := make([]float64, 200)
+			for i := range x {
+				x[i] = draw(rng.Float64())
+			}
+			g := extremeQuantile(x, 0.99)
+			sort.Float64s(x)
+			e := stat.Quantile(0.99, stat.Empirical, x, nil)
+			errG += (g - want) * (g - want)
+			errE += (e - want) * (e - want)
+		}
+		if !(errG < errE) || math.Sqrt(errG/300) > 0.15*want {
+			t.Errorf("shape %.1f: RMSE GEV %.3f, empirical %.3f (true q99 %.2f)", shape, math.Sqrt(errG/300), math.Sqrt(errE/300), want)
 		}
 	}
 }

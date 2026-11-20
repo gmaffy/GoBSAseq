@@ -110,8 +110,9 @@ func (p plantSim) datasetPhase(rng *rand.Rand, nPlants int, rho float64, qtl, ra
 // TestHMMLODCalibration checks the genome-wide null against data from an
 // independent plant-level generator (F2 plants with Poisson crossovers,
 // gamma-Poisson depths, optional beta-binomial overdispersion): about 5% of
-// no-QTL genomes should exceed the p95 HMM LOD threshold, 1% the p99, and 1%
-// of sites the p99 CompositeZ threshold. Slow (~90 s): set
+// no-QTL genomes should exceed the p95 HMM LOD and CompositeZ thresholds and
+// 1% the p99 (both genome-wide), with and without overdispersion, and the
+// estimated read overdispersion ρ should be near the truth. Slow: set
 // GOBSASEQ_CALIBRATION=1 to run.
 func TestHMMLODCalibration(t *testing.T) {
 	if os.Getenv("GOBSASEQ_CALIBRATION") == "" {
@@ -146,11 +147,20 @@ func TestHMMLODCalibration(t *testing.T) {
 			return raw
 		}
 		tmpl := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
-		zt, ht, err := genomeNullThresholds(cfg, sc.mode, tmpl)
+		th, err := genomeNullThresholds(cfg, sc.mode, tmpl)
+		zt, ht := th.Z, th.HMM
 		if err != nil {
 			t.Fatal(err)
 		}
-		var over95, over99, czOver99, czN, brmGenomes int
+		sim, err := newNullSim(cfg, sc.mode, tmpl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rhoHat, _ := estimateRho(tmpl, newMarkerOrder(tmpl), sim)
+		var over95, over99, czOver95, czOver99, brmGenomes int
+		// per-statistic: null genomes where any scanned smoothed track crosses its p99 / p95
+		var statOver99, statOver95 int
+		lay := scorer.lay
 		const nNull = 100
 		for range nNull {
 			raw := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
@@ -165,11 +175,21 @@ func TestHMMLODCalibration(t *testing.T) {
 			if mx > ht.LODP99 {
 				over99++
 			}
+			cz := math.Inf(-1)
 			for i := range sm {
-				czN++
-				if sm[i].CompositeZ > zt.CompositeZP99 {
-					czOver99++
-				}
+				cz = math.Max(cz, sm[i].CompositeZ)
+			}
+			if o99, o95 := crossesAny(sm, th, lay); o99 {
+				statOver99++
+				statOver95++
+			} else if o95 {
+				statOver95++
+			}
+			if cz > zt.CompositeZP95 {
+				czOver95++
+			}
+			if cz > zt.CompositeZP99 {
+				czOver99++
 			}
 			if blocks, _ := RunBRM(cfg, sc.mode, sm); len(blocks) > 0 {
 				brmGenomes++
@@ -195,7 +215,49 @@ func TestHMMLODCalibration(t *testing.T) {
 		if HMMAvailable(cfg, sc.mode) && (over99 > 5 || over95 > 12) {
 			t.Errorf("%s/%s rho=%.3f: null genomes over p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, over95, nNull, over99, nNull)
 		}
-		t.Logf("%s ref-parent=%s rho=%.3f: HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ sites over p99: %.2f%% | QTL max LOD %.1f | BRM: null genomes with a block %d/%d, QTL found %v",
-			sc.mode, sc.refParent, sc.rho, ht.LODP95, ht.LODP99, over95, over99, nNull, 100*float64(czOver99)/float64(czN), qmax, brmGenomes, nNull, qBRM == 1)
+		if czOver99 > 5 || czOver95 > 12 {
+			t.Errorf("%s/%s rho=%.3f: null genomes over CompositeZ p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, czOver95, nNull, czOver99, nNull)
+		}
+		if statOver99 > 5*len(nullExtremes(lay)) {
+			t.Errorf("%s/%s rho=%.3f: %d/%d null genomes cross a per-statistic p99", sc.mode, sc.refParent, sc.rho, statOver99, nNull)
+		}
+		t.Logf("  per-statistic: null genomes crossing any track's p99 %d, p95 %d (of %d; tracks %d)", statOver99, statOver95, nNull, len(nullExtremes(lay))-1)
+		qcz := math.Inf(-1)
+		for i := range qsm {
+			if qsm[i].CHROM == "A" {
+				qcz = math.Max(qcz, qsm[i].CompositeZ)
+			}
+		}
+		t.Logf("%s ref-parent=%s rho=%.3f (estimated %.4f): HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ p95/p99 %.2f/%.2f, null genomes over %d/%d | QTL max LOD %.1f, max CompositeZ %.1f | BRM: null genomes with a block %d/%d, QTL found %v",
+			sc.mode, sc.refParent, sc.rho, rhoHat, ht.LODP95, ht.LODP99, over95, over99, nNull, zt.CompositeZP95, zt.CompositeZP99, czOver95, czOver99, qmax, qcz, brmGenomes, nNull, qBRM == 1)
 	}
+}
+
+// crossesAny reports whether any detection track (ΔSI or AFDev both tails,
+// G′/G1, ED⁴; not SI or CompositeZ) crosses its p99, and its p95.
+func crossesAny(sm []SmoothedStats, th Thresholds, lay smoothLayout) (p99, p95 bool) {
+	tb, ob := th.TwoBulk, th.OneBulk
+	type tr struct {
+		get                func(*SmoothedStats) float64
+		u99, u95, l99, l95 float64
+	}
+	nan := math.NaN()
+	var trs []tr
+	if lay.both() {
+		trs = append(trs, tr{func(s *SmoothedStats) float64 { return s.SmDeltaSI }, tb.DeltaSIP99, tb.DeltaSIP95, tb.DeltaSIMp99, tb.DeltaSIMp95},
+			tr{func(s *SmoothedStats) float64 { return s.SmGstat }, tb.GstatP99, tb.GstatP95, nan, nan},
+			tr{func(s *SmoothedStats) float64 { return s.SmED }, tb.ED4P99, tb.ED4P95, nan, nan})
+	}
+	if lay.one() {
+		trs = append(trs, tr{func(s *SmoothedStats) float64 { return s.SmAFDev }, ob.AFDevP99, ob.AFDevP95, ob.AFDevMp99, ob.AFDevMp95},
+			tr{func(s *SmoothedStats) float64 { return s.SmOneBulkG }, ob.OneBulkGstatP99, ob.OneBulkGstatP95, nan, nan})
+	}
+	for i := range sm {
+		for _, r := range trs {
+			v := r.get(&sm[i])
+			p99 = p99 || v > r.u99 || v < r.l99
+			p95 = p95 || v > r.u95 || v < r.l95
+		}
+	}
+	return p99, p95
 }
