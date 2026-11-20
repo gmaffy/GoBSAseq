@@ -111,6 +111,16 @@ func PopulationVarianceScale(pop string) float64 {
 //
 // where V_scale is the population variance scale (e.g., 2.0 for F2) and p is the
 // average allele frequency across bulks.
+// bulkDepths returns a site's high- and low-bulk depths (at least 1), falling
+// back to the effective depth when per-bulk depths are absent.
+func bulkDepths(s SmoothedStats) (float64, float64) {
+	dH, dL := s.HighDepth, s.LowDepth
+	if dH <= 0 || dL <= 0 {
+		dH, dL = s.Depth, s.Depth
+	}
+	return math.Max(float64(dH), 1), math.Max(float64(dL), 1)
+}
+
 func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize, lowBulkSize int, popScale, uAlpha float64) []BRMBlock {
 	if len(stats) == 0 || highBulkSize <= 0 || lowBulkSize <= 0 || uAlpha <= 0 {
 		return nil
@@ -149,12 +159,12 @@ func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize
 			af = 0.95
 		}
 		// Law of total variance: pool sampling variance is attenuated by
-		// sequencing, then binomial read sampling is added back. Depth is the
-		// conservative minimum of the two bulk depths carried by SmoothedStats.
-		d := math.Max(float64(s.Depth), 1)
+		// sequencing, then binomial read sampling is added back, each bulk at
+		// its own depth.
+		dH, dL := bulkDepths(s)
 		poolH := af * (1 - af) / (popScale * n1)
 		poolL := af * (1 - af) / (popScale * n2)
-		variance := poolH*(1-1/d) + af*(1-af)/d + poolL*(1-1/d) + af*(1-af)/d
+		variance := poolH*(1-1/dH) + af*(1-af)/dH + poolL*(1-1/dL) + af*(1-af)/dL
 		threshold := uAlpha * math.Sqrt(variance)
 		significant := threshold > 0 && math.Abs(s.SmDeltaSI) >= threshold
 
@@ -297,6 +307,15 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 	}
 	popScale := PopulationVarianceScale(cfg.Population)
 	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
+
+	// Two-bulk BRM tests signed smoothed ΔSI against a zero-centred null. With
+	// unknown polarity (2b, --ref-parent none) SmDeltaSI is smoothed |ΔSI|,
+	// whose null baseline is above zero and depends on depth, so the BRM
+	// threshold does not apply.
+	if hasBoth && !cfg.SignedDeltaSI(bsaType) {
+		color.Yellow("BRM skipped: 2b without --ref-parent has no allele polarity (use --ref-parent high|low if the reference is a parent)")
+		hasBoth = false
+	}
 
 	// group by chrom
 	byChrom := make(map[string][]SmoothedStats)

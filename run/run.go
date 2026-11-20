@@ -320,7 +320,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	mergeGap := cfg.EffectiveMergeDistance()
 
-	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, mergeGap)
+	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, cfg.SignedDeltaSI(btype), mergeGap)
 	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing individual QTLs to Excel: %v\n", err)

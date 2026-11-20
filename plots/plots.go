@@ -71,6 +71,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	}
 
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := stats.BulkFlags(bsaType)
+	signedDSI := cfg.SignedDeltaSI(bsaType)
 
 	// ── group by chromosome, preserve sort order ─────────────────────────────
 
@@ -254,8 +255,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromBRM),
 				createRawValueChart(chrom+" LowSI", x, li,
 					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromBRM),
-				createRawValueChart(chrom+" ΔSI (DeltaSI)", x, dsi,
-					avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), true, chromBRM),
+				dsiChart(chrom, x, dsi, avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), signedDSI, chromBRM),
 				createRawValueChart(chrom+" G-statistic", x, gs,
 					avg(gsT99), avg(gsT95), 0, 0, false, chromBRM),
 				createRawValueChart(chrom+" ED⁴", x, ed,
@@ -418,6 +418,14 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 // tm99 / tm95   — lower-tail (negative) thresholds; ignored when
 //
 //	hasNegativeThresh is false.
+// dsiChart draws ΔSI, or |ΔSI| (upper thresholds only) when polarity is unknown.
+func dsiChart(chrom string, x []int64, y []float64, t99, t95, tm99, tm95 float64, signed bool, brm []stats.BRMBlock) *charts.Line {
+	if signed {
+		return createRawValueChart(chrom+" ΔSI (DeltaSI)", x, y, t99, t95, tm99, tm95, true, brm)
+	}
+	return createRawValueChart(chrom+" |ΔSI| (AbsDeltaSI, polarity unknown)", x, y, t99, t95, 0, 0, false, brm)
+}
+
 func createRawValueChart(
 	title string,
 	x []int64,

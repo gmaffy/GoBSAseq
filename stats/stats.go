@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,17 +19,17 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
+// BSAstats holds one site's raw statistics. Genotypes and AD strings are not
+// stored: only the raw TSV needs them, and it reads them from the filter.Site.
 type BSAstats struct {
-	CHROM      string
-	POS        int64
-	REF        string
-	ALT        string
-	HighParGT  []int
-	LowParGT   []int
-	HighBulkGT []int
-	HighBulkAD string
-	LowBulkGT  []int
-	LowBulkAD  string
+	CHROM string
+	POS   int64
+	REF   string
+	ALT   string
+
+	// Reads on other ALTs of a split multi-allelic record (not in H/L).
+	HighBulkOther int
+	LowBulkOther  int
 
 	HighBulkL int
 	HighBulkH int
@@ -47,6 +49,14 @@ type BSAstats struct {
 	OneBulkLOD     float64
 	OneBulkBBLogBF float64
 
+	// HighDepth and LowDepth are each bulk's informative depth (REF + target
+	// ALT reads; 0 when the mode lacks that bulk).
+	HighDepth int
+	LowDepth  int
+	// Depth is the depth used for smoothing weights and the CompositeZ null:
+	// the bulk's depth in one-bulk modes, and in two-bulk modes the effective
+	// depth 2·dH·dL/(dH+dL), i.e. the equal depth that gives ΔSI the same
+	// read-sampling variance, p(1−p)(1/dH + 1/dL).
 	Depth int
 }
 
@@ -211,14 +221,38 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 		return nil, fmt.Errorf("unsupported bsaseq type %q", bsaType)
 	}
 
-	hasOneBulk := (highBulkIdx >= 0) != (lowBulkIdx >= 0)
-	oneBulkP0 := 0.0
+	// The filter emits sites with exactly the kept samples, so a mismatch is a
+	// bug upstream; fail loudly instead of silently dropping sites.
+	for i := range passedVariants {
+		if n := int(passedVariants[i].NSamples); n != len(idxs) {
+			s := &passedVariants[i]
+			return nil, fmt.Errorf("%s raw stats: site %s:%d has %d samples, expected %d", bsaType, s.Chrom, s.Pos, n, len(idxs))
+		}
+	}
+
+	layout := rawLayout{
+		highParent: highParentIdx >= 0, lowParent: lowParentIdx >= 0,
+		highBulk: highBulkIdx >= 0, lowBulk: lowBulkIdx >= 0,
+		// Without known polarity (2b, --ref-parent none) the sign of ΔSI is
+		// arbitrary at each SNP and would cancel when smoothed, so DeltaSI holds |ΔSI|.
+		signedDSI: cfg.SignedDeltaSI(bsaType),
+	}
+	hasOneBulk := layout.highBulk != layout.lowBulk
+	signedDSI := layout.signedDSI
+	// One-bulk null frequency of the high-parent allele, by polarity:
+	// p0[0] where the high allele is REF, p0[1] where it is ALT. See
+	// oneBulkP0ByPolarity.
+	var oneBulkP0 [2]float64
 	if hasOneBulk {
 		p0, err := ExpectedAF(cfg.Population)
 		if err != nil {
 			return nil, err
 		}
-		oneBulkP0 = p0
+		bulk := highBulkIdx
+		if bulk < 0 {
+			bulk = lowBulkIdx
+		}
+		oneBulkP0 = oneBulkP0ByPolarity(cfg.OneBulkP0Mode, passedVariants, bulk, p0)
 	}
 
 	outDir := filepath.Join(cfg.OutputDir, "stats")
@@ -228,244 +262,394 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 
 	color.Cyan("============================ Calculating Raw Statistics (%s) ============================\n\n", bsaType)
 
-	results := make([]BSAstats, len(passedVariants))
-	keep := make([]bool, len(passedVariants))
-	bar := progressbar.Default(int64(len(passedVariants)), "Processing variants")
-
-	var next atomic.Int64
-	var wg sync.WaitGroup
-	workers := runtime.GOMAXPROCS(0)
-	if workers < 1 {
-		workers = 1
+	calc := rawCalc{
+		roles:     siteRoles{hp: highParentIdx, lp: lowParentIdx, hb: highBulkIdx, lb: lowBulkIdx},
+		signedDSI: signedDSI,
+		oneBulk:   hasOneBulk,
+		p0:        oneBulkP0,
 	}
-
-	wg.Add(workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			for {
-				i := int(next.Add(1)) - 1
-				if i >= len(passedVariants) {
-					return
-				}
-
-				site := &passedVariants[i]
-				if int(site.NSamples) != len(idxs) {
-					continue
-				}
-
-				s := BSAstats{
-					CHROM: site.Chrom,
-					POS:   site.Pos,
-					REF:   site.Ref,
-					ALT:   site.Alt,
-				}
-
-				// The filter has already decided polarity (which allele the high
-				// parent carries, from the parents' allele depths; REF in 2b mode).
-				highIsAlt := site.HighIsAlt
-
-				if highParentIdx >= 0 {
-					s.HighParGT = site.Samples[highParentIdx].GT()
-				}
-				if lowParentIdx >= 0 {
-					s.LowParGT = site.Samples[lowParentIdx].GT()
-				}
-
-				if highBulkIdx >= 0 {
-					b := site.Samples[highBulkIdx]
-					refDepth, altDepth := int(b.Ref), int(b.Alt)
-					s.HighBulkGT = b.GT()
-					s.HighBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
-					if !highIsAlt {
-						s.HighBulkH, s.HighBulkL = refDepth, altDepth
-					} else {
-						s.HighBulkH, s.HighBulkL = altDepth, refDepth
-					}
-					highTotal := s.HighBulkH + s.HighBulkL
-					if highTotal > 0 {
-						s.HighSI = math.Round((float64(s.HighBulkH)/float64(highTotal))*1e6) / 1e6
-					}
-					s.Depth = highTotal
-				}
-
-				if lowBulkIdx >= 0 {
-					b := site.Samples[lowBulkIdx]
-					refDepth, altDepth := int(b.Ref), int(b.Alt)
-					s.LowBulkGT = b.GT()
-					s.LowBulkAD = fmt.Sprintf("%d,%d", refDepth, altDepth)
-					if !highIsAlt {
-						s.LowBulkH, s.LowBulkL = refDepth, altDepth
-					} else {
-						s.LowBulkH, s.LowBulkL = altDepth, refDepth
-					}
-					lowTotal := s.LowBulkH + s.LowBulkL
-					if lowTotal > 0 {
-						s.LowSI = math.Round((float64(s.LowBulkH)/float64(lowTotal))*1e6) / 1e6
-					}
-					if s.Depth == 0 || lowTotal < s.Depth {
-						s.Depth = lowTotal
-					}
-				}
-
-				if highBulkIdx >= 0 && lowBulkIdx >= 0 {
-					highTotal := s.HighBulkH + s.HighBulkL
-					lowTotal := s.LowBulkH + s.LowBulkL
-					s.DeltaSI = math.Round((s.HighSI-s.LowSI)*1e6) / 1e6
-					s.Gstat = math.Round(GStatistic(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
-					s.ED = math.Round(euclideanDistance4(s.HighSI, s.LowSI)*1e6) / 1e6
-					s.LOD = math.Round(lod(s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH)*1e6) / 1e6
-					s.BBLogBF = math.Round(betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)*1e6) / 1e6
-					_ = highTotal
-					_ = lowTotal
-				}
-
-				if hasOneBulk {
-					s.OneBulkP0 = oneBulkP0
-					h, l := s.HighBulkH, s.HighBulkL
-					si := s.HighSI
-					if lowBulkIdx >= 0 {
-						h, l, si = s.LowBulkH, s.LowBulkL, s.LowSI
-					}
-					s.OneBulkAFDev = math.Round((si-oneBulkP0)*1e6) / 1e6
-					s.OneBulkGstat = math.Round(oneBulkGStatistic(h, l, oneBulkP0)*1e6) / 1e6
-					s.OneBulkLOD = math.Round(oneBulkLOD(h, l, oneBulkP0)*1e6) / 1e6
-					s.OneBulkBBLogBF = math.Round(oneBulkBetaBinomialLogBF(h, l, oneBulkP0)*1e6) / 1e6
-				}
-
-				results[i] = s
-				keep[i] = true
-				_ = bar.Add(1)
-			}
-		}()
-	}
-	wg.Wait()
-	_ = bar.Finish()
-
-	stats := make([]BSAstats, 0, len(results))
-	for i, s := range results {
-		if keep[i] {
-			stats = append(stats, s)
-		}
-	}
-
 	rawPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.raw.tsv", bsaType))
-	if err := writeRawTSV(rawPath, stats, bsaType); err != nil {
+	results, err := computeAndWriteRaw(rawPath, passedVariants, calc, layout)
+	if err != nil {
+		return nil, fmt.Errorf("writing %s: %w", rawPath, err)
+	}
+
+	color.Green("Raw stats written to %s (%d variants)", rawPath, len(results))
+	return results, nil
+}
+
+// siteRoles are the positions of each role in filter.Site.Samples (-1 = absent).
+type siteRoles struct{ hp, lp, hb, lb int }
+
+// rawCalc computes one site's raw statistics.
+type rawCalc struct {
+	roles     siteRoles
+	signedDSI bool       // false: DeltaSI holds |ΔSI| (2b without --ref-parent)
+	oneBulk   bool       // exactly one bulk: compute the one-bulk statistics
+	p0        [2]float64 // one-bulk null frequency: [high allele REF, high allele ALT]
+}
+
+// site returns the raw statistics of one site. Values are stored at full
+// precision; rounding happens only in the TSV. (Rounding stored values to
+// 6 dp zeroed ED⁴ whenever |ΔSI| < 0.027, about 16% of null sites.)
+func (c *rawCalc) site(site *filter.Site) BSAstats {
+	s := BSAstats{CHROM: site.Chrom, POS: site.Pos, REF: site.Ref, ALT: site.Alt}
+	// The filter has already decided polarity (which allele the high parent
+	// carries; in 2b mode from --ref-parent).
+	highIsAlt := site.HighIsAlt
+
+	// bulk returns a bulk's high-allele and low-allele reads, other-ALT reads,
+	// high-allele fraction and informative depth.
+	bulk := func(b *filter.SampleAD) (h, l, other int, si float64, depth int) {
+		h, l = int(b.Ref), int(b.Alt)
+		if highIsAlt {
+			h, l = l, h
+		}
+		if depth = h + l; depth > 0 {
+			si = float64(h) / float64(depth)
+		}
+		return h, l, int(b.Other), si, depth
+	}
+	if c.roles.hb >= 0 {
+		s.HighBulkH, s.HighBulkL, s.HighBulkOther, s.HighSI, s.HighDepth = bulk(&site.Samples[c.roles.hb])
+	}
+	if c.roles.lb >= 0 {
+		s.LowBulkH, s.LowBulkL, s.LowBulkOther, s.LowSI, s.LowDepth = bulk(&site.Samples[c.roles.lb])
+	}
+	s.Depth = effectiveDepth(s.HighDepth, s.LowDepth)
+
+	if c.roles.hb >= 0 && c.roles.lb >= 0 {
+		s.DeltaSI = s.HighSI - s.LowSI
+		if !c.signedDSI {
+			s.DeltaSI = math.Abs(s.DeltaSI)
+		}
+		s.Gstat = GStatistic(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
+		s.ED = euclideanDistance4(s.HighSI, s.LowSI)
+		s.LOD = lod(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
+		s.BBLogBF = betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
+	}
+
+	if c.oneBulk {
+		p0 := c.p0[0]
+		if highIsAlt {
+			p0 = c.p0[1]
+		}
+		h, l, si := s.HighBulkH, s.HighBulkL, s.HighSI
+		if c.roles.lb >= 0 {
+			h, l, si = s.LowBulkH, s.LowBulkL, s.LowSI
+		}
+		s.OneBulkP0 = p0
+		s.OneBulkAFDev = si - p0
+		s.OneBulkGstat = oneBulkGStatistic(h, l, p0)
+		s.OneBulkLOD = oneBulkLOD(h, l, p0)
+		s.OneBulkBBLogBF = oneBulkBetaBinomialLogBF(h, l, p0)
+	}
+	return s
+}
+
+// rawChunk is the number of sites a worker computes and formats at a time.
+const rawChunk = 8192
+
+// computeAndWriteRaw computes every site's statistics and writes the raw TSV.
+// Workers take chunks of sites in order, compute them and format their TSV
+// rows into a buffer; this goroutine writes the buffers in chunk order. At
+// most 2 chunks per worker are in flight, which bounds the buffered output.
+// Every write, flush and close error is returned.
+func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawLayout) (results []BSAstats, err error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}()
+	w := bufio.NewWriterSize(f, 1<<20)
+	if _, err := w.Write(rawHeader(lay)); err != nil {
 		return nil, err
 	}
 
-	color.Green("Raw stats written to %s (%d variants)", rawPath, len(stats))
-	return stats, nil
+	results = make([]BSAstats, len(sites))
+	nChunks := (len(sites) + rawChunk - 1) / rawChunk
+	workers := max(runtime.GOMAXPROCS(0), 1)
+	done := make([]chan []byte, nChunks)
+	for c := range done {
+		done[c] = make(chan []byte, 1)
+	}
+	tokens := make(chan struct{}, 2*workers)
+	bufs := sync.Pool{New: func() any { return make([]byte, 0, 1<<20) }}
+	bar := progressbar.Default(int64(len(sites)), "Processing variants")
+
+	// A chunk index is claimed only after taking a token, so the chunk this
+	// goroutine waits for next is always claimed: no deadlock.
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				tokens <- struct{}{}
+				c := int(next.Add(1)) - 1
+				if c >= nChunks {
+					<-tokens
+					return
+				}
+				lo, hi := c*rawChunk, min((c+1)*rawChunk, len(sites))
+				buf := bufs.Get().([]byte)[:0]
+				for i := lo; i < hi; i++ {
+					results[i] = calc.site(&sites[i])
+					buf = appendRawRow(buf, &results[i], &sites[i], calc.roles, lay)
+				}
+				done[c] <- buf
+				_ = bar.Add(hi - lo)
+			}
+		}()
+	}
+
+	var werr error
+	for c := range done {
+		buf := <-done[c]
+		if werr == nil {
+			_, werr = w.Write(buf)
+		}
+		bufs.Put(buf) //nolint:staticcheck // []byte header copy is fine here
+		<-tokens
+	}
+	wg.Wait()
+	_ = bar.Finish()
+	if werr != nil {
+		return nil, werr
+	}
+	if err := w.Flush(); err != nil {
+		return nil, err
+	}
+	return results, nil
 }
 
-func writeRawTSV(filename string, stats []BSAstats, bsaType string) error {
-	f, err := os.Create(filename)
-	if err != nil {
-		return err
+// minOneBulkP0Sites is the fewest informative sites each polarity class needs
+// before the empirical mapping-bias estimate is trusted.
+const minOneBulkP0Sites = 200
+
+// oneBulkP0ByPolarity returns the one-bulk null frequency of the high-parent
+// allele for sites where that allele is REF ([0]) and where it is ALT ([1]).
+//
+// Reference mapping bias adds a shift b to the REF read fraction. The
+// high-allele fraction is therefore theory + b where the high allele is REF
+// and theory − b where it is ALT, and a single theoretical p0 turns b into a
+// genome-wide AFDev/G1/LOD1/BF1 offset. With mode "empirical" (the default)
+// b is estimated as half the difference between the two classes' typical
+// high-allele fractions, and p0 = theory ± b. A QTL, or a wrong population
+// setting, moves both classes the same way, so it cancels in b and does not
+// leak into p0. Mode "theoretical" uses theory for both.
+//
+// Each class's typical fraction is the interquartile mean (mean of the middle
+// 50%), which is robust to QTL regions and, unlike a median, does not snap to
+// the 1/depth grid of read fractions. Only sites where the bulk shows at least
+// 2 reads of each allele are used, so non-segregating sites (bulk fixed for
+// one allele, common in one-parent one-bulk modes) are left out. If either
+// class has fewer than minOneBulkP0Sites such sites, b cannot be separated
+// from other shifts and the theoretical value is used.
+func oneBulkP0ByPolarity(mode string, sites []filter.Site, bulk int, theory float64) [2]float64 {
+	p0 := [2]float64{theory, theory}
+	if mode == "theoretical" {
+		color.Blue("One-bulk p₀: theoretical %.4f (--one-bulk-p0 theoretical)", theory)
+		return p0
 	}
-	defer f.Close()
+	var si [2][]float64
+	for i := range sites {
+		b := sites[i].Samples[bulk]
+		if b.Ref < 2 || b.Alt < 2 {
+			continue
+		}
+		k, h := 0, b.Ref
+		if sites[i].HighIsAlt {
+			k, h = 1, b.Alt
+		}
+		si[k] = append(si[k], float64(h)/float64(b.Ref+b.Alt))
+	}
+	if len(si[0]) < minOneBulkP0Sites || len(si[1]) < minOneBulkP0Sites {
+		color.Yellow("One-bulk p₀: too few informative sites to estimate mapping bias (%d with the high allele on REF, %d on ALT; need %d each); using theoretical %.4f",
+			len(si[0]), len(si[1]), minOneBulkP0Sites, theory)
+		return p0
+	}
+	sort.Float64s(si[0])
+	sort.Float64s(si[1])
+	refClass, altClass := interquartileMean(si[0]), interquartileMean(si[1])
+	bias := (refClass - altClass) / 2
+	p0 = [2]float64{clampP0(theory + bias), clampP0(theory - bias)}
+	color.Blue("One-bulk p₀: REF mapping bias %+.4f (from %d + %d sites), so p₀ = %.4f where the high allele is REF and %.4f where it is ALT (theoretical %.4f)",
+		bias, len(si[0]), len(si[1]), p0[0], p0[1], theory)
+	if math.Abs(bias) > 0.1 {
+		color.Yellow("One-bulk p₀: estimated mapping bias %+.3f is unusually large; check the alignments, or use --one-bulk-p0 theoretical", bias)
+	}
+	return p0
+}
 
-	w := bufio.NewWriter(f)
-	defer w.Flush()
+func clampP0(p float64) float64 { return math.Min(math.Max(p, 0.01), 0.99) }
 
-	hasHighParent := strings.Contains(bsaType, "hp") || strings.Contains(bsaType, "2p")
-	hasLowParent := strings.Contains(bsaType, "lp") || strings.Contains(bsaType, "2p")
-	hasHighBulk := strings.Contains(bsaType, "hb") || strings.Contains(bsaType, "2b")
-	hasLowBulk := strings.Contains(bsaType, "lb") || strings.Contains(bsaType, "2b")
-	hasBothBulks := hasHighBulk && hasLowBulk
-	hasOneBulk := hasHighBulk != hasLowBulk
+// interquartileMean is the mean of the middle half of sorted v.
+func interquartileMean(v []float64) float64 {
+	lo, hi := len(v)/4, len(v)-len(v)/4
+	sum := 0.0
+	for _, x := range v[lo:hi] {
+		sum += x
+	}
+	return sum / float64(hi-lo)
+}
 
+// rawLayout records which samples a mode has (from the role indices RawStats
+// already resolved) and whether ΔSI is signed; it decides the TSV columns.
+type rawLayout struct {
+	highParent, lowParent, highBulk, lowBulk bool
+	signedDSI                                bool
+}
+
+// rawHeader returns the raw TSV header line.
+//
+// AD columns are the biallelic view (REF, target ALT). Reads on any other ALT
+// of a split multi-allelic record are in the *Other columns, so AD + Other
+// accounts for every allele read.
+func rawHeader(lay rawLayout) []byte {
 	header := []string{"CHROM", "POS", "REF", "ALT"}
-	if hasHighParent {
+	if lay.highParent {
 		header = append(header, "HighParGT")
 	}
-	if hasLowParent {
+	if lay.lowParent {
 		header = append(header, "LowParGT")
 	}
-	if hasHighBulk {
-		header = append(header, "HighBulkGT", "HighBulkAD", "HighBulkL", "HighBulkH", "HighSI")
+	if lay.highBulk {
+		header = append(header, "HighBulkGT", "HighBulkAD", "HighBulkOther", "HighBulkL", "HighBulkH", "HighSI")
 	}
-	if hasLowBulk {
-		header = append(header, "LowBulkGT", "LowBulkAD", "LowBulkL", "LowBulkH", "LowSI")
+	if lay.lowBulk {
+		header = append(header, "LowBulkGT", "LowBulkAD", "LowBulkOther", "LowBulkL", "LowBulkH", "LowSI")
 	}
-	if hasBothBulks {
-		header = append(header, "DeltaSI", "Gstat", "ED4", "LOD", "BBLogBF")
+	if lay.highBulk && lay.lowBulk {
+		header = append(header, DeltaSIName(lay.signedDSI), "Gstat", "ED4", "LOD", "BBLogBF", "HighDepth", "LowDepth")
 	}
-	if hasOneBulk {
+	if lay.highBulk != lay.lowBulk {
 		header = append(header, "P0", "AFDev", "Gstat1", "LOD1", "BBLogBF1")
 	}
 	header = append(header, "Depth")
-
-	fmt.Fprintln(w, strings.Join(header, "\t"))
-
-	for _, s := range stats {
-		row := []string{
-			s.CHROM,
-			fmt.Sprintf("%d", s.POS),
-			s.REF,
-			s.ALT,
-		}
-		if hasHighParent {
-			row = append(row, fmt.Sprintf("%v", s.HighParGT))
-		}
-		if hasLowParent {
-			row = append(row, fmt.Sprintf("%v", s.LowParGT))
-		}
-		if hasHighBulk {
-			row = append(row, fmt.Sprintf("%v", s.HighBulkGT), s.HighBulkAD, fmt.Sprintf("%d", s.HighBulkL), fmt.Sprintf("%d", s.HighBulkH), fmt.Sprintf("%.6f", s.HighSI))
-		}
-		if hasLowBulk {
-			row = append(row, fmt.Sprintf("%v", s.LowBulkGT), s.LowBulkAD, fmt.Sprintf("%d", s.LowBulkL), fmt.Sprintf("%d", s.LowBulkH), fmt.Sprintf("%.6f", s.LowSI))
-		}
-		if hasBothBulks {
-			row = append(row, fmt.Sprintf("%.6f", s.DeltaSI), fmt.Sprintf("%.6f", s.Gstat), fmt.Sprintf("%.6f", s.ED), fmt.Sprintf("%.6f", s.LOD), fmt.Sprintf("%.6f", s.BBLogBF))
-		}
-		if hasOneBulk {
-			row = append(row, fmt.Sprintf("%.6f", s.OneBulkP0), fmt.Sprintf("%.6f", s.OneBulkAFDev), fmt.Sprintf("%.6f", s.OneBulkGstat), fmt.Sprintf("%.6f", s.OneBulkLOD), fmt.Sprintf("%.6f", s.OneBulkBBLogBF))
-		}
-		row = append(row, fmt.Sprintf("%d", s.Depth))
-		fmt.Fprintln(w, strings.Join(row, "\t"))
-	}
-	return nil
+	return []byte(strings.Join(header, "\t") + "\n")
 }
 
-func GStatistic(highBulkAlt, highBulkRef, lowBulkAlt, lowBulkRef int) float64 {
-	hba := float64(highBulkAlt) + 0.5
-	hbr := float64(highBulkRef) + 0.5
-	lba := float64(lowBulkAlt) + 0.5
-	lbr := float64(lowBulkRef) + 0.5
+// appendRawRow appends one site's TSV row to buf, without allocating.
+// Floats use 6 decimals, except ED⁴ (6 significant digits: it is routinely
+// below 1e-6, which fixed decimals would print as 0).
+func appendRawRow(buf []byte, s *BSAstats, site *filter.Site, r siteRoles, lay rawLayout) []byte {
+	tab := func(b []byte) []byte { return append(b, '\t') }
+	f6 := func(b []byte, v float64) []byte { return strconv.AppendFloat(tab(b), v, 'f', 6, 64) }
+	itoa := func(b []byte, v int) []byte { return strconv.AppendInt(tab(b), int64(v), 10) }
 
-	highBulkTotal := hba + hbr
-	lowBulkTotal := lba + lbr
-	total := highBulkTotal + lowBulkTotal
-	if total == 0 {
+	buf = append(buf, s.CHROM...)
+	buf = strconv.AppendInt(tab(buf), s.POS, 10)
+	buf = append(tab(buf), s.REF...)
+	buf = append(tab(buf), s.ALT...)
+	if lay.highParent {
+		buf = appendGT(tab(buf), &site.Samples[r.hp])
+	}
+	if lay.lowParent {
+		buf = appendGT(tab(buf), &site.Samples[r.lp])
+	}
+	bulkCols := func(b []byte, sa *filter.SampleAD, other, l, h int, si float64) []byte {
+		b = appendGT(tab(b), sa)
+		b = strconv.AppendInt(tab(b), int64(sa.Ref), 10)
+		b = strconv.AppendInt(append(b, ','), int64(sa.Alt), 10)
+		return f6(itoa(itoa(itoa(b, other), l), h), si)
+	}
+	if lay.highBulk {
+		buf = bulkCols(buf, &site.Samples[r.hb], s.HighBulkOther, s.HighBulkL, s.HighBulkH, s.HighSI)
+	}
+	if lay.lowBulk {
+		buf = bulkCols(buf, &site.Samples[r.lb], s.LowBulkOther, s.LowBulkL, s.LowBulkH, s.LowSI)
+	}
+	if lay.highBulk && lay.lowBulk {
+		buf = f6(f6(buf, s.DeltaSI), s.Gstat)
+		buf = strconv.AppendFloat(tab(buf), s.ED, 'g', 6, 64)
+		buf = f6(f6(buf, s.LOD), s.BBLogBF)
+		buf = itoa(itoa(buf, s.HighDepth), s.LowDepth)
+	}
+	if lay.highBulk != lay.lowBulk {
+		buf = f6(f6(f6(f6(f6(buf, s.OneBulkP0), s.OneBulkAFDev), s.OneBulkGstat), s.OneBulkLOD), s.OneBulkBBLogBF)
+	}
+	buf = itoa(buf, s.Depth)
+	return append(buf, '\n')
+}
+
+// appendGT writes a sample's biallelic genotype as filter.SampleAD.GT would
+// print with %v: allele indices (-1 missing, 0 REF, 1 ALT, 2 other ALT),
+// sorted, space-separated, in brackets.
+func appendGT(buf []byte, sa *filter.SampleAD) []byte {
+	buf = append(buf, '[')
+	first := true
+	for _, a := range [4]struct {
+		tok string
+		n   uint8
+	}{{"-1", sa.GTMissing}, {"0", sa.GTRef}, {"1", sa.GTAlt}, {"2", sa.GTOther}} {
+		for range a.n {
+			if !first {
+				buf = append(buf, ' ')
+			}
+			buf = append(buf, a.tok...)
+			first = false
+		}
+	}
+	return append(buf, ']')
+}
+
+// effectiveDepth combines the two bulk depths into the single equal depth with
+// the same ΔSI read-sampling variance (harmonic mean). With one bulk (the
+// other depth 0) it is that bulk's depth.
+func effectiveDepth(high, low int) int {
+	switch {
+	case high <= 0:
+		return max(low, 0)
+	case low <= 0:
+		return high
+	}
+	return int(math.Round(2 * float64(high) * float64(low) / float64(high+low)))
+}
+
+// DeltaSIName is the column name for ΔSI: "DeltaSI", or "AbsDeltaSI" when
+// polarity is unknown and the column holds |ΔSI|.
+func DeltaSIName(signed bool) string {
+	if signed {
+		return "DeltaSI"
+	}
+	return "AbsDeltaSI"
+}
+
+// GStatistic is the standard 2×2 G-test (Magwene et al. 2011) of allele counts
+// between bulks: a1/b1 are the two allele counts in bulk 1, a2/b2 in bulk 2.
+// G = 2 Σ o·ln(o/e) over the four cells, with 0·ln 0 = 0 and no pseudo-counts.
+// It is symmetric in the allele order, so callers may pass (H, L) or (ALT, REF).
+// A bulk or allele with no reads gives G = 0 (no information).
+func GStatistic(a1, b1, a2, b2 int) float64 {
+	o := [4]float64{float64(a1), float64(b1), float64(a2), float64(b2)}
+	n1, n2 := o[0]+o[1], o[2]+o[3]
+	ca, cb := o[0]+o[2], o[1]+o[3]
+	total := n1 + n2
+	if n1 == 0 || n2 == 0 || ca == 0 || cb == 0 {
 		return 0
 	}
-
-	expHighAlt := highBulkTotal * (hba + lba) / total
-	expHighRef := highBulkTotal * (hbr + lbr) / total
-	expLowAlt := lowBulkTotal * (hba + lba) / total
-	expLowRef := lowBulkTotal * (hbr + lbr) / total
-
+	e := [4]float64{n1 * ca / total, n1 * cb / total, n2 * ca / total, n2 * cb / total}
 	g := 0.0
-	if hba > 0 {
-		g += hba * math.Log(hba/expHighAlt)
-	}
-	if hbr > 0 {
-		g += hbr * math.Log(hbr/expHighRef)
-	}
-	if lba > 0 {
-		g += lba * math.Log(lba/expLowAlt)
-	}
-	if lbr > 0 {
-		g += lbr * math.Log(lbr/expLowRef)
+	for k := range o {
+		if o[k] > 0 {
+			g += o[k] * math.Log(o[k]/e[k])
+		}
 	}
 	return 2 * g
 }
 
+// euclideanDistance4 is ED⁴ (Hill et al. 2013) for a biallelic site: the
+// Euclidean distance between the bulks' allele-frequency vectors is
+// √((ΔSI)² + (−ΔSI)²) = √2·|ΔSI|, so ED⁴ = 4·ΔSI⁴.
 func euclideanDistance4(hSI, lSI float64) float64 {
 	d := hSI - lSI
-	return d * d * d * d
+	return 4 * d * d * d * d
 }
 
 // ExpectedAF is the expected high-parent allele frequency under H₀; see
@@ -535,9 +719,12 @@ func logBeta(a, b float64) float64 {
 	return la + lb - lab
 }
 
-func lod(ref1, alt1, ref2, alt2 int) float64 {
-	n1 := float64(ref1 + alt1)
-	n2 := float64(ref2 + alt2)
+// lod is the two-binomial likelihood ratio (log10) for different allele
+// frequencies in two bulks: a1/b1 are the two allele counts in bulk 1, a2/b2 in
+// bulk 2. It is symmetric in the allele order.
+func lod(a1, b1, a2, b2 int) float64 {
+	n1 := float64(a1 + b1)
+	n2 := float64(a2 + b2)
 	total := n1 + n2
 	if n1 == 0 || n2 == 0 || total == 0 {
 		return 0
@@ -554,9 +741,9 @@ func lod(ref1, alt1, ref2, alt2 int) float64 {
 		return p
 	}
 
-	p1 := clamp(float64(alt1) / n1)
-	p2 := clamp(float64(alt2) / n2)
-	p0 := clamp(float64(alt1+alt2) / total)
+	p1 := clamp(float64(a1) / n1)
+	p2 := clamp(float64(a2) / n2)
+	p0 := clamp(float64(a1+a2) / total)
 
 	logLik := func(k, n, p float64) float64 {
 		if n == 0 {
@@ -565,8 +752,8 @@ func lod(ref1, alt1, ref2, alt2 int) float64 {
 		return k*math.Log(p) + (n-k)*math.Log(1-p)
 	}
 
-	logL1 := logLik(float64(alt1), n1, p1) + logLik(float64(alt2), n2, p2)
-	logL0 := logLik(float64(alt1), n1, p0) + logLik(float64(alt2), n2, p0)
+	logL1 := logLik(float64(a1), n1, p1) + logLik(float64(a2), n2, p2)
+	logL0 := logLik(float64(a1), n1, p0) + logLik(float64(a2), n2, p0)
 	return (logL1 - logL0) / math.Log(10)
 }
 

@@ -68,6 +68,16 @@ type AnalysisConfig struct {
 	// Off by default: such sites may be non-segregating, but they may also be
 	// QTL markers where the bulk is fixed for the parent's allele.
 	RequireNonParentAllele bool
+	// RefParent says which parent the reference genome is, for bulks-only (2b)
+	// mode: "high" (REF is the high-parent allele), "low" (ALT is) or "none"
+	// (unknown, or the reference is not a parent). With "none" the sign of ΔSI
+	// is arbitrary at each SNP, so 2b uses |ΔSI| instead (see SignedDeltaSI).
+	// Ignored in modes with a parent sample.
+	RefParent string
+	// OneBulkP0Mode sets the one-bulk null allele frequency: "empirical" (default;
+	// also when empty) estimates it per polarity from the data to absorb
+	// reference mapping bias, "theoretical" uses the population's expected value.
+	OneBulkP0Mode string
 	// Region calling controls. A zero value selects biologically conservative
 	// defaults derived from the Gaussian smoothing bandwidth.
 	MinQTLWidth   int64
@@ -134,6 +144,14 @@ func (cfg AnalysisConfig) EffectiveMergeDistance() int64 {
 		return int64(cfg.WindowSize / 2)
 	}
 	return 0
+}
+
+// SignedDeltaSI reports whether ΔSI has a meaningful sign for bsaType: true
+// whenever polarity is known (a parent sample, or --ref-parent high|low in 2b).
+// When false (2b with --ref-parent none) the pipeline stores, smooths and
+// thresholds |ΔSI|, has no lower-tail ΔSI track and skips two-bulk BRM.
+func (cfg AnalysisConfig) SignedDeltaSI(bsaType string) bool {
+	return bsaType != "2b" || cfg.RefParent == "high" || cfg.RefParent == "low"
 }
 
 // BulkSizes returns the number of individuals in each bulk used by bsaType.

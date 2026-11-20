@@ -131,7 +131,7 @@ func TestSelectedAltFlowsIntoRawStats(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RawStats: %v", err)
 		}
-		if len(raw) != 1 || raw[0].ALT != "G" || raw[0].HighBulkAD != "10,30" {
+		if len(raw) != 1 || raw[0].ALT != "G" || raw[0].HighBulkH != 10 || raw[0].HighBulkL != 30 {
 			t.Fatalf("split=%v: raw stats used wrong ALT: %+v", split, raw)
 		}
 	}
@@ -370,6 +370,57 @@ func TestSegregationFloorForBulkModes(t *testing.T) {
 	cfg.MinPooledMAF, cfg.Population = -1, "BC1H"
 	if out := run(t, bc, cfg, gatk(), "2b", []int{0, 1}); len(out.sites) != 1 {
 		t.Fatal("BC1 site with minor AF 0.15 removed by the segregation floor")
+	}
+}
+
+// In 2b mode polarity comes only from --ref-parent: low makes ALT the high
+// allele; high and none keep REF. With none, ΔSI is stored as |ΔSI|.
+func TestRefParentPolarity2b(t *testing.T) {
+	vcf := header("high", "low") + rec("chr1", 100, "A", "T", "60", "PASS", ".", "GT:AD:DP", "0/1:10,30:40", "0/1:30,10:40")
+	for _, tc := range []struct {
+		refParent string
+		highIsAlt bool
+		highSI    float64
+		dsi       float64
+	}{
+		{"none", false, 0.25, 0.5},
+		{"", false, 0.25, 0.5}, // unset behaves as none
+		{"high", false, 0.25, -0.5},
+		{"low", true, 0.75, 0.5},
+	} {
+		cfg := bulksCfg()
+		cfg.RefParent = tc.refParent
+		out := run(t, vcf, cfg, gatk(), "2b", []int{0, 1})
+		if len(out.sites) != 1 || out.sites[0].HighIsAlt != tc.highIsAlt {
+			t.Fatalf("--ref-parent %q: want HighIsAlt=%v, got %+v", tc.refParent, tc.highIsAlt, out.sites)
+		}
+		cfg.OutputDir = t.TempDir()
+		raw, err := stats.RawStats(cfg, "2b", []int{0, 1}, out.sites)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw[0].HighSI != tc.highSI || raw[0].DeltaSI != tc.dsi {
+			t.Fatalf("--ref-parent %q: HighSI/DeltaSI = %v/%v, want %v/%v", tc.refParent, raw[0].HighSI, raw[0].DeltaSI, tc.highSI, tc.dsi)
+		}
+	}
+}
+
+// --ref-parent is ignored when a parent sample sets polarity.
+func TestRefParentIgnoredWithParent(t *testing.T) {
+	vcf := header("hp", "hb", "lb") + rec("chr1", 100, "A", "T", "60", "PASS", ".", "GT:AD:DP",
+		"0/0:30,0:30", "0/1:30,10:40", "0/1:10,30:40")
+	cfg := utils.AnalysisConfig{HighParentIdx: 0, HighBulkIdx: 1, LowBulkIdx: 2, HighParentDepth: 1, HighBulkDepth: 1, LowBulkDepth: 1, RefParent: "low"}
+	out := run(t, vcf, cfg, gatk(), "hp2b", []int{0, 1, 2})
+	if len(out.sites) != 1 || out.sites[0].HighIsAlt {
+		t.Fatalf("hp2b with REF high parent: --ref-parent low must not flip polarity, got %+v", out.sites)
+	}
+	cfg.OutputDir = t.TempDir()
+	raw, err := stats.RawStats(cfg, "hp2b", []int{0, 1, 2}, out.sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[0].DeltaSI != 0.5 {
+		t.Fatalf("hp2b DeltaSI = %v, want signed 0.5", raw[0].DeltaSI)
 	}
 }
 

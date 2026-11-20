@@ -63,7 +63,7 @@ type ZThresholds struct {
 // simParams bundles the inputs to a single null simulation run.
 type simParams struct {
 	highDepth int
-	lowDepth  int     // == highDepth for two-bulk with shared depth
+	lowDepth  int     // low-bulk depth (two-bulk); simulated separately from highDepth
 	p0High    float64 // expected AF in high bulk under H₀
 	p0Low     float64 // expected AF in low bulk under H₀ (usually == p0High)
 	p0One     float64 // expected AF for one-bulk mode
@@ -73,6 +73,9 @@ type simParams struct {
 	lowBulkSize  int
 	oneBulkSize  int
 	population   string
+	// absDeltaSI: polarity unknown (2b, --ref-parent none), so the ΔSI
+	// thresholds are for |ΔSI| (upper tail only; the lower-tail ones are NaN).
+	absDeltaSI bool
 }
 
 // ── Module-level caches ──────────────────────────────────────────────────────
@@ -220,6 +223,9 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 		hSIArr[i] = hSI
 		lSIArr[i] = lSI
 		dsiArr[i] = hSI - lSI
+		if p.absDeltaSI {
+			dsiArr[i] = math.Abs(dsiArr[i])
+		}
 		gsArr[i] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
 		edArr[i] = euclideanDistance4(hSI, lSI)
 		lodArr[i] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
@@ -238,6 +244,16 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
 	}
 
+	// Signed ΔSI: P99/Mp99 are the 0.5% tails (99% two-sided). |ΔSI| folds both
+	// tails, so its 99th percentile gives the same 1% false-positive rate, and
+	// there is no lower tail.
+	dsiP99, dsiP95 := q(dsiArr, 0.995), q(dsiArr, 0.95)
+	dsiMp99, dsiMp95 := q(dsiArr, 0.005), q(dsiArr, 0.05)
+	if p.absDeltaSI {
+		dsiP99, dsiP95 = q(dsiArr, 0.99), q(dsiArr, 0.95)
+		dsiMp99, dsiMp95 = math.NaN(), math.NaN()
+	}
+
 	return TwoBulkThresholds{
 		HighSIP99: q(hSIArr, 0.995), HighSIP95: q(hSIArr, 0.95),
 		HighSIMp99: q(hSIArr, 0.005), HighSIMp95: q(hSIArr, 0.05),
@@ -245,8 +261,8 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 		LowSIP99: q(lSIArr, 0.995), LowSIP95: q(lSIArr, 0.95),
 		LowSIMp99: q(lSIArr, 0.005), LowSIMp95: q(lSIArr, 0.05),
 
-		DeltaSIP99: q(dsiArr, 0.995), DeltaSIP95: q(dsiArr, 0.95),
-		DeltaSIMp99: q(dsiArr, 0.005), DeltaSIMp95: q(dsiArr, 0.05),
+		DeltaSIP99: dsiP99, DeltaSIP95: dsiP95,
+		DeltaSIMp99: dsiMp99, DeltaSIMp95: dsiMp95,
 
 		GstatP99: q(gsArr, 0.995), GstatP95: q(gsArr, 0.95),
 		ED4P99: q(edArr, 0.995), ED4P95: q(edArr, 0.95),
@@ -257,9 +273,9 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 
 // twoBulkCacheKey builds a deterministic string key for the memo cache.
 func twoBulkCacheKey(p simParams) string {
-	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d_%s",
+	return fmt.Sprintf("%d_%d_%.6f_%.6f_%d_%d_%d_%d_%s_%t",
 		p.highDepth, p.lowDepth, p.p0High, p.p0Low, p.rep, p.highBulkSize, p.lowBulkSize, p.oneBulkSize,
-		strings.ToUpper(strings.TrimSpace(p.population)))
+		strings.ToUpper(strings.TrimSpace(p.population)), p.absDeltaSI)
 }
 
 // simulateTwoBulkCached returns cached results or runs the simulation once.
@@ -718,21 +734,32 @@ func countZStats(bsaType string) int {
 
 // ── Parallel warm-up ─────────────────────────────────────────────────────────
 
-// warmUpTwoBulkCache pre-computes thresholds for every unique depth observed in
-// the smoothed data.  Work is spread across all available CPU cores.
+// siteBulkDepths is the (high, low) depth pair a two-bulk site is simulated
+// at: its own per-bulk depths, or the effective depth for both when those are
+// absent.
+func siteBulkDepths(sm SmoothedStats) (int, int) {
+	if sm.HighDepth > 0 && sm.LowDepth > 0 {
+		return sm.HighDepth, sm.LowDepth
+	}
+	return sm.Depth, sm.Depth
+}
+
+// warmUpTwoBulkCache pre-computes thresholds for every unique (high, low)
+// depth pair observed in the smoothed data, so unequal bulk depths are
+// simulated as they are. Work is spread across all available CPU cores.
 func warmUpTwoBulkCache(smoothed []SmoothedStats, p simParams) {
-	// Collect unique depth values.
-	seen := make(map[int]struct{})
+	// Collect unique depth pairs.
+	seen := make(map[[2]int]struct{})
 	for _, sm := range smoothed {
-		if sm.Depth > 0 {
-			seen[sm.Depth] = struct{}{}
+		if h, l := siteBulkDepths(sm); h > 0 && l > 0 {
+			seen[[2]int{h, l}] = struct{}{}
 		}
 	}
 	if len(seen) == 0 {
 		return
 	}
 
-	depths := make([]int, 0, len(seen))
+	depths := make([][2]int, 0, len(seen))
 	for d := range seen {
 		depths = append(depths, d)
 	}
@@ -743,7 +770,7 @@ func warmUpTwoBulkCache(smoothed []SmoothedStats, p simParams) {
 		progressbar.OptionShowCount(),
 	)
 
-	jobs := make(chan int, len(depths))
+	jobs := make(chan [2]int, len(depths))
 	for _, d := range depths {
 		jobs <- d
 	}
@@ -756,8 +783,7 @@ func warmUpTwoBulkCache(smoothed []SmoothedStats, p simParams) {
 			defer wg.Done()
 			for depth := range jobs {
 				pp := p
-				pp.highDepth = depth
-				pp.lowDepth = depth
+				pp.highDepth, pp.lowDepth = depth[0], depth[1]
 				simulateTwoBulkCached(pp)
 				_ = bar.Add(1)
 			}
@@ -865,6 +891,7 @@ func CalculateThresholds(
 		lowBulkSize:  lowBulkSize,
 		oneBulkSize:  oneBulkSize,
 		population:   cfg.Population,
+		absDeltaSI:   !cfg.SignedDeltaSI(bsaType),
 	}
 
 	// Pre-populate the cache in parallel for every depth in the dataset.
@@ -889,8 +916,7 @@ func CalculateThresholds(
 
 		if hasBothBulks {
 			p := base
-			p.highDepth = sm.Depth
-			p.lowDepth = sm.Depth
+			p.highDepth, p.lowDepth = siteBulkDepths(sm)
 			t.TwoBulk = simulateTwoBulkCached(p)
 		}
 		if hasOneBulk {
@@ -946,6 +972,7 @@ func writeThresholdsTSV(
 
 	if hasBothBulks {
 		header = append(header,
+			"HighDepth", "LowDepth", // the depth pair the two-bulk null was simulated at
 			"HighSI_P99", "HighSI_P95", "HighSI_Mp99", "HighSI_Mp95",
 			"LowSI_P99", "LowSI_P95", "LowSI_Mp99", "LowSI_Mp95",
 			"DeltaSI_P99", "DeltaSI_P95", "DeltaSI_Mp99", "DeltaSI_Mp95",
@@ -985,7 +1012,9 @@ func writeThresholdsTSV(
 
 		if hasBothBulks {
 			tb := t.TwoBulk
+			hd, ld := siteBulkDepths(sm)
 			row = append(row,
+				fmt.Sprintf("%d", hd), fmt.Sprintf("%d", ld),
 				f4(tb.HighSIP99), f4(tb.HighSIP95), f4(tb.HighSIMp99), f4(tb.HighSIMp95),
 				f4(tb.LowSIP99), f4(tb.LowSIP95), f4(tb.LowSIMp99), f4(tb.LowSIMp95),
 				f4(tb.DeltaSIP99), f4(tb.DeltaSIP95), f4(tb.DeltaSIMp99), f4(tb.DeltaSIMp95),

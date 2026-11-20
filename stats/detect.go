@@ -399,6 +399,23 @@ var twoBulkStatConfigs = []peakStatConfig{
 	{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP99 }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }, UpperTail, "BBLogBF"},
 }
 
+// absDeltaSIStatConfigs replaces twoBulkStatConfigs when polarity is unknown
+// (2b, --ref-parent none): SmDeltaSI holds smoothed |ΔSI|, so there is one
+// upper-tail track and no DeltaSI- track.
+var absDeltaSIStatConfigs = func() []peakStatConfig {
+	var out []peakStatConfig
+	for _, c := range twoBulkStatConfigs {
+		switch c.name {
+		case "DeltaSI-":
+			continue
+		case "DeltaSI+":
+			c.name, c.label = "AbsDeltaSI", "AbsDeltaSI"
+		}
+		out = append(out, c)
+	}
+	return out
+}()
+
 var oneBulkStatConfigs = []peakStatConfig{
 	{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }, UpperTail, "AFDev"},
 	{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp95 }, LowerTail, "AFDev-"},
@@ -431,7 +448,7 @@ func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
 
 	switch p.Stat {
 
-	case "DeltaSI+", "DeltaSI-":
+	case "DeltaSI+", "DeltaSI-", "AbsDeltaSI":
 		q.DeltaSI = peak
 
 	case "Gstat":
@@ -734,8 +751,13 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 	return nil
 }
 
-func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
+// signedDSI is cfg.SignedDeltaSI(bsaType): false selects the |ΔSI| track set.
+func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsaType string, signedDSI bool, mergeGap int64) ([]PeakIntersection, []ConsolidatedQTL) {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
+	twoBulkConfigs := twoBulkStatConfigs
+	if !signedDSI {
+		twoBulkConfigs = absDeltaSIStatConfigs
+	}
 
 	var peaks []PeakIntersection
 	var qtls []ConsolidatedQTL
@@ -756,7 +778,7 @@ func DetectIndividualQTLs(smoothed []SmoothedStats, thresholds []Thresholds, bsa
 
 		var chrPeaks []PeakIntersection
 		if hasBothBulks {
-			chrPeaks = append(chrPeaks, collectPeaks(sm, th, twoBulkStatConfigs)...)
+			chrPeaks = append(chrPeaks, collectPeaks(sm, th, twoBulkConfigs)...)
 		}
 		if hasOneBulk {
 			chrPeaks = append(chrPeaks, collectPeaks(sm, th, oneBulkStatConfigs)...)

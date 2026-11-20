@@ -212,6 +212,18 @@ var rootCmd = &cobra.Command{
 		noSplitMultiallelic, _ := cmd.Flags().GetBool("no-split-multiallelic")
 		minPooledMAF, _ := cmd.Flags().GetFloat64("min-pooled-maf")
 		requireNonParent, _ := cmd.Flags().GetBool("require-nonparent-allele")
+		oneBulkP0Mode, _ := cmd.Flags().GetString("one-bulk-p0")
+		oneBulkP0Mode = strings.ToLower(strings.TrimSpace(oneBulkP0Mode))
+		if oneBulkP0Mode != "empirical" && oneBulkP0Mode != "theoretical" {
+			color.Red("Error: --one-bulk-p0 must be empirical or theoretical, got %q", oneBulkP0Mode)
+			os.Exit(1)
+		}
+		refParent, _ := cmd.Flags().GetString("ref-parent")
+		refParent = strings.ToLower(strings.TrimSpace(refParent))
+		if refParent != "high" && refParent != "low" && refParent != "none" {
+			color.Red("Error: --ref-parent must be high, low or none, got %q", refParent)
+			os.Exit(1)
+		}
 		bulkSizes, _ := cmd.Flags().GetString("bulk-sizes")
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
@@ -426,6 +438,8 @@ var rootCmd = &cobra.Command{
 			SplitMultiallelic:      !noSplitMultiallelic,
 			MinPooledMAF:           minPooledMAF,
 			RequireNonParentAllele: requireNonParent,
+			RefParent:              refParent,
+			OneBulkP0Mode:          oneBulkP0Mode,
 			OutputDir:              resultsDir,
 
 			HighParentName:     highParentName,
@@ -502,6 +516,8 @@ func init() {
 	rootCmd.Flags().Int("min-GQ", 0, "Minimum genotype quality (GQ) for PARENT samples; 0 = disabled, applied only when GQ present (not applied to bulks, to avoid AF-correlated bias)")
 	rootCmd.Flags().Bool("no-split-multiallelic", false, "Do not decompose multi-allelic records into biallelic records before filtering")
 	rootCmd.Flags().Bool("require-nonparent-allele", false, "One parent + one bulk modes: drop sites where the bulk has <2 reads of the allele the parent does not carry (removes non-segregating sites, but also QTL markers where the bulk is fixed for the parent's allele)")
+	rootCmd.Flags().String("one-bulk-p0", "empirical", "One-bulk modes: null allele frequency of the high-parent allele. empirical = genome-wide median per polarity (absorbs reference mapping bias); theoretical = the population's expected value")
+	rootCmd.Flags().String("ref-parent", "none", "Bulks-only (2b) mode: which parent the reference genome is (high, low or none). high/low fixes allele polarity so ΔSI is signed; none (unknown, or the reference is not a parent) makes 2b use |ΔSI|. Use high/low only if the reference is that parent or the same inbred line. Ignored when a parent sample is given")
 	rootCmd.Flags().Float64("min-pooled-maf", -1, "Segregation floor for 2b/hp2b/lp2b: minimum pooled minor allele frequency of the two bulks (-1 = auto: 0.4 x expected minor AF, 0.2 for F2; 0 = off)")
 
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //

@@ -62,7 +62,10 @@ type SmoothedStats struct {
 	POS   int64
 	REF   string
 	ALT   string
-	Depth int
+	Depth int // effective depth (see BSAstats.Depth)
+	// Per-bulk depths of the site, for two-bulk thresholds and BRM.
+	HighDepth int
+	LowDepth  int
 
 	// ── smoothed raw values ─────────────────────────────────────────────
 	// Two-bulk
@@ -135,7 +138,8 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 	normalise(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
 
 	// ── 3. Stouffer's Z consolidation ─────────────────────────────────────
-	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk)
+	signedDSI := cfg.SignedDeltaSI(bsaType)
+	consolidate(smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI)
 
 	// ── 4. Write TSV ───────────────────────────────────────────────────────
 	outDir := filepath.Join(cfg.OutputDir, "stats")
@@ -143,7 +147,7 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 		return nil, err
 	}
 	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.smoothed_and_normalised.tsv", bsaType))
-	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk); err != nil {
+	if err := writeSmoothedTSV(outPath, smoothed, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI); err != nil {
 		return nil, err
 	}
 
@@ -296,6 +300,7 @@ func gaussianSmooth(raw []BSAstats, bw float64, hasHighBulk, hasLowBulk, hasBoth
 			s.REF = raw[ci].REF
 			s.ALT = raw[ci].ALT
 			s.Depth = raw[ci].Depth
+			s.HighDepth, s.LowDepth = raw[ci].HighDepth, raw[ci].LowDepth
 			if hasOneBulk {
 				s.OneBulkP0 = raw[ci].OneBulkP0
 			}
@@ -488,7 +493,7 @@ func medianOf(vals []float64) float64 {
 // IMPORTANT: countZStats() in thresholds.go must return the same k = 3 value for
 // each bsaType mode so that the CompositeZ null simulation uses the correct
 // denominator.  Any change here must be mirrored there.
-func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) {
+func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI bool) {
 	for i := range sm {
 		s := &sm[i]
 
@@ -498,7 +503,15 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 			// |ZDeltaSI| folds both tails into a single positive signal-strength
 			// score, matching the always-positive ZGstat and ZLOD components so
 			// the Stouffer sum and its null distribution are symmetric.
-			czs = append(czs, math.Abs(s.ZDeltaSI), s.ZGstat, s.ZLOD)
+			//
+			// Without polarity (signedDSI false) SmDeltaSI is already smoothed |ΔSI|,
+			// so its Z is used as is: Z(|ΔSI|), which is also what the CompositeZ
+			// null simulates. Folding it again would score low |ΔSI| as signal.
+			zd := s.ZDeltaSI
+			if signedDSI {
+				zd = math.Abs(zd)
+			}
+			czs = append(czs, zd, s.ZGstat, s.ZLOD)
 		}
 		if hasOneBulk {
 			czs = append(czs, math.Abs(s.ZAFDev), s.ZOneBulkG, s.ZOneBulkLOD)
@@ -541,7 +554,7 @@ func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasO
 
 // ─── TSV output ────────────────────────────────────────────────────────────────
 
-func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool) error {
+func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI bool) error {
 	f, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -553,6 +566,9 @@ func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBu
 
 	// Build header.
 	header := []string{"CHROM", "POS", "REF", "ALT", "Depth"}
+	if hasBothBulks {
+		header = append(header, "HighDepth", "LowDepth")
+	}
 	if hasHighBulk {
 		header = append(header, "Sm_HighSI", "Z_HighSI")
 	}
@@ -561,7 +577,7 @@ func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBu
 	}
 	if hasBothBulks {
 		header = append(header,
-			"Sm_DeltaSI", "Z_DeltaSI",
+			"Sm_"+DeltaSIName(signedDSI), "Z_"+DeltaSIName(signedDSI),
 			"Sm_Gstat", "Z_Gstat",
 			"Sm_ED4", "Z_ED4",
 			"Sm_LOD", "Z_LOD",
@@ -589,6 +605,9 @@ func writeSmoothedTSV(filename string, sm []SmoothedStats, hasHighBulk, hasLowBu
 			s.REF,
 			s.ALT,
 			fmt.Sprintf("%d", s.Depth),
+		}
+		if hasBothBulks {
+			row = append(row, fmt.Sprintf("%d", s.HighDepth), fmt.Sprintf("%d", s.LowDepth))
 		}
 		if hasHighBulk {
 			row = append(row, f6(s.SmHighSI), f6(s.ZHighSI))

@@ -44,7 +44,7 @@ type Site struct {
 	Chrom     string
 	Pos       int64
 	Ref, Alt  string
-	HighIsAlt bool // the high-parent allele is the ALT allele (false: REF; always false in 2b mode)
+	HighIsAlt bool // the high-parent allele is the ALT allele (false: REF). In 2b mode it is set only by --ref-parent low
 	Samples   [4]SampleAD
 	NSamples  uint8
 }
@@ -386,6 +386,12 @@ func (f *Filterer) bsaCheck(sa []SampleAD) (highIsAlt bool, why drop) {
 	}
 	// The high-parent allele: the high parent's, else the one the low parent lacks.
 	highIsAlt = ha == 1 || (ha < 0 && la == 0)
+	// No parent sample (2b): polarity is known only if the reference genome is a
+	// parent. --ref-parent low means REF is the low parent's allele, so ALT is
+	// the high one; high and none leave REF as the reference allele for SI.
+	if ha < 0 && la < 0 && c.RefParent == "low" {
+		highIsAlt = true
+	}
 
 	if twoBulks && !twoParents && f.minPooledMAF > 0 {
 		h, l := &sa[f.r.hb], &sa[f.r.lb]
@@ -692,6 +698,18 @@ func (f *Filterer) reportActiveFilters(p FilterProfile) {
 		} else {
 			color.Yellow("BSA gate: segregation filter disabled (--min-pooled-maf 0)")
 		}
+	}
+	if f.r.hp < 0 && f.r.lp < 0 {
+		switch cfg.RefParent {
+		case "high", "low":
+			color.Blue("Polarity (2b): reference genome is the %s parent (--ref-parent), so ΔSI is signed", cfg.RefParent)
+		default:
+			color.Yellow("Polarity (2b): unknown (--ref-parent none). SI is the REF fraction, whose sign vs the parents " +
+				"varies by SNP, so 2b uses |ΔSI|: QTLs can be found but not which bulk carries which parent's allele. " +
+				"Two-bulk BRM is skipped.")
+		}
+	} else if cfg.RefParent == "high" || cfg.RefParent == "low" {
+		color.Yellow("--ref-parent %s ignored: polarity comes from the parent sample(s)", cfg.RefParent)
 	}
 	if !(f.r.hb >= 0 && f.r.lb >= 0) && !(f.r.hp >= 0 && f.r.lp >= 0) {
 		if cfg.RequireNonParentAllele {
