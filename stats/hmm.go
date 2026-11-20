@@ -58,7 +58,8 @@ import (
 // (reads combined); every marker gets its bin's LOD.
 //
 // The HMM needs the high-parent allele at every SNP, so it is not computed in
-// 2b mode without --ref-parent.
+// 2b mode without --ref-parent (a phase-free joint two-bulk model was tried
+// and is kept in oldcode/hmmjoint.go.backup; it was ~20× slower).
 
 const (
 	hmmSeqError = 0.01   // per-read probability of reading the other allele
@@ -163,16 +164,19 @@ func (m *poolModel) switchProbs(dM float64) (a, b float64) {
 	return math.Min(2*(1-m.pi)*r, 1), math.Min(2*m.pi*r, 1)
 }
 
-// stepTables holds one gap's per-unit binomial terms: powA[j] = (1−a)^j,
-// powB[k] = (1−b)^k, for the loss and gain distributions.
+// stepTables holds one gap's per-unit switch probabilities and scratch for
+// the binomial loss and gain distributions: powA[j] = (1−a)^j and
+// powB[k] = (1−b)^k start them.
 type stepTables struct {
-	a, b, ra, rb float64
-	powA, powB   []float64
+	a, b, ra, rb     float64
+	powA, powB       []float64
+	lossBuf, gainBuf []float64
 }
 
 func (m *poolModel) tables(t *stepTables, a, b float64) {
 	if len(t.powA) != m.U+1 {
 		t.powA, t.powB = make([]float64, m.U+1), make([]float64, m.U+1)
+		t.lossBuf, t.gainBuf = make([]float64, m.U+1), make([]float64, m.U+1)
 	}
 	t.a, t.b, t.ra, t.rb = a, b, a/(1-a), b/(1-b)
 	t.powA[0], t.powB[0] = 1, 1
@@ -182,74 +186,75 @@ func (m *poolModel) tables(t *stepTables, a, b float64) {
 	}
 }
 
-// Truncation of the binomial loss/gain sums: stop past the mean once terms
-// fall below binomTail.
+// Truncation of the binomial loss/gain distributions: stop past the mean once
+// terms fall below binomTail.
 const binomTail = 1e-15
 
+// binomInto fills buf[0:k] with P(Binomial(n, p) = i), i < k, truncated past
+// the mean once terms fall below binomTail, and returns k. pow0 = (1−p)^n,
+// ratio = p/(1−p).
+func binomInto(buf []float64, n int, p, ratio, pow0 float64) int {
+	if p == 0 {
+		buf[0] = 1
+		return 1
+	}
+	pk, mean := pow0, float64(n)*p
+	for i := 0; i <= n; i++ {
+		buf[i] = pk
+		pk *= float64(n-i) / float64(i+1) * ratio
+		if float64(i) > mean && pk < binomTail {
+			return i + 1
+		}
+	}
+	return n + 1
+}
+
 // forwardStep sets dst = Tᵀ src: the distribution of j at the next marker
-// given src at this one (losses, then gains). scratch has length U+1.
-func (m *poolModel) forwardStep(dst, src, scratch []float64, t *stepTables) {
+// given src at this one. Exact per-unit model: from state j, l ~ Bin(j, a)
+// high units switch to low and, independently, g ~ Bin(U − j, b) low units
+// switch to high; j' = j − l + g (as the null simulation draws it). The
+// scratch argument is unused (kept for the callers' shape).
+func (m *poolModel) forwardStep(dst, src, _ []float64, t *stepTables) {
 	if t.a == 0 && t.b == 0 {
 		copy(dst, src)
 		return
 	}
-	clear(scratch)
-	for j, v := range src { // losses: l ~ Bin(j, a)
-		if v == 0 {
-			continue
-		}
-		pk, mean := t.powA[j], float64(j)*t.a
-		for l := 0; l <= j; l++ {
-			scratch[j-l] += v * pk
-			pk *= float64(j-l) / float64(l+1) * t.ra
-			if float64(l) > mean && pk < binomTail {
-				break
-			}
-		}
-	}
 	clear(dst)
-	for mm, v := range scratch { // gains: g ~ Bin(U−m, b)
+	for j, v := range src {
 		if v == 0 {
 			continue
 		}
-		n := m.U - mm
-		pk, mean := t.powB[n], float64(n)*t.b
-		for g := 0; g <= n; g++ {
-			dst[mm+g] += v * pk
-			pk *= float64(n-g) / float64(g+1) * t.rb
-			if float64(g) > mean && pk < binomTail {
-				break
+		nl := binomInto(t.lossBuf, j, t.a, t.ra, t.powA[j])
+		ng := binomInto(t.gainBuf, m.U-j, t.b, t.rb, t.powB[m.U-j])
+		gain := t.gainBuf[:ng]
+		for l := range nl {
+			base := v * t.lossBuf[l]
+			row := dst[j-l : j-l+ng]
+			for g, pg := range gain {
+				row[g] += base * pg
 			}
 		}
 	}
 }
 
-// backwardStep sets dst(j) = Σ_j' T(j→j') src(j').
-func (m *poolModel) backwardStep(dst, src, scratch []float64, t *stepTables) {
+// backwardStep sets dst(j) = Σ_j' T(j→j') src(j') for the same transition.
+func (m *poolModel) backwardStep(dst, src, _ []float64, t *stepTables) {
 	if t.a == 0 && t.b == 0 {
 		copy(dst, src)
 		return
 	}
-	for mm := range scratch { // w(m) = Σ_g Bin(g; U−m, b)·src(m+g)
-		n := m.U - mm
-		pk, mean, s := t.powB[n], float64(n)*t.b, 0.0
-		for g := 0; g <= n; g++ {
-			s += pk * src[mm+g]
-			pk *= float64(n-g) / float64(g+1) * t.rb
-			if float64(g) > mean && pk < binomTail {
-				break
+	for j := range dst {
+		nl := binomInto(t.lossBuf, j, t.a, t.ra, t.powA[j])
+		ng := binomInto(t.gainBuf, m.U-j, t.b, t.rb, t.powB[m.U-j])
+		gain := t.gainBuf[:ng]
+		s := 0.0
+		for l := range nl {
+			row := src[j-l : j-l+ng]
+			inner := 0.0
+			for g, pg := range gain {
+				inner += pg * row[g]
 			}
-		}
-		scratch[mm] = s
-	}
-	for j := range dst { // dst(j) = Σ_l Bin(l; j, a)·w(j−l)
-		pk, mean, s := t.powA[j], float64(j)*t.a, 0.0
-		for l := 0; l <= j; l++ {
-			s += pk * scratch[j-l]
-			pk *= float64(j-l) / float64(l+1) * t.ra
-			if float64(l) > mean && pk < binomTail {
-				break
-			}
+			s += t.lossBuf[l] * inner
 		}
 		dst[j] = s
 	}
@@ -524,7 +529,7 @@ func computeHMMLOD(s *hmmSetup, raw []BSAstats, order *markerOrder) {
 		go func() {
 			defer wg.Done()
 			for idx := range jobs {
-				s.chromLOD(raw, idx)
+				s.chromLOD(raw, idx, order.rep)
 			}
 		}()
 	}
@@ -536,8 +541,10 @@ func computeHMMLOD(s *hmmSetup, raw []BSAstats, order *markerOrder) {
 }
 
 // chromLOD computes the HMM LOD for one chromosome's sites (indices into raw,
-// sorted by position).
-func (s *hmmSetup) chromLOD(raw []BSAstats, idx []int) {
+// sorted by position). Only representative views (rep) contribute reads: the
+// views of a split multi-allelic site share their reads, so multiplying them
+// would count those reads more than once.
+func (s *hmmSetup) chromLOD(raw []BSAstats, idx []int, rep []bool) {
 	n := len(idx)
 	gaps := gapsMorgans(raw, idx, s.cmPerMb)
 
@@ -563,6 +570,9 @@ func (s *hmmSetup) chromLOD(raw []BSAstats, idx []int) {
 		}
 		for x, i := range idx {
 			r := &raw[i]
+			if !rep[i] { // non-representative view: no reads (d = 0)
+				continue
+			}
 			if high {
 				d.h[x], d.d[x] = r.HighBulkH, r.HighBulkH+r.HighBulkL
 			} else {

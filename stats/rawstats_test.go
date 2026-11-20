@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -21,7 +22,7 @@ func site2b(pos int64, hRef, hAlt, lRef, lAlt, hOther int32) filter.Site {
 // Stored values are full precision: a small ΔSI gives a non-zero ED⁴, and the
 // TSV prints it rather than 0.000000.
 func TestRawStatsNotRounded(t *testing.T) {
-	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high"}
+	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high", Population: "F2", HighBulkSize: 20, LowBulkSize: 20}
 	raw, err := RawStats(cfg, "2b", []int{0, 1}, []filter.Site{site2b(100, 101, 99, 99, 101, 3)})
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,8 @@ func TestWriteRawTSVReportsWriteErrors(t *testing.T) {
 	}
 	sites := benchSites(2, 50000) // more output than the 1 MB bufio buffer
 	calc := rawCalc{roles: siteRoles{hp: -1, lp: -1, hb: 0, lb: 1}, signedDSI: true}
-	if _, err := computeAndWriteRaw("/dev/full", sites, calc, rawLayout{highBulk: true, lowBulk: true, signedDSI: true}); err == nil {
+	results := computeRaw(sites, calc)
+	if err := writeRaw("/dev/full", results, sites, calc.roles, rawLayout{highBulk: true, lowBulk: true, signedDSI: true}); err == nil {
 		t.Fatal("writing to a full device returned nil")
 	}
 }
@@ -98,7 +100,7 @@ func TestED4(t *testing.T) {
 
 // Unequal bulk depths are kept separately; Depth is their harmonic mean.
 func TestRawStatsBulkDepths(t *testing.T) {
-	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high"}
+	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high", Population: "F2", HighBulkSize: 20, LowBulkSize: 20}
 	raw, err := RawStats(cfg, "2b", []int{0, 1}, []filter.Site{site2b(100, 40, 40, 12, 13, 0)})
 	if err != nil {
 		t.Fatal(err)
@@ -146,7 +148,7 @@ func TestOneBulkP0Empirical(t *testing.T) {
 		{"", 0.55, 0.45, 0, 0}, // unset = empirical
 		{"theoretical", 0.5, 0.5, 0.05, -0.05},
 	} {
-		cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), Population: "F2", OneBulkP0Mode: tc.mode}
+		cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), Population: "F2", OneBulkP0Mode: tc.mode, HighBulkSize: 20, LowBulkSize: 20}
 		raw, err := RawStats(cfg, "hphb", []int{0, 1}, sites)
 		if err != nil {
 			t.Fatal(err)
@@ -186,5 +188,61 @@ func TestOneBulkP0IgnoresCommonShift(t *testing.T) {
 	p0 := oneBulkP0ByPolarity("empirical", sites, 1, 0.5)
 	if math.Abs(p0[0]-0.55) > 1e-9 || math.Abs(p0[1]-0.45) > 1e-9 {
 		t.Fatalf("p0 = %v, want [0.55 0.45]", p0)
+	}
+}
+
+// The HMM LOD is computed in the raw stage, written to the raw TSV, and
+// carried unsmoothed into the smoothed output (no Z, not in CompositeZ).
+func TestHMMLODRawColumnCarriedThrough(t *testing.T) {
+	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high", Population: "F2", HighBulkSize: 20, LowBulkSize: 20,
+		WindowSize: 2_000_000}
+	var sites []filter.Site
+	for i := range 400 {
+		h := int32(20 + i%7) // high bulk enriched for REF in the middle of the chromosome
+		if i > 150 && i < 250 {
+			h = 40
+		}
+		sites = append(sites, site2b(int64(1000+i*50_000), h, 50-h, 25, 25, 0))
+	}
+	raw, err := RawStats(cfg, "2b", []int{0, 1}, sites)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tsv, err := os.ReadFile(filepath.Join(cfg.OutputDir, "stats", "GoBSAseq.2b.raw.tsv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(tsv)), "\n")
+	hdr := strings.Split(lines[0], "\t")
+	c := -1
+	for i, h := range hdr {
+		if h == "HMMLOD" {
+			c = i
+		}
+	}
+	if c < 0 || len(lines)-1 != len(raw) {
+		t.Fatalf("header %v, %d rows for %d sites", hdr, len(lines)-1, len(raw))
+	}
+	byPos := map[int64]float64{}
+	maxLOD := 0.0
+	for i, s := range raw {
+		v, err := strconv.ParseFloat(strings.Split(lines[i+1], "\t")[c], 64)
+		if err != nil || math.Abs(v-s.HMMLOD) > 5e-7 {
+			t.Fatalf("row %d: TSV HMMLOD %q, BSAstats %v", i, strings.Split(lines[i+1], "\t")[c], s.HMMLOD)
+		}
+		byPos[s.POS] = s.HMMLOD
+		maxLOD = math.Max(maxLOD, s.HMMLOD)
+	}
+	if maxLOD < 3 {
+		t.Fatalf("max HMM LOD %v: want a clear peak", maxLOD)
+	}
+	sm, err := SmoothAndNormalise(cfg, "2b", raw)
+	if err != nil || len(sm) == 0 {
+		t.Fatal(err, len(sm))
+	}
+	for _, s := range sm {
+		if s.HMMLOD != byPos[s.POS] {
+			t.Fatalf("pos %d: smoothed HMMLOD %v, raw %v", s.POS, s.HMMLOD, byPos[s.POS])
+		}
 	}
 }

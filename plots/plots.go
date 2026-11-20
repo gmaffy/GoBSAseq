@@ -513,7 +513,7 @@ func createCompositeChart(
 
 	title := chrom + " — Composite Signal"
 	subtitle := fmt.Sprintf(
-		"Stouffer CompositeZ (ΔSI + G-stat + HMM LOD, k=%d) and max |Z| envelope. "+
+		"Stouffer CompositeZ (ΔSI + G′, k=%d; the HMM LOD is a separate track) and max |Z| envelope. "+
 			"Dashed lines: genome-null simulation p99 (%.3f) and p95 (%.3f). "+
 			"Shaded bands: BRM blocks.",
 		czThresh.NumStats, czP99, czP95,

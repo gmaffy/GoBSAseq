@@ -1,0 +1,296 @@
+package stats
+
+import "math"
+
+// Phase-free joint two-bulk HMM LOD, for 2b mode without --ref-parent.
+//
+// Without a parent sample nobody knows, at a given SNP, whether REF is the
+// high or the low parent's allele: the "phase". It is the same for both bulks
+// (they share the reference genome) and independent between SNPs (the
+// reference is a mosaic of the two parents' alleles), so the two bulks can no
+// longer be modelled separately. The hidden state is the pair (j_H, j_L) of
+// high-allele unit counts in the two pools; linkage still acts on each pool
+// independently, so a transition applies each pool's chain along its own axis.
+//
+// Reads are REF counts. With f_j the high-allele frequency of state j, a SNP's
+// REF reads come from frequency f (REF = high allele) or 1 − f (REF = low
+// allele) with probability ½ each, and 1 − f_j = f_{U−j}, so its emission is
+//
+//	E(j_H, j_L) = ½·[a(j_H)·b(j_L) + a(U_H − j_H)·b(U_L − j_L)]
+//
+// with a, b the high- and low-bulk read likelihoods taking REF as the high
+// allele. This is exact for every population, and flipping REF/ALT at any SNP
+// leaves the LOD unchanged, so it needs no polarity and the null simulation
+// needs no phase randomisation.
+//
+// The LOD is the same differential test as the polarised two-bulk HMM: the
+// pools' frequencies free vs both pools drawn around one shared frequency f
+// (itself free, maximised over the same f grid), at each bin, from
+// L(j_H, j_L) ∝ P(all reads | state at the bin) = α·β / prior.
+//
+// Cost: (U_H+1)(U_L+1) states (1681 for two 20-plant F2 bulks) per bin
+// instead of U+1 per bulk; markers within 0.01 cM share a bin as in the
+// polarised HMM.
+
+// jointChromLOD returns the phase-free two-bulk LOD of every bin of a
+// chromosome. hd and ld are the high and low bulks' REF reads and depths.
+func (s *hmmSetup) jointChromLOD(hd, ld hmmBulkData, binStart []int, dM []float64) []float64 {
+	mh, ml := s.high, s.low
+	SH, SL := mh.U+1, ml.U+1
+	S := SH * SL
+	nb := len(binStart) - 1
+
+	// With p0 = 0.5 (F2, F3, F4, RIL) the joint likelihood is symmetric under
+	// (j_H, j_L) → (U_H − j_H, U_L − j_L), so the shared-frequency sum is the
+	// same at f and 1 − f and only half the f grid is evaluated.
+	sym := mh.pi == 0.5 && ml.pi == 0.5
+	prior := make([]float64, S)
+	for jh := range SH {
+		for jl := range SL {
+			prior[jh*SL+jl] = mh.prior[jh] * ml.prior[jl]
+		}
+	}
+
+	var cacheH, cacheL logCache
+	aBuf, bBuf, bRev := make([]float64, SH), make([]float64, SL), make([]float64, SL)
+	// emission fills e with the bin's joint read likelihood, scaled to max 1
+	// after each marker. Exact (no truncation): the LOD divides by the prior,
+	// which is ~1e-12 at extreme states, so even tiny emission values matter.
+	emission := func(e []float64, lo, hi int) {
+		for c := range e {
+			e[c] = 1
+		}
+		for x := lo; x < hi; x++ {
+			if hd.d[x] == 0 && ld.d[x] == 0 {
+				continue
+			}
+			readLik(aBuf, mh, &cacheH, hd.h[x], hd.d[x])
+			readLik(bBuf, ml, &cacheL, ld.h[x], ld.d[x])
+			for jl := range SL {
+				bRev[jl] = bBuf[SL-1-jl] // b(U_L − j_L)
+			}
+			// e is symmetric under (j_H, j_L) → (U_H − j_H, U_L − j_L), i.e.
+			// c → S−1−c (each marker averages both phases, and the start is
+			// all ones), so only the first half is computed and mirrored.
+			mx := 0.0
+			c := 0
+		rows:
+			for jh := range SH {
+				aj, ar := 0.5*aBuf[jh], 0.5*aBuf[SH-1-jh]
+				for jl := range SL {
+					if c > (S-1)/2 {
+						break rows
+					}
+					v := e[c] * (aj*bBuf[jl] + ar*bRev[jl])
+					e[c], e[S-1-c] = v, v
+					if v > mx {
+						mx = v
+					}
+					c++
+				}
+			}
+			if mx > 0 {
+				inv := 1 / mx
+				for c := range e {
+					e[c] *= inv
+				}
+			}
+		}
+	}
+
+	var tabH, tabL stepTables
+	colIn, colOut := make([]float64, SH), make([]float64, SH)
+	scratchH, scratchL := make([]float64, SH), make([]float64, SL)
+	tmp := make([]float64, S)
+	// step applies the joint transition (forward: T_H ⊗ T_L transposed;
+	// backward: T_H ⊗ T_L) from src to dst, one axis at a time.
+	step := func(dst, src []float64, dMx float64, forward bool) {
+		aH, bH := mh.switchProbs(dMx)
+		aL, bL := ml.switchProbs(dMx)
+		mh.tables(&tabH, aH, bH)
+		ml.tables(&tabL, aL, bL)
+		for jh := range SH { // low-bulk axis: rows are contiguous
+			if allZero(src[jh*SL : (jh+1)*SL]) {
+				clear(tmp[jh*SL : (jh+1)*SL])
+				continue
+			}
+			if forward {
+				ml.forwardStep(tmp[jh*SL:(jh+1)*SL], src[jh*SL:(jh+1)*SL], scratchL, &tabL)
+			} else {
+				ml.backwardStep(tmp[jh*SL:(jh+1)*SL], src[jh*SL:(jh+1)*SL], scratchL, &tabL)
+			}
+		}
+		for jl := range SL { // high-bulk axis: gather, step, scatter
+			nz := false
+			for jh := range SH {
+				colIn[jh] = tmp[jh*SL+jl]
+				nz = nz || colIn[jh] != 0
+			}
+			if !nz {
+				for jh := range SH {
+					dst[jh*SL+jl] = 0
+				}
+				continue
+			}
+			if forward {
+				mh.forwardStep(colOut, colIn, scratchH, &tabH)
+			} else {
+				mh.backwardStep(colOut, colIn, scratchH, &tabH)
+			}
+			for jh := range SH {
+				dst[jh*SL+jl] = colOut[jh]
+			}
+		}
+	}
+
+	// Forward pass: α per bin, normalised to sum 1, stored as float32.
+	alpha := make([]float32, nb*S)
+	cur, prev, e := make([]float64, S), make([]float64, S), make([]float64, S)
+	for x := range nb {
+		if x == 0 {
+			copy(cur, prior)
+		} else {
+			step(cur, prev, dM[x], true)
+		}
+		emission(e, binStart[x], binStart[x+1])
+		sum := 0.0
+		for c := range cur {
+			cur[c] *= e[c]
+			sum += cur[c]
+		}
+		if sum <= 0 {
+			sum = hmmTiny
+		}
+		row := alpha[x*S : (x+1)*S]
+		for c := range cur {
+			cur[c] /= sum
+			row[c] = float32(cur[c])
+		}
+		prev, cur = cur, prev
+	}
+
+	// Backward pass with the LOD at each bin. eNext holds the emission of
+	// bin x+1 (computed at the previous iteration), so each bin's emission is
+	// computed once per pass.
+	lod := make([]float64, nb)
+	beta, v, eNext, L := make([]float64, S), make([]float64, S), make([]float64, S), make([]float64, S)
+	for c := range beta {
+		beta[c] = 1
+	}
+	for x := nb - 1; x >= 0; x-- {
+		if x < nb-1 {
+			for c := range v {
+				v[c] = beta[c] * eNext[c]
+			}
+			step(beta, v, dM[x+1], false)
+			mx := 0.0
+			for _, b := range beta {
+				if b > mx {
+					mx = b
+				}
+			}
+			if mx > 0 {
+				for c := range beta {
+					beta[c] /= mx
+				}
+			}
+		}
+		row := alpha[x*S : (x+1)*S]
+		mx := 0.0
+		for c := range L {
+			L[c] = 0
+			if prior[c] > 0 {
+				L[c] = float64(row[c]) * beta[c] / prior[c]
+			}
+			if L[c] > mx {
+				mx = L[c]
+			}
+		}
+		if mx > 0 {
+			inv := 1 / mx
+			for c := range L {
+				L[c] *= inv
+			}
+		}
+		lod[x] = s.two.lodJoint(L, SL, sym)
+		if x > 0 {
+			emission(eNext, binStart[x], binStart[x+1])
+		}
+	}
+	return lod
+}
+
+// readLik fills l(j) ∝ P(h of d reads | f_j) for pool model m, scaled to
+// max 1 (all ones when d = 0).
+func readLik(l []float64, m *poolModel, cache *logCache, h, d int) {
+	if d == 0 {
+		for j := range l {
+			l[j] = 1
+		}
+		return
+	}
+	lp := m.logsFor(cache, 0)
+	fh, fl := float64(h), float64(d-h)
+	mx := math.Inf(-1)
+	for j := range l {
+		l[j] = fh*lp.logP[j] + fl*lp.log1mP[j]
+		if l[j] > mx {
+			mx = l[j]
+		}
+	}
+	for j := range l {
+		l[j] = math.Exp(l[j] - mx)
+	}
+}
+
+// lodJoint is the differential LOD from the joint likelihood L(j_H, j_L)
+// (row-major, SL columns, max 1): minus log10 of the best shared-frequency
+// likelihood, max_f Σ Bin(j_H; U_H, f)·Bin(j_L; U_L, f)·L(j_H, j_L), on the
+// same f grid and parabolic refinement as twoBulkLOD.lod. sym: L is
+// symmetric (p0 = 0.5), so ll(f) = ll(1 − f) and the grid (symmetric about
+// 0.5) is evaluated on its lower half and mirrored.
+func (t *twoBulkLOD) lodJoint(L []float64, SL int, sym bool) float64 {
+	n := len(t.fGrid)
+	ll := make([]float64, n)
+	best := 0
+	for i := range t.fGrid {
+		if sym && i > (n-1)/2 {
+			ll[i] = ll[n-1-i]
+			if ll[i] > ll[best] {
+				best = i
+			}
+			continue
+		}
+		total := 0.0
+		tl := t.tabL[i]
+		for jh, ph := range t.tabH[i] {
+			row := L[jh*SL : (jh+1)*SL : (jh+1)*SL]
+			inner := 0.0
+			for jl, pl := range tl {
+				inner += pl * row[jl]
+			}
+			total += ph * inner
+		}
+		ll[i] = math.Log(math.Max(total, hmmTiny))
+		if ll[i] > ll[best] {
+			best = i
+		}
+	}
+	mx := ll[best]
+	if best > 0 && best < len(ll)-1 {
+		y0, y1, y2 := ll[best-1], ll[best], ll[best+1]
+		if den := y0 - 2*y1 + y2; den < 0 {
+			mx = y1 - (y0-y2)*(y0-y2)/(8*den)
+		}
+	}
+	return math.Max(0, -mx/math.Ln10)
+}
+
+func allZero(v []float64) bool {
+	for _, x := range v {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
+}

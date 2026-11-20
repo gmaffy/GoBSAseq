@@ -45,14 +45,18 @@ type SmoothedStats struct {
 	SmDeltaSI float64
 	SmGstat   float64
 	SmED      float64
+	// SmDeltaSI2 (2b without --ref-parent only): smoothed bias-corrected ΔSI²
+	// (deltaSI2c), whose square root estimates |ΔAF| without polarity; the
+	// polarity-free BRM tests it.
+	SmDeltaSI2 float64
 	// One-bulk
 	OneBulkP0  float64 // the site's own one-bulk p0 (not smoothed; differs by polarity)
 	SmAFDev    float64
 	SmOneBulkG float64
-	// HMMLOD is the pool-HMM LOD at the site (hmm.go): two-bulk, bulks differ;
-	// one-bulk, the bulk deviates from p0. Already linkage-aware, so it is
-	// carried through unsmoothed. 0 where the HMM is not computed (2b without
-	// --ref-parent).
+	// HMMLOD is the pool-HMM LOD at the site, computed in raw stats (hmm.go):
+	// two-bulk, bulks differ; one-bulk, the bulk deviates from p0. A separate
+	// track in LOD units: carried through unsmoothed, not normalised, not in
+	// CompositeZ. 0 where the HMM is not computed (2b without --ref-parent).
 	HMMLOD float64
 
 	// ── robust Z-scores of smoothed values ──────────────────────────────
@@ -63,12 +67,11 @@ type SmoothedStats struct {
 	ZED       float64
 	ZAFDev    float64
 	ZOneBulkG float64
-	ZHMMLOD   float64
 
 	// ── consolidated scores ──────────────────────────────────────────────
-	// CompositeZ = (|ZDeltaSI| + ZGstat + ZHMMLOD) / √k in two-bulk modes (see
-	// consolidate). It is not bounded below: ZGstat and ZHMMLOD are negative
-	// where the value is under the genome-wide median.
+	// CompositeZ = (|ZDeltaSI| + ZGstat) / √2 in two-bulk modes (see
+	// consolidate). It is not bounded below: ZGstat is negative where G′ is
+	// under the genome-wide median.
 	CompositeZ float64
 	// max|Z| across all valid statistics (unsigned)
 	MaxAbsZ float64
@@ -84,16 +87,6 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 
 	color.Cyan("\n============================ Smoothing & Normalising (%s) ============================\n\n", bsaType)
 	color.Cyan("Gaussian kernel σ = %.0f bp  (WindowSize=%d / 2)\n\n", float64(cfg.WindowSize)/2, cfg.WindowSize)
-	if HMMAvailable(cfg, bsaType) {
-		if cfg.CMPerMb > 0 {
-			color.Cyan("HMM LOD: recombination %.3g cM/Mb\n", cfg.CMPerMb)
-		} else {
-			color.Cyan("HMM LOD: recombination assumed 1 Morgan per chromosome (set --cm-per-mb to change)\n")
-		}
-	} else {
-		color.Yellow("HMM LOD not computed: 2b without --ref-parent has no allele polarity (CompositeZ uses |ΔSI| and G only)\n")
-	}
-
 	sc, err := newScorer(cfg, bsaType)
 	if err != nil {
 		return nil, err
@@ -116,14 +109,14 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 	return smoothed, nil
 }
 
-// scorer runs the in-memory scoring pipeline (HMM LOD → kernel smoothing →
-// robust Z → CompositeZ). The real data and every null-simulation replicate
+// scorer runs the in-memory scoring pipeline (kernel smoothing → robust Z →
+// CompositeZ) on raw stats whose HMMLOD is already filled. The real data and every null-simulation replicate
 // go through it, so thresholds are calibrated on exactly what is scanned.
 type scorer struct {
 	bw     float64
 	step   float64 // smoothing grid spacing (gridStep)
 	weight func(*BSAstats) float64
-	hmm    *hmmSetup // nil when the HMM LOD is not computed
+	hmm    *hmmSetup // for the null simulation; nil when the HMM LOD is not computed
 	lay    smoothLayout
 }
 
@@ -144,8 +137,8 @@ func newScorer(cfg utils.AnalysisConfig, bsaType string) (*scorer, error) {
 	return sc, nil
 }
 
-// score fills raw[i].HMMLOD and returns the smoothed, normalised and
-// consolidated markers. report prints the sparse-marker summary. every > 1
+// score returns the smoothed, normalised and consolidated markers (HMMLOD is
+// carried from raw, where RawStats or the null simulation computed it). report prints the sparse-marker summary. every > 1
 // smooths only every n-th marker of each chromosome (all markers still feed
 // the kernel); the null simulation uses it, since it only samples CompositeZ.
 func (sc *scorer) score(raw []BSAstats, report bool, every int) ([]SmoothedStats, error) {
@@ -157,18 +150,13 @@ func (sc *scorer) score(raw []BSAstats, report bool, every int) ([]SmoothedStats
 // same). With every > 1 the output is compact and in chromosome order, not
 // input order.
 func (sc *scorer) scoreOrdered(raw []BSAstats, order *markerOrder, report bool, every int) ([]SmoothedStats, error) {
-	l := sc.lay
-	both, one := l.highBulk && l.lowBulk, l.highBulk != l.lowBulk
-	if sc.hmm != nil {
-		computeHMMLOD(sc.hmm, raw, order)
-	}
 	smoothed, err := gaussianSmoothOpts(raw, smoothOpts{bw: sc.bw, step: sc.step, weight: sc.weight,
-		hasHighBulk: l.highBulk, hasLowBulk: l.lowBulk, signedDSI: l.signedDSI, report: report, every: every, order: order})
+		lay: sc.lay, report: report, every: every, order: order})
 	if err != nil {
 		return nil, err
 	}
-	normalise(smoothed, l.highBulk, l.lowBulk, both, one, l.hmm)
-	consolidate(smoothed, l.highBulk, l.lowBulk, both, one, l.signedDSI, l.hmm)
+	compScales := normalise(smoothed, sc.lay)
+	consolidate(smoothed, sc.lay, compScales)
 	return smoothed, nil
 }
 
@@ -176,10 +164,17 @@ func (sc *scorer) scoreOrdered(raw []BSAstats, order *markerOrder, report bool, 
 
 // markerOrder groups marker indices by chromosome (chromosomes sorted by
 // name), each group sorted by position (stable, so duplicate positions keep
-// input order). It depends only on CHROM/POS, so it is built once per marker
-// set and shared by the HMM and the smoother.
+// input order), and picks each position's representative view. It depends
+// only on CHROM, POS and depths, so it is built once per marker set and
+// shared by the HMM and the smoother (and by every null replicate).
 type markerOrder struct {
 	chroms [][]int
+	// rep[i]: raw[i] represents its position. Views sharing a position (a
+	// split multi-allelic site) are different allele contrasts from the same
+	// reads; only the deepest (most informative reads, HighDepth + LowDepth;
+	// ties: first) enters the kernels and the HMM, so a position counts once
+	// and contrasts are not mixed. Every view still gets the position's output.
+	rep []bool
 }
 
 func newMarkerOrder(raw []BSAstats) *markerOrder {
@@ -192,14 +187,29 @@ func newMarkerOrder(raw []BSAstats) *markerOrder {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	o := &markerOrder{chroms: make([][]int, 0, len(names))}
+	o := &markerOrder{chroms: make([][]int, 0, len(names)), rep: make([]bool, len(raw))}
 	for _, name := range names {
 		idx := byChrom[name]
 		sort.SliceStable(idx, func(a, b int) bool { return raw[idx[a]].POS < raw[idx[b]].POS })
 		o.chroms = append(o.chroms, idx)
+		for k := 0; k < len(idx); {
+			best := k
+			j := k + 1
+			for ; j < len(idx) && raw[idx[j]].POS == raw[idx[k]].POS; j++ {
+				if viewDepth(&raw[idx[j]]) > viewDepth(&raw[idx[best]]) {
+					best = j
+				}
+			}
+			o.rep[idx[best]] = true
+			k = j
+		}
 	}
 	return o
 }
+
+// viewDepth is a view's informative depth (reads on its two alleles, over
+// the bulks present).
+func viewDepth(s *BSAstats) int { return s.HighDepth + s.LowDepth }
 
 // markerWeight returns each marker's inverse-variance weight for smoothing.
 //
@@ -249,6 +259,140 @@ const (
 	kLoess
 )
 
+// ─── track layout ──────────────────────────────────────────────────────────────
+
+// smoothLayout is a mode's track layout: which bulks, whether ΔSI is signed,
+// and whether the HMM LOD is computed. Its tracks() table is the single
+// source for what is smoothed, normalised, combined into CompositeZ and
+// written to the TSV.
+type smoothLayout struct {
+	highBulk, lowBulk bool
+	signedDSI         bool
+	hmm               bool
+}
+
+func (l smoothLayout) both() bool { return l.highBulk && l.lowBulk }
+func (l smoothLayout) one() bool  { return l.highBulk != l.lowBulk }
+
+// compositeRole is a track's part in CompositeZ.
+type compositeRole uint8
+
+const (
+	notInComposite  compositeRole = iota
+	compositePlain                // + Z
+	compositeFolded               // + |Z| (signed tracks: either direction is signal)
+)
+
+// track is one output track of a layout.
+type track struct {
+	smCol, zCol string                        // TSV columns ("" = none)
+	sm          func(*SmoothedStats) *float64 // the smoothed (or carried) value
+	z           func(*SmoothedStats) *float64 // its robust Z-score; nil = not normalised
+	raw         func(*BSAstats) float64       // smoothed from this; nil = carried from the site (set in emit)
+	kernel      smoothKernel
+	lo, hi      float64 // clamp for the fitted value
+	composite   compositeRole
+	// logZ: the robust Z is taken of log(x + c), c = 10% of the track's
+	// genome-wide median. For the non-negative, right-skewed tracks (G′, G1,
+	// ED⁴, HMM LOD) the median/MAD Z assumes a symmetry they lack; on
+	// simulated no-QTL genomes the log brings G′ and ED⁴ from Bowley skew
+	// +0.36/+0.49 to +0.14/+0.17 and their largest null Z from 7.8/17.9 to
+	// 2.7 (as Magwene's log G′). The offset keeps a clamped zero ~2.3 log
+	// units below the median instead of stretching the lower tail.
+	logZ bool
+}
+
+// tracks lists a layout's tracks in TSV column order.
+//
+//	two-bulk: HighSI, LowSI (smoothed, not normalised: ΔSI carries the
+//	          contrast), ΔSI (|ΔSI| without polarity), G′, ED⁴
+//	one-bulk: SI (smoothed and normalised), P0 (carried), AFDev, G1
+//	both:     HMM LOD (carried: already linkage-aware) when computed
+//
+// CompositeZ = Σ of the composite tracks' Z (|Z| when folded) / √k.
+func (l smoothLayout) tracks() []track {
+	inf := math.Inf(1)
+	var t []track
+	si := func(name string, raw func(*BSAstats) float64, sm, z func(*SmoothedStats) *float64) {
+		tr := track{smCol: "Sm_" + name, sm: sm, raw: raw, kernel: kGauss, lo: 0, hi: 1}
+		if !l.both() { // SI Z-scores only in one-bulk modes
+			tr.zCol, tr.z = "Z_"+name, z
+		}
+		t = append(t, tr)
+	}
+	if l.highBulk {
+		si("HighSI", func(s *BSAstats) float64 { return s.HighSI },
+			func(s *SmoothedStats) *float64 { return &s.SmHighSI }, func(s *SmoothedStats) *float64 { return &s.ZHighSI })
+	}
+	if l.lowBulk {
+		si("LowSI", func(s *BSAstats) float64 { return s.LowSI },
+			func(s *SmoothedStats) *float64 { return &s.SmLowSI }, func(s *SmoothedStats) *float64 { return &s.ZLowSI })
+	}
+	if l.both() {
+		name, lo, role := DeltaSIName(l.signedDSI), -1.0, compositeFolded
+		if !l.signedDSI { // |ΔSI|: already folded
+			lo, role = 0, compositePlain
+		}
+		t = append(t,
+			track{"Sm_" + name, "Z_" + name, func(s *SmoothedStats) *float64 { return &s.SmDeltaSI }, func(s *SmoothedStats) *float64 { return &s.ZDeltaSI },
+				func(s *BSAstats) float64 { return s.DeltaSI }, kGauss, lo, 1, role, false},
+			track{"Sm_Gstat", "Z_Gstat", func(s *SmoothedStats) *float64 { return &s.SmGstat }, func(s *SmoothedStats) *float64 { return &s.ZGstat },
+				func(s *BSAstats) float64 { return s.Gstat }, kTricube, 0, inf, compositePlain, true},
+			track{"Sm_ED4", "Z_ED4", func(s *SmoothedStats) *float64 { return &s.SmED }, func(s *SmoothedStats) *float64 { return &s.ZED },
+				func(s *BSAstats) float64 { return s.ED }, kLoess, 0, inf, notInComposite, true},
+		)
+		if !l.signedDSI { // polarity-free BRM input
+			t = append(t, track{smCol: "Sm_DeltaSI2c", sm: func(s *SmoothedStats) *float64 { return &s.SmDeltaSI2 },
+				raw: deltaSI2c, kernel: kGauss, lo: -1, hi: 1})
+		}
+	}
+	if l.one() {
+		t = append(t,
+			track{smCol: "P0", sm: func(s *SmoothedStats) *float64 { return &s.OneBulkP0 }},
+			track{"Sm_AFDev", "Z_AFDev", func(s *SmoothedStats) *float64 { return &s.SmAFDev }, func(s *SmoothedStats) *float64 { return &s.ZAFDev },
+				func(s *BSAstats) float64 { return s.OneBulkAFDev }, kGauss, -1, 1, compositeFolded, false},
+			track{"Sm_OneBulkGstat", "Z_OneBulkGstat", func(s *SmoothedStats) *float64 { return &s.SmOneBulkG }, func(s *SmoothedStats) *float64 { return &s.ZOneBulkG },
+				func(s *BSAstats) float64 { return s.OneBulkGstat }, kTricube, 0, inf, compositePlain, true},
+		)
+	}
+	if l.hmm && (l.both() || l.one()) { // carried from raw stats; its own track only
+		t = append(t, track{smCol: "HMMLOD", sm: func(s *SmoothedStats) *float64 { return &s.HMMLOD }})
+	}
+	return t
+}
+
+// oneSided reports whether only high values of a track are evidence: the
+// non-negative statistics (log-Z tracks) and |ΔSI|.
+func (tr track) oneSided() bool { return tr.logZ || tr.smCol == "Sm_AbsDeltaSI" }
+
+// deltaSI2c is a site's bias-corrected squared ΔSI: (SI_H − SI_L)² minus the
+// unbiased read-sampling variance SI(1−SI)/(d−1) of each bulk. ΔSI² does not
+// depend on which allele is REF, and E[deltaSI2c] = (pool_H − pool_L)², so
+// its smoothed value estimates the squared pool frequency difference without
+// polarity (2b without --ref-parent).
+func deltaSI2c(s *BSAstats) float64 {
+	d := s.HighSI - s.LowSI
+	v := d * d
+	if s.HighDepth > 1 {
+		v -= s.HighSI * (1 - s.HighSI) / float64(s.HighDepth-1)
+	}
+	if s.LowDepth > 1 {
+		v -= s.LowSI * (1 - s.LowSI) / float64(s.LowDepth-1)
+	}
+	return v
+}
+
+// compositeCount is k, the number of Z-scores in CompositeZ.
+func (l smoothLayout) compositeCount() int {
+	k := 0
+	for _, tr := range l.tracks() {
+		if tr.composite != notInComposite {
+			k++
+		}
+	}
+	return k
+}
+
 // smoothField pairs a raw statistic with the smoothed field it fills; lo/hi
 // clamp the fitted value to the statistic's range (local regressions can
 // overshoot at chromosome ends).
@@ -259,42 +403,31 @@ type smoothField struct {
 	lo, hi float64
 }
 
-// smoothFields lists the statistics smoothed for a mode's layout, grouped by
-// kernel: [Gaussian | tricube | loess].
-func smoothFields(hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI bool) []smoothField {
-	inf := math.Inf(1)
-	var g, t, l []smoothField
-	if hasHighBulk {
-		g = append(g, smoothField{func(s *BSAstats) float64 { return s.HighSI }, func(s *SmoothedStats, v float64) { s.SmHighSI = v }, kGauss, 0, 1})
-	}
-	if hasLowBulk {
-		g = append(g, smoothField{func(s *BSAstats) float64 { return s.LowSI }, func(s *SmoothedStats, v float64) { s.SmLowSI = v }, kGauss, 0, 1})
-	}
-	if hasBothBulks {
-		dsiLo := -1.0
-		if !signedDSI {
-			dsiLo = 0 // |ΔSI|
+// smoothFields lists the layout's smoothed tracks, grouped by kernel:
+// [Gaussian | tricube | loess].
+func smoothFields(l smoothLayout) []smoothField {
+	var byKernel [3][]smoothField
+	for _, tr := range l.tracks() {
+		if tr.raw == nil {
+			continue
 		}
-		g = append(g, smoothField{func(s *BSAstats) float64 { return s.DeltaSI }, func(s *SmoothedStats, v float64) { s.SmDeltaSI = v }, kGauss, dsiLo, 1})
-		t = append(t, smoothField{func(s *BSAstats) float64 { return s.Gstat }, func(s *SmoothedStats, v float64) { s.SmGstat = v }, kTricube, 0, inf})
-		l = append(l, smoothField{func(s *BSAstats) float64 { return s.ED }, func(s *SmoothedStats, v float64) { s.SmED = v }, kLoess, 0, inf})
+		sm := tr.sm
+		byKernel[tr.kernel] = append(byKernel[tr.kernel], smoothField{tr.raw, func(s *SmoothedStats, v float64) { *sm(s) = v }, tr.kernel, tr.lo, tr.hi})
 	}
-	if hasOneBulk {
-		g = append(g, smoothField{func(s *BSAstats) float64 { return s.OneBulkAFDev }, func(s *SmoothedStats, v float64) { s.SmAFDev = v }, kGauss, -1, 1})
-		t = append(t, smoothField{func(s *BSAstats) float64 { return s.OneBulkGstat }, func(s *SmoothedStats, v float64) { s.SmOneBulkG = v }, kTricube, 0, inf})
-	}
-	return append(append(g, t...), l...)
+	return append(append(byKernel[kGauss], byKernel[kTricube]...), byKernel[kLoess]...)
 }
+
+// ─── smoothing ─────────────────────────────────────────────────────────────────
 
 // smoothOpts configures gaussianSmooth.
 type smoothOpts struct {
-	bw                                 float64                 // Gaussian σ in bp (WindowSize/2); tricube half-width h = 2·bw
-	step                               float64                 // grid spacing for dense chromosomes; 0 = always exact at markers
-	weight                             func(*BSAstats) float64 // marker weight (markerWeight)
-	hasHighBulk, hasLowBulk, signedDSI bool
-	report                             bool         // print the sparse-marker summary
-	every                              int          // > 1: output only every n-th marker of each chromosome (compact, chromosome order)
-	order                              *markerOrder // precomputed marker order; nil = build it
+	bw     float64                 // Gaussian σ in bp (WindowSize/2); tricube half-width h = 2·bw
+	step   float64                 // grid spacing for dense chromosomes; 0 = always exact at markers
+	weight func(*BSAstats) float64 // marker weight (markerWeight)
+	lay    smoothLayout
+	report bool         // print the sparse-marker summary
+	every  int          // > 1: output only every n-th marker of each chromosome (compact, chromosome order)
+	order  *markerOrder // precomputed marker order; nil = build it
 }
 
 // gridStep is the smoothing grid spacing: --step-size, capped at σ/20 so
@@ -317,8 +450,8 @@ const smoothChunk = 256
 // gaussianSmooth smooths every statistic with default options (exact at every
 // marker, signed ΔSI); see gaussianSmoothOpts.
 func gaussianSmooth(raw []BSAstats, bw float64, weight func(*BSAstats) float64, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, report bool) ([]SmoothedStats, error) {
-	return gaussianSmoothOpts(raw, smoothOpts{bw: bw, weight: weight, hasHighBulk: hasHighBulk, hasLowBulk: hasLowBulk,
-		signedDSI: true, report: report, every: 1})
+	return gaussianSmoothOpts(raw, smoothOpts{bw: bw, weight: weight,
+		lay: smoothLayout{highBulk: hasHighBulk, lowBulk: hasLowBulk, signedDSI: true}, report: report, every: 1})
 }
 
 // gaussianSmoothOpts smooths every statistic per chromosome, with the kernel
@@ -344,37 +477,21 @@ func gaussianSmooth(raw []BSAstats, bw float64, weight func(*BSAstats) float64, 
 //
 // Memory. Chromosomes are processed one at a time: a chromosome's positions,
 // weights, values and query results are allocated, used and released before
-// the next. Within a chromosome, query points are smoothed in parallel chunks;
-// all kernels share one pass over the neighbours, and each sum runs over the
-// neighbours in position order, so results do not depend on scheduling.
+// the next. Within a chromosome, query points are smoothed in parallel chunks
+// (kernelSpec.eval); all kernels share one pass over the neighbours, and each
+// sum runs over the neighbours in position order, so results do not depend on
+// scheduling.
 //
 // The output keeps the input (raw) order. With every > 1 (null simulation) it
 // is compact (only the output markers, no len(raw) array) and in chromosome
 // order.
 func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
-	bw := o.bw
-	cutoff := kernelCutoffSigmas * bw
-	h := 2 * bw // tricube half-width = WindowSize (inside the ±3σ window)
-	invBw := 1 / bw
-	hasBothBulks, hasOneBulk := o.hasHighBulk && o.hasLowBulk, o.hasHighBulk != o.hasLowBulk
-	fields := smoothFields(o.hasHighBulk, o.hasLowBulk, hasBothBulks, hasOneBulk, o.signedDSI)
-	nf := len(fields)
-	ng, nt := 0, 0
-	for _, fd := range fields {
-		switch fd.kernel {
-		case kGauss:
-			ng++
-		case kTricube:
-			nt++
-		}
-	}
-	nl := nf - ng - nt
-	useTri := nt+nl > 0
-
+	k := newKernelSpec(o.bw, smoothFields(o.lay))
 	order := o.order
 	if order == nil {
 		order = newMarkerOrder(raw)
 	}
+	o.order = order // newChromWork reads the representative views from it
 	every := max(o.every, 1)
 	var out []SmoothedStats
 	var keep []bool
@@ -390,128 +507,27 @@ func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
 	}
 	var drops []chromDrop
 
-	workers := max(runtime.GOMAXPROCS(0), 1)
 	// One persistent worker pool; chromosomes are fed one at a time.
 	type job struct {
 		q0, q1 int
 		c      *chromWork
 		done   *sync.WaitGroup
 	}
+	workers := max(runtime.GOMAXPROCS(0), 1)
 	jobs := make(chan job, 64)
 	var pool sync.WaitGroup
 	for range workers {
 		pool.Add(1)
 		go func() {
 			defer pool.Done()
-			accG := make([]float64, 2*ng) // Σw·x, Σw·d·x per Gaussian field
-			accT := make([]float64, nt)   // Σt·x per tricube field
-			accL := make([]float64, 3*nl) // Σt·x, Σt·u·x, Σt·u²·x per loess field
+			acc := k.newAcc()
 			for jb := range jobs {
 				c := jb.c
-				pos, n := c.npos, len(c.npos) // kernel neighbours (markers, or aggregated grid intervals)
-				first, last := c.pos[0], c.pos[len(c.pos)-1]
-				edgeFit := last-first >= 2*cutoff // local linear near ends only on chromosomes ≥ 6σ
-				q0 := c.q[jb.q0]
-				lo := sort.Search(n, func(m int) bool { return pos[m] >= q0-cutoff })
-				hi := sort.Search(n, func(m int) bool { return pos[m] > q0+cutoff })
-				tlo := sort.Search(n, func(m int) bool { return pos[m] > q0-h })
-				thi := sort.Search(n, func(m int) bool { return pos[m] >= q0+h })
+				edgeFit := c.span() >= 2*k.cutoff // local linear near ends only on chromosomes ≥ 6σ
+				w := k.startWindow(c.npos, c.q[jb.q0])
 				for qi := jb.q0; qi < jb.q1; qi++ {
-					pK := c.q[qi]
-					for lo < n && pos[lo] < pK-cutoff {
-						lo++
-					}
-					for hi < n && pos[hi] <= pK+cutoff {
-						hi++
-					}
-					for tlo < n && pos[tlo] <= pK-h { // tricube window: |Δ| < h
-						tlo++
-					}
-					for thi < n && pos[thi] < pK+h {
-						thi++
-					}
-
-					clear(accG)
-					clear(accT)
-					clear(accL)
-					var g0, g1, g2, w2 float64     // Gaussian moments Σw·dⁱ, Σw²
-					var s0, s1, s2, s3, s4 float64 // tricube moments Σt·uⁱ
-					for m := lo; m < hi; m++ {
-						d := (pos[m] - pK) * invBw
-						k := math.Exp(-0.5 * d * d)
-						w := c.nwt[m] * k // marker weight × Gaussian
-						wd := w * d
-						g0 += w
-						g1 += wd
-						g2 += wd * d
-						if c.nwt2 == nil {
-							w2 += w * w
-						} else { // aggregated: Σ(wt·K)² = K²·Σwt²
-							w2 += k * k * c.nwt2[m]
-						}
-						row := c.nvals[m*nf : (m+1)*nf : (m+1)*nf]
-						for f := range ng {
-							accG[2*f] += w * row[f]
-							accG[2*f+1] += wd * row[f]
-						}
-						if m < tlo || m >= thi || !useTri {
-							continue
-						}
-						u := 0.5 * d // Δ/h, since h = 2·bw
-						a := math.Abs(u)
-						q := 1 - a*a*a
-						tw := c.nwt[m] * q * q * q // marker weight × tricube
-						s0 += tw
-						for f := range nt {
-							accT[f] += tw * row[ng+f]
-						}
-						if nl > 0 {
-							u2 := u * u
-							s1 += tw * u
-							s2 += tw * u2
-							s3 += tw * u2 * u
-							s4 += tw * u2 * u2
-							for f := range nl {
-								y := tw * row[ng+nt+f]
-								accL[3*f] += y
-								accL[3*f+1] += y * u
-								accL[3*f+2] += y * u2
-							}
-						}
-					}
-					res := c.res[qi*nf : (qi+1)*nf]
-					c.neff[qi] = 0
-					if w2 > 0 {
-						c.neff[qi] = g0 * g0 / w2
-					}
-					nG, nT := hi-lo, thi-tlo
-					alpha := 0.0
-					if edgeFit {
-						alpha = edgeBlend(math.Min(pK-first, last-pK), bw)
-					}
-					for f := range nf {
-						fd := &fields[f]
-						var v float64
-						switch {
-						case f < ng:
-							mean := 0.0
-							if g0 > 0 {
-								mean = accG[2*f] / g0
-							}
-							v = mean
-							if alpha > 0 {
-								v += alpha * (localLinear(g0, g1, g2, accG[2*f], accG[2*f+1], nG) - mean)
-							}
-						case f < ng+nt:
-							if s0 > 0 {
-								v = accT[f-ng] / s0
-							}
-						default:
-							l := f - ng - nt
-							v = loessFit(s0, s1, s2, s3, s4, accL[3*l], accL[3*l+1], accL[3*l+2], nT)
-						}
-						res[f] = math.Min(math.Max(v, fd.lo), fd.hi)
-					}
+					w.advance(c.npos, c.q[qi], k.cutoff, k.h)
+					k.eval(c, qi, w, acc, edgeFit)
 				}
 				jb.done.Done()
 			}
@@ -519,7 +535,7 @@ func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
 	}
 
 	for _, idx := range order.chroms {
-		c := newChromWork(raw, idx, fields, o)
+		c := newChromWork(raw, idx, k.fields, o)
 		var done sync.WaitGroup
 		chunk := min(max(len(c.q)/(4*workers), 16), smoothChunk)
 		for q0 := 0; q0 < len(c.q); q0 += chunk {
@@ -527,7 +543,7 @@ func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
 			jobs <- job{q0, min(q0+chunk, len(c.q)), c, &done}
 		}
 		done.Wait()
-		drops = append(drops, c.emit(raw, &out, keep, fields, o))
+		drops = append(drops, c.emit(raw, &out, keep, k.fields, o))
 		// c is released here
 	}
 	close(jobs)
@@ -546,6 +562,155 @@ func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
 		reportSparseDrops(drops, len(raw), len(raw)-len(out))
 	}
 	return out, nil
+}
+
+// kernelSpec is a smoothing pass's fixed parameters: bandwidths and the
+// fields, grouped by kernel (ng Gaussian, nt tricube, nl loess).
+type kernelSpec struct {
+	bw, invBw, h, cutoff float64
+	fields               []smoothField
+	nf, ng, nt, nl       int
+}
+
+func newKernelSpec(bw float64, fields []smoothField) *kernelSpec {
+	k := &kernelSpec{bw: bw, invBw: 1 / bw, h: 2 * bw, cutoff: kernelCutoffSigmas * bw, fields: fields, nf: len(fields)}
+	for _, fd := range fields {
+		switch fd.kernel {
+		case kGauss:
+			k.ng++
+		case kTricube:
+			k.nt++
+		}
+	}
+	k.nl = k.nf - k.ng - k.nt
+	return k
+}
+
+// kernelAcc is one worker's per-query accumulators.
+type kernelAcc struct {
+	g, t, l []float64 // Σw·x, Σw·d·x per Gaussian field; Σt·x per tricube field; Σt·x, Σt·u·x, Σt·u²·x per loess field
+}
+
+func (k *kernelSpec) newAcc() *kernelAcc {
+	return &kernelAcc{g: make([]float64, 2*k.ng), t: make([]float64, k.nt), l: make([]float64, 3*k.nl)}
+}
+
+// window is the neighbour index ranges of a query: [lo, hi) within the ±3σ
+// Gaussian window, [tlo, thi) within the open ±h tricube window.
+type window struct{ lo, hi, tlo, thi int }
+
+// startWindow positions a window for query q by binary search.
+func (k *kernelSpec) startWindow(pos []float64, q float64) window {
+	n := len(pos)
+	return window{
+		lo:  sort.Search(n, func(m int) bool { return pos[m] >= q-k.cutoff }),
+		hi:  sort.Search(n, func(m int) bool { return pos[m] > q+k.cutoff }),
+		tlo: sort.Search(n, func(m int) bool { return pos[m] > q-k.h }),
+		thi: sort.Search(n, func(m int) bool { return pos[m] >= q+k.h }),
+	}
+}
+
+// advance moves the window forward to query q (queries are sorted).
+func (w *window) advance(pos []float64, q, cutoff, h float64) {
+	n := len(pos)
+	for w.lo < n && pos[w.lo] < q-cutoff {
+		w.lo++
+	}
+	for w.hi < n && pos[w.hi] <= q+cutoff {
+		w.hi++
+	}
+	for w.tlo < n && pos[w.tlo] <= q-h { // tricube window: |Δ| < h
+		w.tlo++
+	}
+	for w.thi < n && pos[w.thi] < q+h {
+		w.thi++
+	}
+}
+
+// eval smooths every field at query qi of c over window w, writing c.res and
+// c.neff. edgeFit enables the local linear fit near chromosome ends.
+func (k *kernelSpec) eval(c *chromWork, qi int, w window, acc *kernelAcc, edgeFit bool) {
+	pos, pK, nf, ng, nt, nl := c.npos, c.q[qi], k.nf, k.ng, k.nt, k.nl
+	useTri := nt+nl > 0
+	clear(acc.g)
+	clear(acc.t)
+	clear(acc.l)
+	var g0, g1, g2, w2 float64     // Gaussian moments Σw·dⁱ, Σw²
+	var s0, s1, s2, s3, s4 float64 // tricube moments Σt·uⁱ
+	for m := w.lo; m < w.hi; m++ {
+		d := (pos[m] - pK) * k.invBw
+		kg := math.Exp(-0.5 * d * d)
+		wm := c.nwt[m] * kg // marker weight × Gaussian
+		wd := wm * d
+		g0 += wm
+		g1 += wd
+		g2 += wd * d
+		if c.nwt2 == nil {
+			w2 += wm * wm
+		} else { // aggregated: Σ(wt·K)² = K²·Σwt²
+			w2 += kg * kg * c.nwt2[m]
+		}
+		row := c.nvals[m*nf : (m+1)*nf : (m+1)*nf]
+		for f := range ng {
+			acc.g[2*f] += wm * row[f]
+			acc.g[2*f+1] += wd * row[f]
+		}
+		if m < w.tlo || m >= w.thi || !useTri {
+			continue
+		}
+		u := 0.5 * d // Δ/h, since h = 2·bw
+		a := math.Abs(u)
+		q := 1 - a*a*a
+		tw := c.nwt[m] * q * q * q // marker weight × tricube
+		s0 += tw
+		for f := range nt {
+			acc.t[f] += tw * row[ng+f]
+		}
+		if nl > 0 {
+			u2 := u * u
+			s1 += tw * u
+			s2 += tw * u2
+			s3 += tw * u2 * u
+			s4 += tw * u2 * u2
+			for f := range nl {
+				y := tw * row[ng+nt+f]
+				acc.l[3*f] += y
+				acc.l[3*f+1] += y * u
+				acc.l[3*f+2] += y * u2
+			}
+		}
+	}
+	c.neff[qi] = 0
+	if w2 > 0 {
+		c.neff[qi] = g0 * g0 / w2
+	}
+	alpha := 0.0
+	if edgeFit {
+		alpha = edgeBlend(math.Min(pK-c.pos[0], c.pos[len(c.pos)-1]-pK), k.bw)
+	}
+	res := c.res[qi*nf : (qi+1)*nf]
+	for f := range nf {
+		var v float64
+		switch {
+		case f < ng:
+			mean := 0.0
+			if g0 > 0 {
+				mean = acc.g[2*f] / g0
+			}
+			v = mean
+			if alpha > 0 {
+				v += alpha * (localLinear(g0, g1, g2, acc.g[2*f], acc.g[2*f+1], w.hi-w.lo) - mean)
+			}
+		case f < ng+nt:
+			if s0 > 0 {
+				v = acc.t[f-ng] / s0
+			}
+		default:
+			l := f - ng - nt
+			v = loessFit(s0, s1, s2, s3, s4, acc.l[3*l], acc.l[3*l+1], acc.l[3*l+2], w.thi-w.tlo)
+		}
+		res[f] = math.Min(math.Max(v, k.fields[f].lo), k.fields[f].hi)
+	}
 }
 
 // chromWork is one chromosome's smoothing state: its markers (sorted by
@@ -577,6 +742,9 @@ type chromWork struct {
 // so interpolation would be inaccurate there; few markers means little cost.
 const sparseIntervalMarkers = 4
 
+// span is the distance from the chromosome's first to its last marker.
+func (c *chromWork) span() float64 { return c.pos[len(c.pos)-1] - c.pos[0] }
+
 func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts) *chromWork {
 	n, nf := len(idx), len(fields)
 	c := &chromWork{name: raw[idx[0]].CHROM, idx: idx, pos: make([]float64, n)}
@@ -591,19 +759,30 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 	}
 	c.q, c.npos, c.nwt, c.nvals = c.pos, c.pos, wt, vals
 
+	// Grid mode for dense chromosomes. A grid needs a positive span: markers
+	// all at one position (e.g. a multi-allelic site split on a tiny contig)
+	// stay on the exact path.
+	first, last := c.pos[0], c.pos[n-1]
+	grid := o.step > 0 && last > first && int((last-first)/o.step)+2 < n
+	dup := false
+	for k := 1; k < n && !dup; k++ {
+		dup = c.pos[k] == c.pos[k-1]
+	}
 	// Markers sharing a position (views of one split multi-allelic site) come
 	// from the same reads and plants, so each position is one kernel
-	// neighbour ("unit"): weight = the views' mean weight, value = their
-	// weighted mean, Σw² = weight² (so NEff counts it once).
-	u := newPosUnits(c.pos, wt, vals, nf)
-	if u.n() < n {
-		c.npos, c.nwt, c.nwt2, c.nvals = u.pos, u.w, u.w2, u.means()
-	}
-	if o.step > 0 {
-		first, last := c.pos[0], c.pos[n-1]
-		// A grid needs a positive span: markers all at one position (e.g. a
-		// multi-allelic site split on a tiny contig) stay on the exact path.
-		if nGrid := int((last-first)/o.step) + 2; last > first && nGrid < n {
+	// neighbour ("unit"): the representative (deepest) view's weight and
+	// values (markerOrder.rep). Units are only built when needed: duplicates
+	// present, or grid mode (aggregation).
+	if dup || grid {
+		isRep := make([]bool, n)
+		for k, ri := range idx {
+			isRep[k] = o.order.rep[ri]
+		}
+		u := newPosUnits(c.pos, wt, vals, nf, isRep)
+		if dup {
+			c.npos, c.nwt, c.nwt2, c.nvals = u.pos, u.w, u.w2, u.means()
+		}
+		if grid {
 			c.buildGrid(first, last, o.step)
 			c.aggregate(u, nf, o.bw/aggregateBinSigmas)
 		}
@@ -614,36 +793,31 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 }
 
 // posUnits are a chromosome's distinct marker positions: per position, the
-// mean of its markers' weights (w), w² (w2), the weighted value sums
-// (sums, row-major [unit][field]) and the index of its first marker.
+// representative view's weight (w), w² (w2), weighted values (sums, w·value,
+// row-major [unit][field]) and the index of the position's first marker.
 type posUnits struct {
 	pos, w, w2, sums []float64
 	first            []int
 	nf               int
 }
 
-func newPosUnits(pos, wt, vals []float64, nf int) *posUnits {
+func newPosUnits(pos, wt, vals []float64, nf int, isRep []bool) *posUnits {
 	u := &posUnits{nf: nf}
 	for k := 0; k < len(pos); {
-		j := k
+		j, r := k, k
 		for j < len(pos) && pos[j] == pos[k] {
+			if isRep[j] {
+				r = j
+			}
 			j++
 		}
-		dup := float64(j - k)
-		w := 0.0
-		for m := k; m < j; m++ {
-			w += wt[m] / dup
-		}
+		w := wt[r]
 		u.pos = append(u.pos, pos[k])
 		u.w = append(u.w, w)
 		u.w2 = append(u.w2, w*w)
 		u.first = append(u.first, k)
 		for f := range nf {
-			s := 0.0
-			for m := k; m < j; m++ {
-				s += wt[m] / dup * vals[m*nf+f]
-			}
-			u.sums = append(u.sums, s)
+			u.sums = append(u.sums, w*vals[r*nf+f])
 		}
 		k = j
 	}
@@ -782,7 +956,7 @@ type chromDrop struct {
 func (c *chromWork) emit(raw []BSAstats, out *[]SmoothedStats, keep []bool, fields []smoothField, o smoothOpts) chromDrop {
 	nf := len(fields)
 	every := max(o.every, 1)
-	hasOneBulk := o.hasHighBulk != o.hasLowBulk
+	hasOneBulk := o.lay.one()
 	d := chromDrop{name: c.name, total: len(c.idx)}
 	g := 0 // grid interval containing the marker: grid[g] ≤ pos < grid[g+1]
 	for k, ri := range c.idx {
@@ -924,105 +1098,134 @@ func reportSparseDrops(drops []chromDrop, total, dropped int) {
 
 // ─── normalisation ─────────────────────────────────────────────────────────────
 
-// zField pairs a smoothed statistic with its Z-score field.
+// zField pairs a smoothed statistic with its Z-score field; logZ: take the Z
+// of log(x + c), c = 10% of the genome-wide median (see track.logZ).
 type zField struct {
-	get func(*SmoothedStats) float64
-	set func(*SmoothedStats, float64)
+	get  func(*SmoothedStats) float64
+	set  func(*SmoothedStats, float64)
+	logZ bool
 }
 
-// normalise computes global robust Z-scores for every smoothed statistic. The
-// Z-scores are stored in place.
-func normalise(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, hmm bool) {
-	var fields []zField
-	// SI Z-scores only in one-bulk modes: in two-bulk modes ΔSI carries the
-	// contrast and the SI Z-scores fed nothing (no CompositeZ, no detection).
-	if hasHighBulk && !hasBothBulks {
-		fields = append(fields, zField{func(s *SmoothedStats) float64 { return s.SmHighSI }, func(s *SmoothedStats, v float64) { s.ZHighSI = v }})
+// zScale is a robust Z transform: z = (x − center) / scale (0 if scale = 0).
+type zScale struct {
+	center, scale float64
+	set           bool
+}
+
+func (z zScale) of(x float64) float64 {
+	if z.scale > 0 {
+		return (x - z.center) / z.scale
 	}
-	if hasLowBulk && !hasBothBulks {
-		fields = append(fields, zField{func(s *SmoothedStats) float64 { return s.SmLowSI }, func(s *SmoothedStats, v float64) { s.ZLowSI = v }})
+	return 0
+}
+
+// normalise computes the genome-wide robust Z-score of every track that has
+// one (smoothLayout.tracks), in place. It returns, per track index, the
+// untransformed robust Z scale of the log-Z tracks that enter CompositeZ:
+// the Z columns of those tracks are log-based (symmetric display), while
+// CompositeZ uses the untransformed robust Z (see consolidate).
+func normalise(sm []SmoothedStats, lay smoothLayout) []zScale {
+	tracks := lay.tracks()
+	raw := make([]zScale, len(tracks))
+	type job struct {
+		f   zField
+		dst *zScale // raw-scale job: store the scale instead of setting Z
 	}
-	if hasBothBulks {
-		fields = append(fields,
-			zField{func(s *SmoothedStats) float64 { return s.SmDeltaSI }, func(s *SmoothedStats, v float64) { s.ZDeltaSI = v }},
-			zField{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }},
-			zField{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }},
-		)
-	}
-	if hasOneBulk {
-		fields = append(fields,
-			zField{func(s *SmoothedStats) float64 { return s.SmAFDev }, func(s *SmoothedStats, v float64) { s.ZAFDev = v }},
-			zField{func(s *SmoothedStats) float64 { return s.SmOneBulkG }, func(s *SmoothedStats, v float64) { s.ZOneBulkG = v }},
-		)
-	}
-	if hmm {
-		fields = append(fields, zField{func(s *SmoothedStats) float64 { return s.HMMLOD }, func(s *SmoothedStats, v float64) { s.ZHMMLOD = v }})
+	var jobs []job
+	for i, tr := range tracks {
+		if tr.z == nil {
+			continue
+		}
+		get, set := tr.sm, tr.z
+		jobs = append(jobs, job{f: zField{func(s *SmoothedStats) float64 { return *get(s) }, func(s *SmoothedStats, v float64) { *set(s) = v }, tr.logZ}})
+		if tr.logZ && tr.composite != notInComposite {
+			jobs = append(jobs, job{f: zField{get: func(s *SmoothedStats) float64 { return *get(s) }}, dst: &raw[i]})
+		}
 	}
 
-	// At most normaliseWorkers fields at a time, each with one reused buffer
+	// At most normaliseWorkers jobs at a time, each with one reused buffer
 	// of len(sm) floats (the median and MAD sort it in place).
 	sem := make(chan struct{}, normaliseWorkers)
 	var wg sync.WaitGroup
-	for _, f := range fields {
+	for _, jb := range jobs {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
-			robustZField(sm, f, make([]float64, len(sm)))
+			buf := make([]float64, len(sm))
+			if jb.dst != nil {
+				*jb.dst = robustZScale(sm, jb.f.get, buf)
+				jb.dst.set = true
+				return
+			}
+			robustZField(sm, jb.f, buf)
 		}()
 	}
 	wg.Wait()
+	return raw
 }
 
 // normaliseWorkers bounds how many fields are normalised at once (memory:
 // one len(sm) buffer each).
 const normaliseWorkers = 3
 
-// robustZField sets f's robust Z-score, (x − median) / (1.4826 × MAD), on
-// every marker, using buf (len(sm)) as the only scratch. The 1.4826 factor
-// makes MAD a consistent estimator of σ under normality (Rousseeuw & Croux
-// 1993). When MAD = 0 it falls back to the classical Z (population SD), and
-// to zeros for a constant track.
-func robustZField(sm []SmoothedStats, f zField, buf []float64) {
+// robustZScale returns the robust Z transform of get over sm: center = median,
+// scale = 1.4826 × MAD (a consistent estimator of σ under normality; Rousseeuw
+// & Croux 1993); when MAD = 0, the classical mean and population SD. buf
+// (len(sm)) is the only scratch.
+func robustZScale(sm []SmoothedStats, get func(*SmoothedStats) float64, buf []float64) zScale {
 	const consistencyFactor = 1.4826
 	n := len(sm)
 	if n == 0 {
-		return
+		return zScale{}
 	}
 	for i := range sm {
-		buf[i] = f.get(&sm[i])
+		buf[i] = get(&sm[i])
 	}
 	sort.Float64s(buf)
 	med := sortedMedian(buf)
 	for i := range sm {
-		buf[i] = math.Abs(f.get(&sm[i]) - med)
+		buf[i] = math.Abs(get(&sm[i]) - med)
 	}
 	sort.Float64s(buf)
-	mad := sortedMedian(buf) * consistencyFactor
-	if mad > 0 {
-		for i := range sm {
-			f.set(&sm[i], (f.get(&sm[i])-med)/mad)
-		}
-		return
+	if mad := sortedMedian(buf) * consistencyFactor; mad > 0 {
+		return zScale{center: med, scale: mad}
 	}
-	// MAD = 0 fallback: classical Z-score (population SD); zeros if constant.
 	mean := 0.0
 	for i := range sm {
-		mean += f.get(&sm[i])
+		mean += get(&sm[i])
 	}
 	mean /= float64(n)
 	variance := 0.0
 	for i := range sm {
-		d := f.get(&sm[i]) - mean
+		d := get(&sm[i]) - mean
 		variance += d * d
 	}
-	sd := math.Sqrt(variance / float64(n))
-	for i := range sm {
-		z := 0.0
-		if sd > 0 {
-			z = (f.get(&sm[i]) - mean) / sd
+	return zScale{center: mean, scale: math.Sqrt(variance / float64(n))}
+}
+
+// robustZField sets f's robust Z-score (robustZScale) on every marker, using
+// buf (len(sm)) as the only scratch; zeros for a constant track. With f.logZ
+// the Z is of log(x + c), c = 10% of the median (see track.logZ).
+func robustZField(sm []SmoothedStats, f zField, buf []float64) {
+	if len(sm) == 0 {
+		return
+	}
+	get := f.get
+	if f.logZ {
+		for i := range sm {
+			buf[i] = f.get(&sm[i])
 		}
-		f.set(&sm[i], z)
+		sort.Float64s(buf)
+		c := 0.1 * sortedMedian(buf)
+		if !(c > 0) {
+			c = 1e-12
+		}
+		get = func(s *SmoothedStats) float64 { return math.Log(math.Max(f.get(s), 0) + c) }
+	}
+	z := robustZScale(sm, get, buf)
+	for i := range sm {
+		f.set(&sm[i], z.of(get(&sm[i])))
 	}
 }
 
@@ -1037,142 +1240,90 @@ func sortedMedian(s []float64) float64 {
 
 // ─── consolidation ─────────────────────────────────────────────────────────────
 
-// consolidate fills CompositeZ (Stouffer's Z) and MaxAbsZ for every variant.
+// consolidate fills CompositeZ (Stouffer's Z) and MaxAbsZ for every variant,
+// from the layout's tracks:
 //
-// CompositeZ combines k Z-scores (countZStats gives k):
+//	Two-bulk: (|ZDeltaSI| + ZGstat) / √2   (Z(|ΔSI|) unfolded when ΔSI is unsigned)
+//	One-bulk: (|ZAFDev|  + ZOneBulkG) / √2
 //
-//	Two-bulk: |ZDeltaSI| + ZGstat + ZHMMLOD   (Z(|ΔSI|) unfolded when ΔSI is unsigned)
-//	One-bulk: |ZAFDev|  + ZOneBulkG + ZHMMLOD
+// The HMM LOD is not part of it: it is a separate track in LOD units with its
+// own genome-wide thresholds. ΔSI and AFDev are folded so that both tails
+// count as signal. ZGstat is a robust Z of a non-negative statistic, so it is
+// negative below the genome-wide median; CompositeZ is not bounded below.
+// Direction is kept in the individual tracks (ZDeltaSI / ZAFDev).
 //
-// ZHMMLOD is left out (k = 2) where the HMM is not computed (2b without
-// --ref-parent). ΔSI and AFDev are folded so that both tails count as signal.
-// ZGstat and ZHMMLOD are robust Z-scores of non-negative statistics, so they
-// are negative below the genome-wide median; CompositeZ is not bounded below.
-// Direction is kept in the individual tracks (ZDeltaSI / ZAFDev). ZHighSI,
-// ZLowSI and ZED are excluded (ΔSI covers them).
+// MaxAbsZ is the largest deviation over all normalised tracks, a diagnostic
+// column: |Z| for signed tracks (ΔSI, AFDev, one-bulk SI), and the positive
+// part of Z for one-sided tracks (G′, G1, ED⁴, |ΔSI|), where a low value is
+// not evidence.
 //
-// MaxAbsZ is max |Z| over all available Z-scores, a diagnostic column.
+// For the log-Z tracks in CompositeZ (G′, G1) it uses their untransformed
+// robust Z (raw, from normalise), not the log-based Z column: on overdispersed
+// data the log-based components raised CompositeZ's pointwise false-positive
+// rate (1.4% vs 1.0% at p99). raw = nil uses the Z columns as they are.
 //
 // Its thresholds come from the null simulation (hmmnull.go), which runs the
 // same scorer, so the combination and its null always match.
-func consolidate(sm []SmoothedStats, hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk, signedDSI, hmm bool) {
+func consolidate(sm []SmoothedStats, lay smoothLayout, raw []zScale) {
+	tracks := lay.tracks()
+	k := lay.compositeCount()
 	for i := range sm {
 		s := &sm[i]
-
-		sum, k := 0.0, 0
-		if hasBothBulks {
-			// Without polarity SmDeltaSI is already smoothed |ΔSI|; its Z is
-			// used as is.
-			zd := s.ZDeltaSI
-			if signedDSI {
-				zd = math.Abs(zd)
-			}
-			sum += zd
-			sum += s.ZGstat
-			k += 2
-		}
-		if hasOneBulk {
-			sum += math.Abs(s.ZAFDev)
-			sum += s.ZOneBulkG
-			k += 2
-		}
-		if hmm && (hasBothBulks || hasOneBulk) {
-			sum += s.ZHMMLOD
-			k++
-		}
 		if k == 0 {
 			continue
 		}
-		s.CompositeZ = sum / math.Sqrt(float64(k))
-
-		maxAbs := 0.0
-		upd := func(z float64) {
-			if a := math.Abs(z); a > maxAbs {
+		sum, maxAbs := 0.0, 0.0
+		for ti, tr := range tracks {
+			if tr.z == nil {
+				continue
+			}
+			z := *tr.z(s)
+			zc := z // CompositeZ component: untransformed Z for log-Z tracks
+			if ti < len(raw) && raw[ti].set {
+				zc = raw[ti].of(*tr.sm(s))
+			}
+			switch tr.composite {
+			case compositePlain:
+				sum += zc
+			case compositeFolded:
+				sum += math.Abs(zc)
+			}
+			a := math.Abs(z)
+			if tr.oneSided() { // only high values are evidence
+				a = math.Max(z, 0)
+			}
+			if a > maxAbs {
 				maxAbs = a
 			}
 		}
-		// SI Z-scores exist only in one-bulk modes (see normalise).
-		if hasHighBulk && !hasBothBulks {
-			upd(s.ZHighSI)
-		}
-		if hasLowBulk && !hasBothBulks {
-			upd(s.ZLowSI)
-		}
-		if hasBothBulks {
-			upd(s.ZDeltaSI)
-			upd(s.ZGstat)
-			upd(s.ZED)
-		}
-		if hasOneBulk {
-			upd(s.ZAFDev)
-			upd(s.ZOneBulkG)
-		}
-		if hmm {
-			upd(s.ZHMMLOD)
-		}
+		s.CompositeZ = sum / math.Sqrt(float64(k))
 		s.MaxAbsZ = maxAbs
 	}
 }
 
 // ─── TSV output ────────────────────────────────────────────────────────────────
 
-// smoothLayout is a mode's track layout: which bulks, whether ΔSI is signed,
-// and whether the HMM LOD is computed.
-type smoothLayout struct {
-	highBulk, lowBulk bool
-	signedDSI         bool
-	hmm               bool
-}
-
 func smoothedHeader(lay smoothLayout) []byte {
-	both, one := lay.highBulk && lay.lowBulk, lay.highBulk != lay.lowBulk
 	header := []string{"CHROM", "POS", "REF", "ALT", "Depth"}
-	if both {
+	if lay.both() {
 		header = append(header, "HighDepth", "LowDepth")
 	}
 	header = append(header, "NEff")
-	if lay.highBulk {
-		header = append(header, "Sm_HighSI")
-		if !both {
-			header = append(header, "Z_HighSI")
+	for _, tr := range lay.tracks() {
+		for _, col := range []string{tr.smCol, tr.zCol} {
+			if col != "" {
+				header = append(header, col)
+			}
 		}
-	}
-	if lay.lowBulk {
-		header = append(header, "Sm_LowSI")
-		if !both {
-			header = append(header, "Z_LowSI")
-		}
-	}
-	if both {
-		header = append(header,
-			"Sm_"+DeltaSIName(lay.signedDSI), "Z_"+DeltaSIName(lay.signedDSI),
-			"Sm_Gstat", "Z_Gstat",
-			"Sm_ED4", "Z_ED4",
-		)
-	}
-	if one {
-		header = append(header,
-			"P0",
-			"Sm_AFDev", "Z_AFDev",
-			"Sm_OneBulkGstat", "Z_OneBulkGstat",
-		)
-	}
-	if lay.hmm {
-		header = append(header, "HMMLOD", "Z_HMMLOD")
 	}
 	header = append(header, "CompositeZ", "MaxAbsZ")
 	return []byte(strings.Join(header, "\t") + "\n")
 }
 
-// appendSmoothedRow appends one marker's TSV row (floats to 6 decimals).
-func appendSmoothedRow(buf []byte, s *SmoothedStats, lay smoothLayout) []byte {
-	both, one := lay.highBulk && lay.lowBulk, lay.highBulk != lay.lowBulk
-	f6 := func(b []byte, vs ...float64) []byte {
-		for _, v := range vs {
-			b = strconv.AppendFloat(append(b, '\t'), v, 'f', 6, 64)
-		}
-		return b
-	}
+// appendSmoothedRow appends one marker's TSV row (floats to 6 decimals,
+// NEff to 2). tracks is lay.tracks().
+func appendSmoothedRow(buf []byte, s *SmoothedStats, lay smoothLayout, tracks []track) []byte {
+	f6 := func(b []byte, v float64) []byte { return strconv.AppendFloat(append(b, '\t'), v, 'f', 6, 64) }
 	itoa := func(b []byte, v int) []byte { return strconv.AppendInt(append(b, '\t'), int64(v), 10) }
 
 	buf = append(buf, s.CHROM...)
@@ -1180,32 +1331,19 @@ func appendSmoothedRow(buf []byte, s *SmoothedStats, lay smoothLayout) []byte {
 	buf = append(append(buf, '\t'), s.REF...)
 	buf = append(append(buf, '\t'), s.ALT...)
 	buf = itoa(buf, s.Depth)
-	if both {
+	if lay.both() {
 		buf = itoa(itoa(buf, s.HighDepth), s.LowDepth)
 	}
 	buf = strconv.AppendFloat(append(buf, '\t'), s.NEff, 'f', 2, 64)
-	if lay.highBulk {
-		buf = f6(buf, s.SmHighSI)
-		if !both {
-			buf = f6(buf, s.ZHighSI)
+	for _, tr := range tracks {
+		if tr.smCol != "" {
+			buf = f6(buf, *tr.sm(s))
+		}
+		if tr.zCol != "" {
+			buf = f6(buf, *tr.z(s))
 		}
 	}
-	if lay.lowBulk {
-		buf = f6(buf, s.SmLowSI)
-		if !both {
-			buf = f6(buf, s.ZLowSI)
-		}
-	}
-	if both {
-		buf = f6(buf, s.SmDeltaSI, s.ZDeltaSI, s.SmGstat, s.ZGstat, s.SmED, s.ZED)
-	}
-	if one {
-		buf = f6(buf, s.OneBulkP0, s.SmAFDev, s.ZAFDev, s.SmOneBulkG, s.ZOneBulkG)
-	}
-	if lay.hmm {
-		buf = f6(buf, s.HMMLOD, s.ZHMMLOD)
-	}
-	buf = f6(buf, s.CompositeZ, s.MaxAbsZ)
+	buf = f6(f6(buf, s.CompositeZ), s.MaxAbsZ)
 	return append(buf, '\n')
 }
 
@@ -1226,8 +1364,9 @@ func writeSmoothedTSV(filename string, sm []SmoothedStats, lay smoothLayout) (er
 		return err
 	}
 	buf := make([]byte, 0, 1024)
+	tracks := lay.tracks()
 	for i := range sm {
-		buf = appendSmoothedRow(buf[:0], &sm[i], lay)
+		buf = appendSmoothedRow(buf[:0], &sm[i], lay, tracks)
 		if _, err := w.Write(buf); err != nil {
 			return err
 		}

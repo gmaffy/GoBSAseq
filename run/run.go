@@ -527,19 +527,6 @@ func Run(cfg *utils.AnalysisConfig, hf utils.HardFilterConfig) error {
 		return fmt.Errorf("VCF file must be a .vcf or .vcf.gz file")
 	}
 
-	// LEGACY: the old filter consumed a vcfgo reader opened here.
-	// f, cleanup, err := openVCF(cfg.VCF)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to open VCF %q: %w", cfg.VCF, err)
-	// }
-	// defer cleanup()
-	//
-	// rdr, err := vcfgo.NewReader(f, false)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to create VCF reader: %w", err)
-	// }
-	// cfg.Rdr = rdr
-
 	// The filter streams the VCF itself; only the header is needed here.
 	hdr, err := filter.ReadVCFHeader(cfg.VCF)
 	if err != nil {

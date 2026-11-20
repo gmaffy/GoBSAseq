@@ -47,13 +47,15 @@ func gatk() utils.HardFilterConfig {
 }
 
 func bulksCfg() utils.AnalysisConfig {
-	return utils.AnalysisConfig{HighBulkIdx: 0, LowBulkIdx: 1, HighBulkDepth: 1, LowBulkDepth: 1, SplitMultiallelic: true}
+	return utils.AnalysisConfig{HighBulkIdx: 0, LowBulkIdx: 1, HighBulkDepth: 1, LowBulkDepth: 1, SplitMultiallelic: true,
+		HighBulkSize: 20, LowBulkSize: 20, Population: "F2"}
 }
 
 func parentsCfg() utils.AnalysisConfig {
 	return utils.AnalysisConfig{
 		HighParentIdx: 0, LowParentIdx: 1, HighBulkIdx: 2, LowBulkIdx: 3,
 		HighParentDepth: 1, LowParentDepth: 1, HighBulkDepth: 1, LowBulkDepth: 1, SplitMultiallelic: true,
+		HighBulkSize: 20, LowBulkSize: 20, Population: "F2",
 	}
 }
 
@@ -409,7 +411,8 @@ func TestRefParentPolarity2b(t *testing.T) {
 func TestRefParentIgnoredWithParent(t *testing.T) {
 	vcf := header("hp", "hb", "lb") + rec("chr1", 100, "A", "T", "60", "PASS", ".", "GT:AD:DP",
 		"0/0:30,0:30", "0/1:30,10:40", "0/1:10,30:40")
-	cfg := utils.AnalysisConfig{HighParentIdx: 0, HighBulkIdx: 1, LowBulkIdx: 2, HighParentDepth: 1, HighBulkDepth: 1, LowBulkDepth: 1, RefParent: "low"}
+	cfg := utils.AnalysisConfig{HighParentIdx: 0, HighBulkIdx: 1, LowBulkIdx: 2, HighParentDepth: 1, HighBulkDepth: 1, LowBulkDepth: 1, RefParent: "low",
+		HighBulkSize: 20, LowBulkSize: 20, Population: "F2"}
 	out := run(t, vcf, cfg, gatk(), "hp2b", []int{0, 1, 2})
 	if len(out.sites) != 1 || out.sites[0].HighIsAlt {
 		t.Fatalf("hp2b with REF high parent: --ref-parent low must not flip polarity, got %+v", out.sites)

@@ -706,7 +706,7 @@ func (f *Filterer) reportActiveFilters(p FilterProfile) {
 		default:
 			color.Yellow("Polarity (2b): unknown (--ref-parent none). SI is the REF fraction, whose sign vs the parents " +
 				"varies by SNP, so 2b uses |ΔSI|: QTLs can be found but not which bulk carries which parent's allele. " +
-				"Two-bulk BRM is skipped.")
+				"BRM uses the polarity-free ΔSI² form; no HMM LOD.")
 		}
 	} else if cfg.RefParent == "high" || cfg.RefParent == "low" {
 		color.Yellow("--ref-parent %s ignored: polarity comes from the parent sample(s)", cfg.RefParent)

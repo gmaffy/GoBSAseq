@@ -372,19 +372,11 @@ func fallbackZThresholds(k int) ZThresholds {
 }
 
 // countZStats returns k, the number of Z-scores consolidate combines into
-// CompositeZ: two per bulk layout (|ZΔSI| + ZG, or |ZAFDev| + ZG1) plus ZHMMLOD
-// when the HMM LOD is computed. TestCompositeZStatCountMatchesConsolidate
-// checks it against consolidate.
-func countZStats(bsaType string, hmm bool) int {
-	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
-	n := 0
-	if hasBothBulks || hasOneBulk {
-		n = 2
-		if hmm {
-			n++
-		}
-	}
-	return n
+// CompositeZ (smoothLayout.compositeCount): 2 in every mode, |ZΔSI| + ZG′ or
+// |ZAFDev| + ZG1. The HMM LOD is a separate track.
+func countZStats(bsaType string) int {
+	hb, lb, _, _ := BulkFlags(bsaType)
+	return smoothLayout{highBulk: hb, lowBulk: lb, signedDSI: true}.compositeCount()
 }
 
 // ── Parallel warm-up ─────────────────────────────────────────────────────────
@@ -566,7 +558,7 @@ func CalculateThresholds(
 	zThresh, hmmThresh, err := genomeNullThresholds(cfg, bsaType, raw)
 	if err != nil {
 		color.Yellow("Warning: genome-wide null failed (%v); CompositeZ falls back to normal quantiles and the HMM LOD has no threshold", err)
-		zThresh = fallbackZThresholds(countZStats(bsaType, HMMAvailable(cfg, bsaType)))
+		zThresh = fallbackZThresholds(countZStats(bsaType))
 		hmmThresh = HMMThresholds{LODP99: math.Inf(1), LODP95: math.Inf(1)}
 	}
 

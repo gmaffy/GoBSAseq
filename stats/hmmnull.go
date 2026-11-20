@@ -63,6 +63,9 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 	order := newMarkerOrder(raw) // replicates share the markers: sort once
 	for range reps {
 		sim.replicate(rng, buf)
+		if sc.hmm != nil { // as RawStats: HMM LOD from the per-site counts, before smoothing
+			computeHMMLOD(sc.hmm, buf, order)
+		}
 		mx := 0.0
 		sm, err := sc.scoreOrdered(buf, order, false, every)
 		if err != nil {
@@ -84,7 +87,7 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 		return r6(stat.Quantile(p, stat.Empirical, v, nil))
 	}
 	zt := ZThresholds{ZP99: 2.576, ZP95: 1.960, CompositeZP99: q(cz, 0.99), CompositeZP95: q(cz, 0.95),
-		NumStats: countZStats(bsaType, sc.lay.hmm)}
+		NumStats: countZStats(bsaType)}
 	var ht HMMThresholds
 	if sc.lay.hmm {
 		ht = HMMThresholds{LODP99: q(maxima, 0.99), LODP95: q(maxima, 0.95)}

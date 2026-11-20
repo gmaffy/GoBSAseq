@@ -461,13 +461,11 @@ func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
 	case "HMMLOD":
 		q.HMMLOD = peak
 
-
 	case "AFDev", "AFDev+", "AFDev-":
 		q.AFDev = peak
 
 	case "OneBulkGstat":
 		q.OneBulkG = peak
-
 
 	}
 }

@@ -47,9 +47,9 @@ type BSAstats struct {
 	OneBulkAFDev float64
 	OneBulkGstat float64
 
-	// HMMLOD is the linkage-aware LOD from the pool HMM (see hmm.go). It is
-	// computed along each chromosome after the per-site statistics, in the
-	// smoothing step, and is not itself smoothed.
+	// HMMLOD is the linkage-aware LOD from the pool HMM (see hmm.go),
+	// computed along each chromosome after the per-site statistics (RawStats).
+	// It is a separate track: not smoothed, normalised or consolidated.
 	HMMLOD float64
 
 	// HighDepth and LowDepth are each bulk's informative depth (REF + target
@@ -62,136 +62,6 @@ type BSAstats struct {
 	// read-sampling variance, p(1−p)(1/dH + 1/dL).
 	Depth int
 }
-
-// LEGACY (commented out): vcfgo-based depth parsing and polarity, replaced by
-// filter.Site (allele depths parsed once by the filter, polarity decided there).
-//
-// // safeRefDepthSample parses REF depth for a sample directly from the AD/RO
-// // FORMAT fields instead of calling vcfgo's RefDepth(), which can panic when
-// // AD is present but malformed (e.g. missing the comma separator). On parse
-// // failure it returns an error so callers can fall back gracefully.
-// func safeRefDepthSample(s *vcfgo.SampleGenotype) (int, error) {
-// 	if s == nil {
-// 		return 0, fmt.Errorf("nil sample")
-// 	}
-// 	if ad, ok := s.Fields["AD"]; ok {
-// 		if comma := strings.Index(ad, ","); comma >= 0 {
-// 			refStr := ad[:comma]
-// 			if refStr == "" || refStr == "." {
-// 				return 0, fmt.Errorf("invalid AD ref depth %q", refStr)
-// 			}
-// 			return strconv.Atoi(refStr)
-// 		}
-// 	}
-// 	if ro, ok := s.Fields["RO"]; ok {
-// 		if ro == "" || ro == "." {
-// 			return 0, fmt.Errorf("invalid RO ref depth %q", ro)
-// 		}
-// 		return strconv.Atoi(ro)
-// 	}
-// 	return 0, fmt.Errorf("no ref depth field (AD/RO)")
-// }
-//
-// // safeAltDepthsSample parses ALT depths for a sample directly from the AD/AO
-// // FORMAT fields instead of calling vcfgo's AltDepths(), for the same
-// // malformed-AD-panic reason as safeRefDepthSample.
-// func safeAltDepthsSample(s *vcfgo.SampleGenotype) ([]int, error) {
-// 	if s == nil {
-// 		return []int{}, fmt.Errorf("nil sample")
-// 	}
-// 	if ad, ok := s.Fields["AD"]; ok {
-// 		if comma := strings.Index(ad, ","); comma >= 0 {
-// 			altStr := ad[comma+1:]
-// 			parts := strings.Split(altStr, ",")
-// 			vals := make([]int, len(parts))
-// 			for i, p := range parts {
-// 				if p == "" || p == "." {
-// 					return []int{}, fmt.Errorf("invalid AD alt depth %q", p)
-// 				}
-// 				v, err := strconv.Atoi(p)
-// 				if err != nil {
-// 					return []int{}, err
-// 				}
-// 				vals[i] = v
-// 			}
-// 			return vals, nil
-// 		}
-// 	}
-// 	if ao, ok := s.Fields["AO"]; ok {
-// 		parts := strings.Split(ao, ",")
-// 		vals := make([]int, len(parts))
-// 		for i, p := range parts {
-// 			if p == "" || p == "." {
-// 				return []int{}, fmt.Errorf("invalid AO alt depth %q", p)
-// 			}
-// 			v, err := strconv.Atoi(p)
-// 			if err != nil {
-// 				return []int{}, err
-// 			}
-// 			vals[i] = v
-// 		}
-// 		return vals, nil
-// 	}
-// 	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
-// }
-//
-// // determineHighAllele decides which allele (0 = ref, altIdx+1 = alt) the
-// // "high" phenotype segregates with. A parent used in BSA-seq is ideally a
-// // fully homozygous inbred line, but in practice parents can carry residual
-// // heterozygosity, low-level contamination, or noisy genotype calls — a raw
-// // GT[0] lookup then reflects whichever allele the caller happened to list
-// // first, not necessarily the allele that actually predominates in that
-// // parent's reads. Using allele depth instead makes the polarity robust to a
-// // parent being imperfectly homozygous. Falls back to the genotype call only
-// // when depth data isn't usable (e.g. the parent has zero coverage here).
-// func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx int) int {
-// 	predominantAllele := func(idx int) (allele int, ok bool) {
-// 		if idx < 0 || idx >= len(v.Samples) {
-// 			return 0, false
-// 		}
-// 		s := v.Samples[idx]
-// 		refDepth, errR := safeRefDepthSample(s)
-// 		altDepths, errA := safeAltDepthsSample(s)
-// 		if errR != nil || errA != nil || altIdx < 0 || altIdx >= len(altDepths) {
-// 			return 0, false
-// 		}
-// 		altDepth := altDepths[altIdx]
-// 		total := refDepth + altDepth
-// 		if total == 0 {
-// 			return 0, false
-// 		}
-// 		if refDepth >= altDepth {
-// 			return 0, true
-// 		}
-// 		return altIdx + 1, true
-// 	}
-//
-// 	if highParentIdx >= 0 {
-// 		if allele, ok := predominantAllele(highParentIdx); ok {
-// 			return allele
-// 		}
-// 		if len(v.Samples[highParentIdx].GT) > 0 {
-// 			return v.Samples[highParentIdx].GT[0]
-// 		}
-// 		return 0
-// 	}
-//
-// 	if lowParentIdx >= 0 {
-// 		if allele, ok := predominantAllele(lowParentIdx); ok {
-// 			// The high-phenotype allele is whichever one the low parent
-// 			// does NOT predominantly carry.
-// 			if allele == 0 {
-// 				return altIdx + 1
-// 			}
-// 			return 0
-// 		}
-// 		if len(v.Samples[lowParentIdx].GT) > 0 && v.Samples[lowParentIdx].GT[0] == 0 {
-// 			return altIdx + 1
-// 		}
-// 	}
-//
-// 	return 0
-// }
 
 func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVariants []filter.Site) ([]BSAstats, error) {
 	if len(idxs) == 0 {
@@ -239,6 +109,7 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 		// Without known polarity (2b, --ref-parent none) the sign of ΔSI is
 		// arbitrary at each SNP and would cancel when smoothed, so DeltaSI holds |ΔSI|.
 		signedDSI: cfg.SignedDeltaSI(bsaType),
+		hmm:       HMMAvailable(cfg, bsaType),
 	}
 	hasOneBulk := layout.highBulk != layout.lowBulk
 	signedDSI := layout.signedDSI
@@ -271,9 +142,29 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 		oneBulk:   hasOneBulk,
 		p0:        oneBulkP0,
 	}
+	results := computeRaw(passedVariants, calc)
+
+	// HMM LOD: a linkage- and pool-aware statistic computed along each
+	// chromosome from the per-site read counts (hmm.go). It stays a separate
+	// track in LOD units: carried through smoothing unsmoothed, not
+	// normalised, not in CompositeZ, with its own genome-wide thresholds.
+	if layout.hmm {
+		setup, err := newHMMSetup(cfg, bsaType)
+		if err != nil {
+			return nil, err
+		}
+		if cfg.CMPerMb > 0 {
+			color.Cyan("HMM LOD: recombination %.3g cM/Mb\n", cfg.CMPerMb)
+		} else {
+			color.Cyan("HMM LOD: recombination assumed 1 Morgan per chromosome (set --cm-per-mb to change)\n")
+		}
+		computeHMMLOD(setup, results, newMarkerOrder(results))
+	} else {
+		color.Yellow("HMM LOD not computed: 2b without --ref-parent has no allele polarity\n")
+	}
+
 	rawPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.raw.tsv", bsaType))
-	results, err := computeAndWriteRaw(rawPath, passedVariants, calc, layout)
-	if err != nil {
+	if err := writeRaw(rawPath, results, passedVariants, calc.roles, layout); err != nil {
 		return nil, fmt.Errorf("writing %s: %w", rawPath, err)
 	}
 
@@ -346,18 +237,46 @@ func (c *rawCalc) site(site *filter.Site) BSAstats {
 	return s
 }
 
-// rawChunk is the number of sites a worker computes and formats at a time.
+// rawChunk is the number of sites a worker computes or formats at a time.
 const rawChunk = 8192
 
-// computeAndWriteRaw computes every site's statistics and writes the raw TSV.
-// Workers take chunks of sites in order, compute them and format their TSV
-// rows into a buffer; this goroutine writes the buffers in chunk order. At
-// most 2 chunks per worker are in flight, which bounds the buffered output.
-// Every write, flush and close error is returned.
-func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawLayout) (results []BSAstats, err error) {
+// computeRaw computes every site's statistics, in parallel chunks.
+func computeRaw(sites []filter.Site, calc rawCalc) []BSAstats {
+	results := make([]BSAstats, len(sites))
+	nChunks := (len(sites) + rawChunk - 1) / rawChunk
+	bar := progressbar.Default(int64(len(sites)), "Processing variants")
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for range max(runtime.GOMAXPROCS(0), 1) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				c := int(next.Add(1)) - 1
+				if c >= nChunks {
+					return
+				}
+				lo, hi := c*rawChunk, min((c+1)*rawChunk, len(sites))
+				for i := lo; i < hi; i++ {
+					results[i] = calc.site(&sites[i])
+				}
+				_ = bar.Add(hi - lo)
+			}
+		}()
+	}
+	wg.Wait()
+	_ = bar.Finish()
+	return results
+}
+
+// writeRaw writes the raw TSV. Workers take chunks of sites in order and
+// format their rows into a buffer; this goroutine writes the buffers in chunk
+// order. At most 2 chunks per worker are in flight, which bounds the buffered
+// output. Every write, flush and close error is returned.
+func writeRaw(path string, results []BSAstats, sites []filter.Site, roles siteRoles, lay rawLayout) (err error) {
 	f, err := os.Create(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() {
 		if cerr := f.Close(); err == nil {
@@ -366,10 +285,9 @@ func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawL
 	}()
 	w := bufio.NewWriterSize(f, 1<<20)
 	if _, err := w.Write(rawHeader(lay)); err != nil {
-		return nil, err
+		return err
 	}
 
-	results = make([]BSAstats, len(sites))
 	nChunks := (len(sites) + rawChunk - 1) / rawChunk
 	workers := max(runtime.GOMAXPROCS(0), 1)
 	done := make([]chan []byte, nChunks)
@@ -378,7 +296,6 @@ func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawL
 	}
 	tokens := make(chan struct{}, 2*workers)
 	bufs := sync.Pool{New: func() any { return make([]byte, 0, 1<<20) }}
-	bar := progressbar.Default(int64(len(sites)), "Processing variants")
 
 	// A chunk index is claimed only after taking a token, so the chunk this
 	// goroutine waits for next is always claimed: no deadlock.
@@ -398,11 +315,9 @@ func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawL
 				lo, hi := c*rawChunk, min((c+1)*rawChunk, len(sites))
 				buf := bufs.Get().([]byte)[:0]
 				for i := lo; i < hi; i++ {
-					results[i] = calc.site(&sites[i])
-					buf = appendRawRow(buf, &results[i], &sites[i], calc.roles, lay)
+					buf = appendRawRow(buf, &results[i], &sites[i], roles, lay)
 				}
 				done[c] <- buf
-				_ = bar.Add(hi - lo)
 			}
 		}()
 	}
@@ -417,14 +332,10 @@ func computeAndWriteRaw(path string, sites []filter.Site, calc rawCalc, lay rawL
 		<-tokens
 	}
 	wg.Wait()
-	_ = bar.Finish()
 	if werr != nil {
-		return nil, werr
+		return werr
 	}
-	if err := w.Flush(); err != nil {
-		return nil, err
-	}
-	return results, nil
+	return w.Flush()
 }
 
 // minOneBulkP0Sites is the fewest informative sites each polarity class needs
@@ -503,6 +414,7 @@ func interquartileMean(v []float64) float64 {
 type rawLayout struct {
 	highParent, lowParent, highBulk, lowBulk bool
 	signedDSI                                bool
+	hmm                                      bool // HMMLOD column (HMMAvailable)
 }
 
 // rawHeader returns the raw TSV header line.
@@ -525,10 +437,17 @@ func rawHeader(lay rawLayout) []byte {
 		header = append(header, "LowBulkGT", "LowBulkAD", "LowBulkOther", "LowBulkL", "LowBulkH", "LowSI")
 	}
 	if lay.highBulk && lay.lowBulk {
-		header = append(header, DeltaSIName(lay.signedDSI), "Gstat", "ED4", "HighDepth", "LowDepth")
+		header = append(header, DeltaSIName(lay.signedDSI), "Gstat", "ED4")
+		if lay.hmm {
+			header = append(header, "HMMLOD")
+		}
+		header = append(header, "HighDepth", "LowDepth")
 	}
 	if lay.highBulk != lay.lowBulk {
 		header = append(header, "P0", "AFDev", "Gstat1")
+		if lay.hmm {
+			header = append(header, "HMMLOD")
+		}
 	}
 	header = append(header, "Depth")
 	return []byte(strings.Join(header, "\t") + "\n")
@@ -567,10 +486,16 @@ func appendRawRow(buf []byte, s *BSAstats, site *filter.Site, r siteRoles, lay r
 	if lay.highBulk && lay.lowBulk {
 		buf = f6(f6(buf, s.DeltaSI), s.Gstat)
 		buf = strconv.AppendFloat(tab(buf), s.ED, 'g', 6, 64)
+		if lay.hmm {
+			buf = f6(buf, s.HMMLOD)
+		}
 		buf = itoa(itoa(buf, s.HighDepth), s.LowDepth)
 	}
 	if lay.highBulk != lay.lowBulk {
 		buf = f6(f6(f6(buf, s.OneBulkP0), s.OneBulkAFDev), s.OneBulkGstat)
+		if lay.hmm {
+			buf = f6(buf, s.HMMLOD)
+		}
 	}
 	buf = itoa(buf, s.Depth)
 	return append(buf, '\n')
@@ -676,4 +601,3 @@ func oneBulkGStatistic(success, fail int, p0 float64) float64 {
 	}
 	return 2 * g
 }
-

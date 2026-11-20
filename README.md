@@ -161,10 +161,10 @@ The mode is auto-detected based on which samples are provided (`None` = not prov
 
 **Two-bulk modes** compute: ΔSI, G-statistic, ED⁴ and the pool-HMM LOD (see below).
 
-**`2b` polarity.** Without a parent sample, SI is the REF-allele fraction. Unless the reference genome is one of the parents, REF comes from the high parent at some SNPs and the low parent at others, so the sign of ΔSI is arbitrary per SNP and would cancel when smoothed. With `--ref-parent none` (the default), `2b` therefore uses \|ΔSI\| (columns `AbsDeltaSI`, `Sm_AbsDeltaSI`, `Z_AbsDeltaSI`): its thresholds are upper-tail only, there is no `DeltaSI-` track, CompositeZ uses Z(\|ΔSI\|), and two-bulk BRM is skipped. QTLs can be located, but not which bulk carries which parent's allele. G and ED⁴ do not depend on polarity; the HMM LOD needs it and is not computed in this case (CompositeZ then uses \|ΔSI\| and G only). If the reference is a parent, pass `--ref-parent high` or `low` to get signed ΔSI and BRM.
+**`2b` polarity.** Without a parent sample, SI is the REF-allele fraction. Unless the reference genome is one of the parents, REF comes from the high parent at some SNPs and the low parent at others, so the sign of ΔSI is arbitrary per SNP and would cancel when smoothed. With `--ref-parent none` (the default), `2b` therefore uses \|ΔSI\| (columns `AbsDeltaSI`, `Sm_AbsDeltaSI`, `Z_AbsDeltaSI`): its thresholds are upper-tail only, there is no `DeltaSI-` track, CompositeZ uses Z(\|ΔSI\|), and BRM uses the polarity-free form described below. QTLs can be located, but not which bulk carries which parent's allele. G and ED⁴ do not depend on polarity. The HMM LOD needs polarity and is not computed in this case; CompositeZ then uses \|ΔSI\| and G′ only. BRM uses a polarity-free form. It smooths the bias-corrected ΔSI², that is (SI_H − SI_L)² minus each bulk's read-sampling variance SI(1−SI)/(d−1), which estimates the squared pool frequency difference whatever allele is REF. BRM then tests its square root (\|ΔAF\|) against the usual threshold, with af at the population's expected frequency. Blocks have no direction. On simulated no-QTL genomes its false-block rate matched the signed BRM's (24 vs 22 of 100 genomes). If the reference is a parent, pass `--ref-parent high` or `low` to get signed ΔSI and BRM.
 **One-bulk modes** compute: AF deviation, one-bulk G-stat and the pool-HMM LOD.
 
-**HMM LOD** (after MULTIPOOL, Edwards & Gifford 2012). Each bulk is modelled as a pool whose hidden high-parent allele count changes along the chromosome only through crossovers, so all linked SNPs inform the same pool frequency, and pool sampling of the plants is part of the model. The pool prior and linkage depend on the population type (F2, F3, F4, RIL, BCn, BCnF2); recombination defaults to 1 Morgan per chromosome (`--cm-per-mb` sets a genome-wide rate); markers within 0.01 cM share one HMM step. Two-bulk LOD tests whether the bulks differ, with their shared frequency free, so segregation distortion that shifts both bulks is not scored as a QTL. One-bulk LOD tests the bulk against P0 (with the mapping-bias correction). The LOD is already linkage-aware and is not smoothed. Its thresholds are genome-wide: the 95%/99% quantiles of the maximum LOD over `--null-reps` simulated no-QTL genomes at the real markers and depths, run through the same scoring code. The same simulated genomes give the CompositeZ thresholds. The HMM LOD replaces the earlier per-SNP LOD and beta-binomial Bayes factor, which ignored pool sampling and linkage.
+**HMM LOD** (after MULTIPOOL, Edwards & Gifford 2012). Each bulk is modelled as a pool whose hidden high-parent allele count changes along the chromosome only through crossovers, so all linked SNPs inform the same pool frequency, and pool sampling of the plants is part of the model. The pool prior and linkage depend on the population type (F2, F3, F4, RIL, BCn, BCnF2); recombination defaults to 1 Morgan per chromosome (`--cm-per-mb` sets a genome-wide rate); markers within 0.01 cM share one HMM step. Two-bulk LOD tests whether the bulks differ, with their shared frequency free, so segregation distortion that shifts both bulks is not scored as a QTL. One-bulk LOD tests the bulk against P0 (with the mapping-bias correction). It is computed in the raw-statistics stage and written to the raw TSV. The LOD is already linkage-aware, so it is not smoothed or normalised and is not part of CompositeZ: it stays in LOD units, as its own track with its own thresholds. Its thresholds are genome-wide: the 95%/99% quantiles of the maximum LOD over `--null-reps` simulated no-QTL genomes at the real markers and depths, run through the same scoring code. The same simulated genomes give the CompositeZ thresholds. The HMM LOD replaces the earlier per-SNP LOD and beta-binomial Bayes factor, which ignored pool sampling and linkage.
 
 ---
 
@@ -209,9 +209,9 @@ genespace/  (if annotation enabled)
 
 ### Key Columns
 
-**Raw TSV**: `CHROM`, `POS`, `REF`, `ALT`, genotypes, bulk allele depths (`*BulkAD` = REF,ALT of the biallelic site; `*BulkOther` = reads on any other ALT of a split multi-allelic record), `HighSI`/`LowSI` (selection index), `DeltaSI`, `Gstat`, `ED4`, `HighDepth`/`LowDepth` (two-bulk), `Depth` (one-bulk: the bulk's depth; two-bulk: effective depth 2·dH·dL/(dH+dL), used for smoothing weights). Two-bulk thresholds are simulated at each site's own (HighDepth, LowDepth) pair. One-bulk modes add `P0`, `AFDev`, `Gstat1`. The HMM LOD is in the smoothed TSV (`HMMLOD`, `Z_HMMLOD`).
+**Raw TSV**: `CHROM`, `POS`, `REF`, `ALT`, genotypes, bulk allele depths (`*BulkAD` = REF,ALT of the biallelic site; `*BulkOther` = reads on any other ALT of a split multi-allelic record), `HighSI`/`LowSI` (selection index), `DeltaSI`, `Gstat`, `ED4`, `HMMLOD` (when computed), `HighDepth`/`LowDepth` (two-bulk), `Depth` (one-bulk: the bulk's depth; two-bulk: effective depth 2·dH·dL/(dH+dL), used for smoothing weights). Two-bulk thresholds are simulated at each site's own (HighDepth, LowDepth) pair. One-bulk modes add `P0`, `AFDev`, `Gstat1`, `HMMLOD`. `HMMLOD` is absent in `2b` without `--ref-parent`.
 
-**Smoothed TSV**: Adds `Sm_*` (smoothed values), `Z_*` (robust Z-scores), `CompositeZ` (Stouffer), `MaxAbsZ`.
+**Smoothed TSV**: Adds `Sm_*` (smoothed values), `Z_*` (robust Z-scores), `CompositeZ` (Stouffer), `MaxAbsZ`. `HMMLOD` is carried over from the raw TSV unchanged (no Z).
 
 **Merged QTLs**: `CHROM`, `START`, `STOP`, `SOURCE` (`ZScore`/`BRM`/`ZScore+BRM`), `Z_PEAK`, `BRM_PEAK`, `BRM_THRESHOLD`.
 
@@ -221,9 +221,10 @@ genespace/  (if annotation enabled)
 
 ```
 1. Hard Filter         → Remove low-quality variants (SNP/INDEL-specific thresholds)
-2. Raw Statistics      → Per-variant SI, ΔSI, G-stat, ED⁴ (one-bulk: AFDev, G1)
-3. Smooth & Normalise  → Pool-HMM LOD along each chromosome (not smoothed), Gaussian kernel smoothing,
-                          robust Z-scores (MAD), Stouffer composite Z (|ZΔSI| + ZG + ZHMMLOD)
+2. Raw Statistics      → Per-variant SI, ΔSI, G-stat, ED⁴ (one-bulk: AFDev, G1); pool-HMM LOD along
+                          each chromosome (not in 2b without --ref-parent)
+3. Smooth & Normalise  → Kernel smoothing, robust Z-scores (MAD), Stouffer composite Z
+                          (|ZΔSI| + ZG′)/√2; one-bulk (|ZAFDev| + ZG1)/√2; the HMM LOD is carried, not smoothed
                           SI, ΔSI and AFDev use a Gaussian kernel (σ = window/2), switching to a local linear fit
                           within 2σ of chromosome ends (blended over 2–3σ; only on chromosomes spanning ≥ 6σ)
                           to remove edge bias; markers sharing a position (split multi-allelic views) count as

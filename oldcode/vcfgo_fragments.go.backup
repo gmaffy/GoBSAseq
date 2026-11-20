@@ -1,0 +1,169 @@
+// Commented-out vcfgo-based code removed from the live sources, kept for reference.
+// The new streaming filter (filter/vcfheader.go, record.go, fastfilter.go) replaced it.
+
+// ===== from stats/stats.go, lines 66-194 =====
+// LEGACY (commented out): vcfgo-based depth parsing and polarity, replaced by
+// filter.Site (allele depths parsed once by the filter, polarity decided there).
+//
+// // safeRefDepthSample parses REF depth for a sample directly from the AD/RO
+// // FORMAT fields instead of calling vcfgo's RefDepth(), which can panic when
+// // AD is present but malformed (e.g. missing the comma separator). On parse
+// // failure it returns an error so callers can fall back gracefully.
+// func safeRefDepthSample(s *vcfgo.SampleGenotype) (int, error) {
+// 	if s == nil {
+// 		return 0, fmt.Errorf("nil sample")
+// 	}
+// 	if ad, ok := s.Fields["AD"]; ok {
+// 		if comma := strings.Index(ad, ","); comma >= 0 {
+// 			refStr := ad[:comma]
+// 			if refStr == "" || refStr == "." {
+// 				return 0, fmt.Errorf("invalid AD ref depth %q", refStr)
+// 			}
+// 			return strconv.Atoi(refStr)
+// 		}
+// 	}
+// 	if ro, ok := s.Fields["RO"]; ok {
+// 		if ro == "" || ro == "." {
+// 			return 0, fmt.Errorf("invalid RO ref depth %q", ro)
+// 		}
+// 		return strconv.Atoi(ro)
+// 	}
+// 	return 0, fmt.Errorf("no ref depth field (AD/RO)")
+// }
+//
+// // safeAltDepthsSample parses ALT depths for a sample directly from the AD/AO
+// // FORMAT fields instead of calling vcfgo's AltDepths(), for the same
+// // malformed-AD-panic reason as safeRefDepthSample.
+// func safeAltDepthsSample(s *vcfgo.SampleGenotype) ([]int, error) {
+// 	if s == nil {
+// 		return []int{}, fmt.Errorf("nil sample")
+// 	}
+// 	if ad, ok := s.Fields["AD"]; ok {
+// 		if comma := strings.Index(ad, ","); comma >= 0 {
+// 			altStr := ad[comma+1:]
+// 			parts := strings.Split(altStr, ",")
+// 			vals := make([]int, len(parts))
+// 			for i, p := range parts {
+// 				if p == "" || p == "." {
+// 					return []int{}, fmt.Errorf("invalid AD alt depth %q", p)
+// 				}
+// 				v, err := strconv.Atoi(p)
+// 				if err != nil {
+// 					return []int{}, err
+// 				}
+// 				vals[i] = v
+// 			}
+// 			return vals, nil
+// 		}
+// 	}
+// 	if ao, ok := s.Fields["AO"]; ok {
+// 		parts := strings.Split(ao, ",")
+// 		vals := make([]int, len(parts))
+// 		for i, p := range parts {
+// 			if p == "" || p == "." {
+// 				return []int{}, fmt.Errorf("invalid AO alt depth %q", p)
+// 			}
+// 			v, err := strconv.Atoi(p)
+// 			if err != nil {
+// 				return []int{}, err
+// 			}
+// 			vals[i] = v
+// 		}
+// 		return vals, nil
+// 	}
+// 	return []int{}, fmt.Errorf("no alt depth field (AD/AO)")
+// }
+//
+// // determineHighAllele decides which allele (0 = ref, altIdx+1 = alt) the
+// // "high" phenotype segregates with. A parent used in BSA-seq is ideally a
+// // fully homozygous inbred line, but in practice parents can carry residual
+// // heterozygosity, low-level contamination, or noisy genotype calls — a raw
+// // GT[0] lookup then reflects whichever allele the caller happened to list
+// // first, not necessarily the allele that actually predominates in that
+// // parent's reads. Using allele depth instead makes the polarity robust to a
+// // parent being imperfectly homozygous. Falls back to the genotype call only
+// // when depth data isn't usable (e.g. the parent has zero coverage here).
+// func determineHighAllele(v *vcfgo.Variant, highParentIdx, lowParentIdx, altIdx int) int {
+// 	predominantAllele := func(idx int) (allele int, ok bool) {
+// 		if idx < 0 || idx >= len(v.Samples) {
+// 			return 0, false
+// 		}
+// 		s := v.Samples[idx]
+// 		refDepth, errR := safeRefDepthSample(s)
+// 		altDepths, errA := safeAltDepthsSample(s)
+// 		if errR != nil || errA != nil || altIdx < 0 || altIdx >= len(altDepths) {
+// 			return 0, false
+// 		}
+// 		altDepth := altDepths[altIdx]
+// 		total := refDepth + altDepth
+// 		if total == 0 {
+// 			return 0, false
+// 		}
+// 		if refDepth >= altDepth {
+// 			return 0, true
+// 		}
+// 		return altIdx + 1, true
+// 	}
+//
+// 	if highParentIdx >= 0 {
+// 		if allele, ok := predominantAllele(highParentIdx); ok {
+// 			return allele
+// 		}
+// 		if len(v.Samples[highParentIdx].GT) > 0 {
+// 			return v.Samples[highParentIdx].GT[0]
+// 		}
+// 		return 0
+// 	}
+//
+// 	if lowParentIdx >= 0 {
+// 		if allele, ok := predominantAllele(lowParentIdx); ok {
+// 			// The high-phenotype allele is whichever one the low parent
+// 			// does NOT predominantly carry.
+// 			if allele == 0 {
+// 				return altIdx + 1
+// 			}
+// 			return 0
+// 		}
+// 		if len(v.Samples[lowParentIdx].GT) > 0 && v.Samples[lowParentIdx].GT[0] == 0 {
+// 			return altIdx + 1
+// 		}
+// 	}
+//
+// 	return 0
+// }
+
+// ===== from run/run.go, lines 530-541 =====
+	// LEGACY: the old filter consumed a vcfgo reader opened here.
+	// f, cleanup, err := openVCF(cfg.VCF)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to open VCF %q: %w", cfg.VCF, err)
+	// }
+	// defer cleanup()
+	//
+	// rdr, err := vcfgo.NewReader(f, false)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to create VCF reader: %w", err)
+	// }
+	// cfg.Rdr = rdr
+
+// ===== from utils/utils.go, lines 9-25 =====
+// LEGACY: INFO lookup used by the old vcfgo-based filter.
+// func GetFloat(v *vcfgo.Variant, key string) (float64, bool) {
+// 	raw, err := v.Info().Get(key)
+// 	if err != nil || raw == nil {
+// 		return 0, false
+// 	}
+// 	switch val := raw.(type) {
+// 	case float32:
+// 		return float64(val), true
+// 	case float64:
+// 		return val, true
+// 	case int:
+// 		return float64(val), true
+// 	default:
+// 		return 0, false
+// 	}
+// }
+
+// ===== from utils/config.go (AnalysisConfig field), lines 26-26 =====
+	// Rdr *vcfgo.Reader // LEGACY: the vcfgo reader used by the old filter.

@@ -23,7 +23,6 @@ type HardFilterConfig struct {
 
 type AnalysisConfig struct {
 	VCF string
-	// Rdr *vcfgo.Reader // LEGACY: the vcfgo reader used by the old filter.
 	// VCFInfoIDs lists the INFO keys declared in the input VCF header.
 	VCFInfoIDs map[string]bool
 

@@ -71,7 +71,7 @@ func dumpSmoothed(sm []SmoothedStats) []byte {
 			g(s.SmHighSI), g(s.SmLowSI), g(s.SmDeltaSI), g(s.SmGstat), g(s.SmED),
 			g(s.OneBulkP0), g(s.SmAFDev), g(s.SmOneBulkG), g(s.HMMLOD),
 			g(s.ZHighSI), g(s.ZLowSI), g(s.ZDeltaSI), g(s.ZGstat), g(s.ZED),
-			g(s.ZAFDev), g(s.ZOneBulkG), g(s.ZHMMLOD), g(s.CompositeZ), g(s.MaxAbsZ))
+			g(s.ZAFDev), g(s.ZOneBulkG), g(s.CompositeZ), g(s.MaxAbsZ))
 	}
 	return b.Bytes()
 }
@@ -88,7 +88,15 @@ func TestSmoothGolden(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), WindowSize: 2_000_000, RefParent: tc.refParent,
 				Population: "F2", HighBulkSize: 20, LowBulkSize: 20}
-			sm, err := SmoothAndNormalise(cfg, tc.mode, smoothInput(11, 1200))
+			raw := smoothInput(11, 1200)
+			if HMMAvailable(cfg, tc.mode) { // as RawStats does, before smoothing
+				setup, err := newHMMSetup(cfg, tc.mode)
+				if err != nil {
+					t.Fatal(err)
+				}
+				computeHMMLOD(setup, raw, newMarkerOrder(raw))
+			}
+			sm, err := SmoothAndNormalise(cfg, tc.mode, raw)
 			if err != nil {
 				t.Fatal(err)
 			}

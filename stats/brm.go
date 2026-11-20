@@ -121,7 +121,23 @@ func bulkDepths(s SmoothedStats) (float64, float64) {
 	return math.Max(float64(dH), 1), math.Max(float64(dL), 1)
 }
 
-func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize, lowBulkSize int, popScale, uAlpha float64) []BRMBlock {
+// brmTwoBulkSignal is what two-bulk BRM tests at a marker: the |ΔAF|
+// estimate (signed: the smoothed ΔSI, whose sign is kept for the peak) and
+// the allele frequency for its null variance.
+type brmTwoBulkSignal func(s SmoothedStats) (value, af float64)
+
+// brmSigned: smoothed signed ΔSI, af = mean smoothed SI (polarity known).
+func brmSigned(s SmoothedStats) (float64, float64) { return s.SmDeltaSI, (s.SmHighSI + s.SmLowSI) / 2 }
+
+// brmPolarityFree returns the signal for 2b without --ref-parent: √max(smoothed
+// bias-corrected ΔSI², 0), an estimate of |ΔAF| that needs no polarity, with
+// af = p0 (the smoothed SI are REF fractions there, ≈ 0.5 whatever the true
+// frequencies).
+func brmPolarityFree(p0 float64) brmTwoBulkSignal {
+	return func(s SmoothedStats) (float64, float64) { return math.Sqrt(math.Max(s.SmDeltaSI2, 0)), p0 }
+}
+
+func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize, lowBulkSize int, popScale, uAlpha float64, signal brmTwoBulkSignal) []BRMBlock {
 	if len(stats) == 0 || highBulkSize <= 0 || lowBulkSize <= 0 || uAlpha <= 0 {
 		return nil
 	}
@@ -151,7 +167,7 @@ func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize
 	}
 
 	for i, s := range stats {
-		af := (s.SmHighSI + s.SmLowSI) / 2
+		value, af := signal(s)
 		if af < 0.05 {
 			af = 0.05
 		}
@@ -166,20 +182,20 @@ func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize
 		poolL := af * (1 - af) / (popScale * n2)
 		variance := poolH*(1-1/dH) + af*(1-af)/dH + poolL*(1-1/dL) + af*(1-af)/dL
 		threshold := uAlpha * math.Sqrt(variance)
-		significant := threshold > 0 && math.Abs(s.SmDeltaSI) >= threshold
+		significant := threshold > 0 && math.Abs(value) >= threshold
 
 		if significant {
 			if !inBlock {
 				inBlock = true
 				startIdx = i
 				peakIdx = i
-				peak = s.SmDeltaSI
+				peak = value
 				peakThreshold = threshold
 				continue
 			}
-			if math.Abs(s.SmDeltaSI) > math.Abs(peak) {
+			if math.Abs(value) > math.Abs(peak) {
 				peakIdx = i
-				peak = s.SmDeltaSI
+				peak = value
 				peakThreshold = threshold
 			}
 			continue
@@ -308,13 +324,18 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 	popScale := PopulationVarianceScale(cfg.Population)
 	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
 
-	// Two-bulk BRM tests signed smoothed ΔSI against a zero-centred null. With
-	// unknown polarity (2b, --ref-parent none) SmDeltaSI is smoothed |ΔSI|,
-	// whose null baseline is above zero and depends on depth, so the BRM
-	// threshold does not apply.
+	// Two-bulk BRM tests the smoothed signed ΔSI against a zero-centred null.
+	// With unknown polarity (2b, --ref-parent none) the sign of ΔSI is
+	// arbitrary per SNP, so BRM tests √(smoothed bias-corrected ΔSI²) instead:
+	// the same |ΔAF|, estimated without polarity (direction not reported).
+	signal := brmTwoBulkSignal(brmSigned)
 	if hasBoth && !cfg.SignedDeltaSI(bsaType) {
-		color.Yellow("BRM skipped: 2b without --ref-parent has no allele polarity (use --ref-parent high|low if the reference is a parent)")
-		hasBoth = false
+		p0, err := ExpectedAF(cfg.Population)
+		if err != nil {
+			return nil, err
+		}
+		signal = brmPolarityFree(p0)
+		color.Cyan("BRM: polarity-free form (2b without --ref-parent): √(smoothed bias-corrected ΔSI²); block peaks have no direction")
 	}
 
 	// group by chrom
@@ -328,7 +349,7 @@ func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRM
 		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
 		var blocks []BRMBlock
 		if hasBoth {
-			blocks = calculateBRMBlocksTwoBulk(chrom, stats, highBulkSize, lowBulkSize, popScale, uAlpha)
+			blocks = calculateBRMBlocksTwoBulk(chrom, stats, highBulkSize, lowBulkSize, popScale, uAlpha, signal)
 		} else if hasOne {
 			// expectedSI: use expectedHighAlleleP0 if available, else 0.5
 			expectedSI, _ := ExpectedAF(cfg.Population)

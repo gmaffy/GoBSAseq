@@ -3,6 +3,7 @@ package stats
 import (
 	"io"
 	"math"
+	"math/rand"
 	"os"
 	"sort"
 	"testing"
@@ -122,13 +123,13 @@ func TestRobustZScores(t *testing.T) {
 // consolidate actually combines. With every component Z = 1, CompositeZ = √k.
 func TestCompositeZStatCountMatchesConsolidate(t *testing.T) {
 	for _, m := range allModes {
-		hb, lb, both, one := BulkFlags(m.mode)
-		for _, hmm := range []bool{true, false} {
-			sm := []SmoothedStats{{ZDeltaSI: 1, ZGstat: 1, ZAFDev: 1, ZOneBulkG: 1, ZHMMLOD: 1}}
-			consolidate(sm, hb, lb, both, one, true, hmm)
+		hb, lb, _, _ := BulkFlags(m.mode)
+		for _, hmm := range []bool{true, false} { // the HMM LOD never enters CompositeZ
+			sm := []SmoothedStats{{ZDeltaSI: 1, ZGstat: 1, ZAFDev: 1, ZOneBulkG: 1, HMMLOD: 5}}
+			consolidate(sm, smoothLayout{highBulk: hb, lowBulk: lb, signedDSI: true, hmm: hmm}, nil)
 			k := int(math.Round(sm[0].CompositeZ * sm[0].CompositeZ))
-			if k != countZStats(m.mode, hmm) {
-				t.Errorf("%s hmm=%v: consolidate combines %d Z-scores, countZStats says %d", m.mode, hmm, k, countZStats(m.mode, hmm))
+			if k != countZStats(m.mode) || k != 2 {
+				t.Errorf("%s hmm=%v: consolidate combines %d Z-scores, countZStats says %d (want 2)", m.mode, hmm, k, countZStats(m.mode))
 			}
 		}
 	}
@@ -210,13 +211,13 @@ func TestSmoothDropsIsolatedMarkerByNEff(t *testing.T) {
 func TestMaxAbsZSIOnlyInOneBulk(t *testing.T) {
 	sm := []SmoothedStats{{ZHighSI: 10, ZLowSI: -9, ZDeltaSI: 1, ZGstat: 1}}
 	for _, signed := range []bool{true, false} {
-		consolidate(sm, true, true, true, false, signed, true)
+		consolidate(sm, smoothLayout{highBulk: true, lowBulk: true, signedDSI: signed, hmm: true}, nil)
 		if sm[0].MaxAbsZ != 1 {
 			t.Fatalf("two-bulk MaxAbsZ = %v (signed %v), want 1", sm[0].MaxAbsZ, signed)
 		}
 	}
 	one := []SmoothedStats{{ZHighSI: 10, ZAFDev: 1}}
-	consolidate(one, true, false, false, true, true, true)
+	consolidate(one, smoothLayout{highBulk: true, signedDSI: true, hmm: true}, nil)
 	if one[0].MaxAbsZ != 10 {
 		t.Fatalf("one-bulk MaxAbsZ = %v, want 10", one[0].MaxAbsZ)
 	}
@@ -318,7 +319,7 @@ func TestRobustZFieldMatchesRobustZScores(t *testing.T) {
 		for i, v := range vals {
 			sm[i].SmGstat = v
 		}
-		robustZField(sm, zField{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }}, make([]float64, len(sm)))
+		robustZField(sm, zField{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }, false}, make([]float64, len(sm)))
 		want := robustZScores(vals)
 		for i := range sm {
 			if sm[i].ZGstat != want[i] {
@@ -365,7 +366,7 @@ func TestLocalLinearNoEdgeBias(t *testing.T) {
 func TestGridMatchesExact(t *testing.T) {
 	color.Output = io.Discard
 	raw := smoothInput(11, 20000) // dense, with a sparse stretch at 8–14 Mb
-	o := smoothOpts{bw: 1e6, weight: depthWeight, hasHighBulk: true, hasLowBulk: true, signedDSI: true, every: 1}
+	o := smoothOpts{bw: 1e6, weight: depthWeight, lay: smoothLayout{highBulk: true, lowBulk: true, signedDSI: true}, every: 1}
 	exact, err := gaussianSmoothOpts(raw, o)
 	if err != nil {
 		t.Fatal(err)
@@ -501,7 +502,7 @@ func TestSmoothSamePositionMarkers(t *testing.T) {
 	for range 6 {
 		raw = append(raw, BSAstats{CHROM: "tiny", POS: 5000, HighSI: 0.5, LowSI: 0.5, Depth: 30, HighDepth: 30, LowDepth: 30})
 	}
-	sm, err := gaussianSmoothOpts(raw, smoothOpts{bw: 1e6, step: 50_000, weight: depthWeight, hasHighBulk: true, hasLowBulk: true, signedDSI: true, every: 1})
+	sm, err := gaussianSmoothOpts(raw, smoothOpts{bw: 1e6, step: 50_000, weight: depthWeight, lay: smoothLayout{highBulk: true, lowBulk: true, signedDSI: true}, every: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +516,7 @@ func TestSmoothSamePositionMarkers(t *testing.T) {
 func TestSmoothCompactOutput(t *testing.T) {
 	color.Output = io.Discard
 	raw := smoothInput(5, 3000)
-	o := smoothOpts{bw: 1e6, step: 50_000, weight: depthWeight, hasHighBulk: true, hasLowBulk: true, signedDSI: true, every: 1}
+	o := smoothOpts{bw: 1e6, step: 50_000, weight: depthWeight, lay: smoothLayout{highBulk: true, lowBulk: true, signedDSI: true}, every: 1}
 	full, err := gaussianSmoothOpts(raw, o)
 	if err != nil {
 		t.Fatal(err)
@@ -536,6 +537,142 @@ func TestSmoothCompactOutput(t *testing.T) {
 		f, ok := byKey[[2]int64{int64(len(s.CHROM)), s.POS}]
 		if !ok || f.SmDeltaSI != s.SmDeltaSI || f.SmGstat != s.SmGstat || f.NEff != s.NEff {
 			t.Fatalf("compact marker %s:%d differs from full output", s.CHROM, s.POS)
+		}
+	}
+}
+
+// Position units are built only when needed: a chromosome without duplicate
+// positions and without a grid uses its markers directly as neighbours.
+func TestUnitsOnlyWhenNeeded(t *testing.T) {
+	raw := flatRaw("c", 50, 10_000, func(int) (float64, int) { return 0.5, 30 })
+	lay := smoothLayout{highBulk: true, lowBulk: true, signedDSI: true}
+	o := smoothOpts{bw: 1e6, weight: depthWeight, lay: lay, every: 1, order: newMarkerOrder(raw)}
+	c := newChromWork(raw, o.order.chroms[0], smoothFields(lay), o)
+	if c.nwt2 != nil || &c.npos[0] != &c.pos[0] {
+		t.Fatal("units built for a chromosome with no duplicates and no grid")
+	}
+	raw = append(raw, raw[10]) // a duplicate position
+	o.order = newMarkerOrder(raw)
+	c = newChromWork(raw, o.order.chroms[0], smoothFields(lay), o)
+	if c.nwt2 == nil || len(c.npos) != 50 {
+		t.Fatalf("duplicates: %d neighbours, want 50 units", len(c.npos))
+	}
+}
+
+// logZ: the robust Z of log(x + c), c = 10% of the median, matches the
+// reference applied to the transformed values (zeros stay finite).
+func TestRobustZFieldLog(t *testing.T) {
+	vals := []float64{0, 0.5, 1, 2, 4, 8, 16, 3, 1.5}
+	sm := make([]SmoothedStats, len(vals))
+	for i, v := range vals {
+		sm[i].SmED = v
+	}
+	robustZField(sm, zField{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }, true}, make([]float64, len(sm)))
+	c := 0.1 * 2.0 // median of vals is 2
+	logged := make([]float64, len(vals))
+	for i, v := range vals {
+		logged[i] = math.Log(v + c)
+	}
+	want := robustZScores(logged)
+	for i := range sm {
+		if math.IsInf(sm[i].ZED, 0) || math.Abs(sm[i].ZED-want[i]) > 1e-12 {
+			t.Fatalf("z[%d] = %v, want %v", i, sm[i].ZED, want[i])
+		}
+	}
+}
+
+// Views sharing a position: only the deepest represents it, in the kernels
+// (smoothed values equal those with the shallower view removed) and in the
+// marker order.
+func TestDeepestViewRepresentsPosition(t *testing.T) {
+	color.Output = io.Discard
+	base := flatRaw("c", 60, 20_000, func(i int) (float64, int) { return 0, 30 })
+	deep := base[30]
+	deep.HighSI, deep.LowSI, deep.HighDepth, deep.LowDepth = 1, 1, 80, 80
+	shallow := base[30]
+	shallow.HighSI, shallow.LowSI, shallow.HighDepth, shallow.LowDepth = 0.2, 0.2, 20, 20
+	withBoth := append(append(append([]BSAstats(nil), base[:30]...), shallow, deep), base[31:]...)
+	onlyDeep := append(append(append([]BSAstats(nil), base[:30]...), deep), base[31:]...)
+	if o := newMarkerOrder(withBoth); o.rep[30] || !o.rep[31] {
+		t.Fatalf("rep = %v/%v, want the deeper view (index 31)", o.rep[30], o.rep[31])
+	}
+	a, err := gaussianSmooth(withBoth, 200_000, depthWeight, true, true, true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := gaussianSmooth(onlyDeep, 200_000, depthWeight, true, true, true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ai := 0
+	for _, s := range b {
+		for a[ai].POS != s.POS {
+			ai++
+		}
+		if math.Abs(a[ai].SmHighSI-s.SmHighSI) > 1e-12 || math.Abs(a[ai].NEff-s.NEff) > 1e-9 {
+			t.Fatalf("at %d: %v (NEff %v) with both views, %v (NEff %v) with the deep view only", s.POS, a[ai].SmHighSI, a[ai].NEff, s.SmHighSI, s.NEff)
+		}
+	}
+}
+
+// MaxAbsZ: |Z| for signed tracks, positive part for one-sided tracks (a very
+// low G′ is not evidence).
+func TestMaxAbsZOneSided(t *testing.T) {
+	lay := smoothLayout{highBulk: true, lowBulk: true, signedDSI: true, hmm: true}
+	sm := []SmoothedStats{{ZDeltaSI: -2, ZGstat: -9, ZED: -12, HMMLOD: 40}} // HMM LOD is not in MaxAbsZ
+	consolidate(sm, lay, nil)
+	if sm[0].MaxAbsZ != 2 {
+		t.Fatalf("MaxAbsZ = %v, want 2 (|ZΔSI|; low G′/ED⁴ ignored)", sm[0].MaxAbsZ)
+	}
+	sm = []SmoothedStats{{ZDeltaSI: -2, ZGstat: 5}}
+	consolidate(sm, lay, nil)
+	if sm[0].MaxAbsZ != 5 {
+		t.Fatalf("MaxAbsZ = %v, want 5", sm[0].MaxAbsZ)
+	}
+}
+
+// CompositeZ uses the untransformed robust Z of the log-Z track G′, while its
+// Z column stays log-based; the HMM LOD is not part of CompositeZ.
+func TestCompositeZUsesUntransformedZ(t *testing.T) {
+	lay := smoothLayout{highBulk: true, lowBulk: true, signedDSI: true, hmm: true}
+	tracks := lay.tracks()
+	scales := make([]zScale, len(tracks))
+	for i, tr := range tracks {
+		if tr.smCol == "Sm_Gstat" {
+			scales[i] = zScale{center: 3, scale: 1, set: true}
+		}
+	}
+	sm := []SmoothedStats{{SmGstat: 5, ZGstat: 0.4, HMMLOD: 20, ZDeltaSI: -1}}
+	consolidate(sm, lay, scales)
+	want := (1 + 2) / math.Sqrt(2) // |ZΔSI| + (5−3)/1
+	if math.Abs(sm[0].CompositeZ-want) > 1e-12 {
+		t.Fatalf("CompositeZ = %v, want %v", sm[0].CompositeZ, want)
+	}
+	if sm[0].ZGstat != 0.4 {
+		t.Fatal("Z column was changed")
+	}
+}
+
+// deltaSI2c is unbiased for the squared pool difference and does not depend
+// on which allele is REF.
+func TestDeltaSI2cUnbiasedAndPhaseFree(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	for _, c := range []struct{ pH, pL float64 }{{0.5, 0.5}, {0.7, 0.3}, {0.6, 0.55}} {
+		sum, n := 0.0, 200000
+		for range n {
+			dH, dL := 20+rng.Intn(60), 20+rng.Intn(60)
+			h, l := binomSample(rng, dH, c.pH), binomSample(rng, dL, c.pL)
+			s := BSAstats{HighSI: float64(h) / float64(dH), LowSI: float64(l) / float64(dL), HighDepth: dH, LowDepth: dL}
+			flipped := s
+			flipped.HighSI, flipped.LowSI = 1-s.HighSI, 1-s.LowSI
+			if math.Abs(deltaSI2c(&s)-deltaSI2c(&flipped)) > 1e-12 {
+				t.Fatal("deltaSI2c depends on phase")
+			}
+			sum += deltaSI2c(&s)
+		}
+		want := (c.pH - c.pL) * (c.pH - c.pL)
+		if got := sum / float64(n); math.Abs(got-want) > 0.002 {
+			t.Errorf("pools %.2f/%.2f: mean deltaSI2c %.4f, want %.4f", c.pH, c.pL, got, want)
 		}
 	}
 }

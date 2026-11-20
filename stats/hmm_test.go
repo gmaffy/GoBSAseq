@@ -114,7 +114,35 @@ func TestGenomeNullThresholdsRuns(t *testing.T) {
 	if !(ht.LODP99 >= ht.LODP95 && ht.LODP95 > 0 && zt.CompositeZP99 >= zt.CompositeZP95) || math.IsInf(ht.LODP99, 0) {
 		t.Fatalf("thresholds HMM %+v, Z %+v", ht, zt)
 	}
-	if zt.NumStats != 3 {
-		t.Fatalf("NumStats = %d, want 3", zt.NumStats)
+	if zt.NumStats != 2 {
+		t.Fatalf("NumStats = %d, want 2", zt.NumStats)
+	}
+}
+
+// The HMM uses only each position's representative view: a duplicated view
+// at a position does not change the LOD.
+func TestHMMIgnoresDuplicateViews(t *testing.T) {
+	cfg := utils.AnalysisConfig{Population: "F2", HighBulkSize: 20, LowBulkSize: 20, RefParent: "high"}
+	setup, err := newHMMSetup(cfg, "2p2b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw []BSAstats
+	for i := range 200 {
+		h := 30
+		if i >= 90 && i < 110 {
+			h = 40 // a shift in the high bulk
+		}
+		raw = append(raw, BSAstats{CHROM: "c", POS: int64(1 + 20_000*i), HighBulkH: h, HighBulkL: 50 - h, LowBulkH: 25, LowBulkL: 25, HighDepth: 50, LowDepth: 50})
+	}
+	single := append([]BSAstats(nil), raw...)
+	computeHMMLOD(setup, single, newMarkerOrder(single))
+	dup := append(append([]BSAstats(nil), raw...), raw[100])     // second view at position 100, same depth
+	dup[len(dup)-1].HighBulkH, dup[len(dup)-1].HighBulkL = 50, 0 // a different contrast
+	computeHMMLOD(setup, dup, newMarkerOrder(dup))
+	for i := range single {
+		if single[i].HMMLOD != dup[i].HMMLOD {
+			t.Fatalf("marker %d: LOD %v without the duplicate view, %v with it", i, single[i].HMMLOD, dup[i].HMMLOD)
+		}
 	}
 }

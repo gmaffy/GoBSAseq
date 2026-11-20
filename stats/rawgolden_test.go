@@ -78,7 +78,7 @@ func numericDump(raw []BSAstats) []byte {
 		fmt.Fprintln(&b, s.CHROM, s.POS, s.REF, s.ALT, s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH,
 			g(s.HighSI), g(s.LowSI), g(s.DeltaSI), g(s.Gstat), g(s.ED),
 			g(s.OneBulkP0), g(s.OneBulkAFDev), g(s.OneBulkGstat), s.HighIsAlt,
-			s.HighBulkOther, s.LowBulkOther, s.HighDepth, s.LowDepth, s.Depth)
+			s.HighBulkOther, s.LowBulkOther, s.HighDepth, s.LowDepth, s.Depth, g(s.HMMLOD))
 	}
 	return b.Bytes()
 }
@@ -101,7 +101,7 @@ func TestRawStatsGolden(t *testing.T) {
 				for i := range idxs {
 					idxs[i] = i
 				}
-				cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), Population: "F2", RefParent: rp}
+				cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), Population: "F2", RefParent: rp, HighBulkSize: 20, LowBulkSize: 20}
 				raw, err := RawStats(cfg, m.mode, idxs, goldenSites(m.n, int64(mi+1)))
 				if err != nil {
 					t.Fatal(err)

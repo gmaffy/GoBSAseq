@@ -43,8 +43,14 @@ func (p plantSim) gamete(rng *rand.Rand) []bool {
 }
 
 func (p plantSim) dataset(rng *rand.Rand, nPlants int, rho float64, qtl bool) []BSAstats {
+	return p.datasetPhase(rng, nPlants, rho, qtl, false)
+}
+
+// datasetPhase: with randomPhase, REF is the high or the low parent's allele
+// at random per SNP and raw stats are computed as in 2b without --ref-parent.
+func (p plantSim) datasetPhase(rng *rand.Rand, nPlants int, rho float64, qtl, randomPhase bool) []BSAstats {
 	var raw []BSAstats
-	calc := rawCalc{roles: siteRoles{hp: -1, lp: -1, hb: 0, lb: 1}, signedDSI: true}
+	calc := rawCalc{roles: siteRoles{hp: -1, lp: -1, hb: 0, lb: 1}, signedDSI: !randomPhase}
 	for c := 0; c < p.nChrom; c++ {
 		copies := [2][]int{make([]int, len(p.markers)), make([]int, len(p.markers))}
 		for b := 0; b < 2; b++ {
@@ -80,6 +86,7 @@ func (p plantSim) dataset(rng *rand.Rand, nPlants int, rho float64, qtl bool) []
 		}
 		for i, pos := range p.markers {
 			site := filter.Site{Chrom: string(rune('A' + c)), Pos: pos, Ref: "A", Alt: "T", NSamples: 2}
+			flip := randomPhase && rng.Intn(2) == 1
 			for b := 0; b < 2; b++ {
 				d := int(distuv.Poisson{Lambda: distuv.Gamma{Alpha: 8, Beta: 8.0 / 50, Src: rng}.Rand(), Src: rng}.Rand())
 				f := float64(copies[b][i]) / float64(2*nPlants)
@@ -90,6 +97,9 @@ func (p plantSim) dataset(rng *rand.Rand, nPlants int, rho float64, qtl bool) []
 				}
 				h := binomSample(rng, d, pr)
 				site.Samples[b] = filter.SampleAD{Ref: int32(h), Alt: int32(d - h), HasAD: true}
+				if flip { // REF is the low parent's allele at this SNP
+					site.Samples[b].Ref, site.Samples[b].Alt = site.Samples[b].Alt, site.Samples[b].Ref
+				}
 			}
 			raw = append(raw, calc.site(&site))
 		}
@@ -112,20 +122,39 @@ func TestHMMLODCalibration(t *testing.T) {
 	for x := 1500.0; x < p.lenBp; x += 3000 {
 		p.markers = append(p.markers, int64(x))
 	}
-	cfg := utils.AnalysisConfig{WindowSize: 2_000_000, Population: "F2", HighBulkSize: 20, LowBulkSize: 20, RefParent: "high", NullReps: 200}
-	sc, _ := newScorer(cfg, "2p2b")
-	for _, rho := range []float64{0, 0.01} {
-		rng := rand.New(rand.NewSource(11))
-		tmpl := p.dataset(rng, 20, rho, false)
-		zt, ht, err := genomeNullThresholds(cfg, "2p2b", tmpl)
+	// Two-bulk with known polarity (binomial and overdispersed reads; HMM LOD
+	// and signed BRM), and 2b without --ref-parent with REF from either parent
+	// at random per SNP (no HMM LOD; polarity-free BRM). BRM is checked as the
+	// fraction of no-QTL genomes with any block (it is a pointwise α = 0.05
+	// test, so this is reported, not asserted).
+	for _, sc := range []struct {
+		mode, refParent string
+		rho             float64
+		randomPhase     bool
+	}{{"2p2b", "high", 0, false}, {"2p2b", "high", 0.01, false}, {"2b", "none", 0, true}} {
+		cfg := utils.AnalysisConfig{WindowSize: 2_000_000, Population: "F2", HighBulkSize: 20, LowBulkSize: 20, RefParent: sc.refParent, NullReps: 200,
+			BrmAlpha: 0.05, OutputDir: t.TempDir()}
+		scorer, err := newScorer(cfg, sc.mode)
 		if err != nil {
 			t.Fatal(err)
 		}
-		var over95, over99, czOver99, czN int
+		rng := rand.New(rand.NewSource(11))
+		withHMM := func(raw []BSAstats) []BSAstats { // as RawStats does
+			if scorer.hmm != nil {
+				computeHMMLOD(scorer.hmm, raw, newMarkerOrder(raw))
+			}
+			return raw
+		}
+		tmpl := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
+		zt, ht, err := genomeNullThresholds(cfg, sc.mode, tmpl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var over95, over99, czOver99, czN, brmGenomes int
 		const nNull = 100
 		for range nNull {
-			raw := p.dataset(rng, 20, rho, false)
-			sm, _ := sc.score(raw, false, 1)
+			raw := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
+			sm, _ := scorer.score(raw, false, 1)
 			mx := 0.0
 			for i := range raw {
 				mx = math.Max(mx, raw[i].HMMLOD)
@@ -142,20 +171,31 @@ func TestHMMLODCalibration(t *testing.T) {
 					czOver99++
 				}
 			}
+			if blocks, _ := RunBRM(cfg, sc.mode, sm); len(blocks) > 0 {
+				brmGenomes++
+			}
 		}
 		// power: one QTL dataset
-		qraw := p.dataset(rng, 20, rho, true)
-		sc.score(qraw, false, 1)
+		qraw := withHMM(p.datasetPhase(rng, 20, sc.rho, true, sc.randomPhase))
+		qsm, _ := scorer.score(qraw, false, 1)
+		qBRM := 0
+		if blocks, _ := RunBRM(cfg, sc.mode, qsm); len(blocks) > 0 {
+			for _, b := range blocks {
+				if b.Chrom == "A" && b.Start <= 15_000_000 && b.Stop >= 15_000_000 {
+					qBRM = 1
+				}
+			}
+		}
 		qmax := 0.0
 		for i := range qraw {
 			if qraw[i].CHROM == "A" {
 				qmax = math.Max(qmax, qraw[i].HMMLOD)
 			}
 		}
-		if over99 > 5 || over95 > 12 {
-			t.Errorf("rho=%.3f: null genomes over p95 %d/%d, over p99 %d/%d: thresholds too low", rho, over95, nNull, over99, nNull)
+		if HMMAvailable(cfg, sc.mode) && (over99 > 5 || over95 > 12) {
+			t.Errorf("%s/%s rho=%.3f: null genomes over p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, over95, nNull, over99, nNull)
 		}
-		t.Logf("rho=%.3f: HMM LOD thresholds p95 %.2f p99 %.2f | null genomes over p95: %d/%d, over p99: %d/%d | CompositeZ sites over p99: %.2f%% | QTL chromosome max LOD %.1f",
-			rho, ht.LODP95, ht.LODP99, over95, nNull, over99, nNull, 100*float64(czOver99)/float64(czN), qmax)
+		t.Logf("%s ref-parent=%s rho=%.3f: HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ sites over p99: %.2f%% | QTL max LOD %.1f | BRM: null genomes with a block %d/%d, QTL found %v",
+			sc.mode, sc.refParent, sc.rho, ht.LODP95, ht.LODP99, over95, over99, nNull, 100*float64(czOver99)/float64(czN), qmax, brmGenomes, nNull, qBRM == 1)
 	}
 }
