@@ -14,10 +14,9 @@ package plots
 //   • BRMBlock        (brm.go)        — BRM block intervals produced by
 //                                       RunBRM.
 //
-// Three HTML pages are written per bsaType:
+// Two HTML pages are written per bsaType:
 //
 //   GoBSAseq.<bsaType>.individual_plots.html   — per-statistic raw-value charts
-//   GoBSAseq.<bsaType>.robust_z_overlay.html   — all Z-scores overlaid per chrom
 //   GoBSAseq.<bsaType>.composite_signal.html   — CompositeZ / MaxAbsZ chart
 //
 // The chart style (theme, colours, data-zoom, toolbox, BRM mark-areas) is
@@ -72,6 +71,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 
 	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk := stats.BulkFlags(bsaType)
 	signedDSI := cfg.SignedDeltaSI(bsaType)
+	hmmOn := stats.HMMAvailable(cfg, bsaType)
 
 	// ── group by chromosome, preserve sort order ─────────────────────────────
 
@@ -103,10 +103,6 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 	individualPage.SetLayout(components.PageFlexLayout)
 	individualPage.PageTitle = "GoBSAseq — Individual Statistics"
 
-	robustZPage := components.NewPage()
-	robustZPage.SetLayout(components.PageFlexLayout)
-	robustZPage.PageTitle = "GoBSAseq — Robust Z-score Overlay"
-
 	compositePage := components.NewPage()
 	compositePage.SetLayout(components.PageFlexLayout)
 	compositePage.PageTitle = "GoBSAseq — Composite Signal"
@@ -131,27 +127,13 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		dsi := make([]float64, n)
 		gs := make([]float64, n)
 		ed := make([]float64, n)
-		lod := make([]float64, n)
-		bbl := make([]float64, n)
+		hmm := make([]float64, n) // pool-HMM LOD (not smoothed)
 
 		// One-bulk smoothed values.
 		afDev := make([]float64, n)
 		obG := make([]float64, n)
-		obLod := make([]float64, n)
-		obBB := make([]float64, n)
 
 		// Z-scores (all available for every bsaType).
-		hiZ := make([]float64, n)
-		liZ := make([]float64, n)
-		dsiZ := make([]float64, n)
-		gsZ := make([]float64, n)
-		edZ := make([]float64, n)
-		lodZ := make([]float64, n)
-		bblZ := make([]float64, n)
-		afDevZ := make([]float64, n)
-		obGZ := make([]float64, n)
-		obLodZ := make([]float64, n)
-		obBBZ := make([]float64, n)
 		compositeZ := make([]float64, n)
 		maxAbsZ := make([]float64, n)
 
@@ -164,15 +146,11 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		dsiT95, dsiTM95 := make([]float64, n), make([]float64, n)
 		gsT99, gsT95 := make([]float64, n), make([]float64, n)
 		edT99, edT95 := make([]float64, n), make([]float64, n)
-		lodT99, lodT95 := make([]float64, n), make([]float64, n)
-		bblT99, bblT95 := make([]float64, n), make([]float64, n)
 
 		// Per-variant threshold arrays for one-bulk individual charts.
 		afDevT99, afDevTM99 := make([]float64, n), make([]float64, n)
 		afDevT95, afDevTM95 := make([]float64, n), make([]float64, n)
 		obGT99, obGT95 := make([]float64, n), make([]float64, n)
-		obLodT99, obLodT95 := make([]float64, n), make([]float64, n)
-		obBBT99, obBBT95 := make([]float64, n), make([]float64, n)
 
 		for i, e := range entries {
 			s, t := e.sm, e.t
@@ -180,9 +158,7 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 
 			if hasBothBulks {
 				hi[i], li[i], dsi[i] = s.SmHighSI, s.SmLowSI, s.SmDeltaSI
-				gs[i], ed[i], lod[i], bbl[i] = s.SmGstat, s.SmED, s.SmLOD, s.SmBBLogBF
-				hiZ[i], liZ[i], dsiZ[i] = s.ZHighSI, s.ZLowSI, s.ZDeltaSI
-				gsZ[i], edZ[i], lodZ[i], bblZ[i] = s.ZGstat, s.ZED, s.ZLOD, s.ZBBLogBF
+				gs[i], ed[i] = s.SmGstat, s.SmED
 
 				tb := t.TwoBulk
 				hiT99[i], hiTM99[i] = tb.HighSIP99, tb.HighSIMp99
@@ -193,20 +169,17 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 				dsiT95[i], dsiTM95[i] = tb.DeltaSIP95, tb.DeltaSIMp95
 				gsT99[i], gsT95[i] = tb.GstatP99, tb.GstatP95
 				edT99[i], edT95[i] = tb.ED4P99, tb.ED4P95
-				lodT99[i], lodT95[i] = tb.LODP99, tb.LODP95
-				bblT99[i], bblT95[i] = tb.BBLogBFP99, tb.BBLogBFP95
 			}
+			hmm[i] = s.HMMLOD
 
 			if hasHighBulk && !hasBothBulks {
 				// High-bulk-only: HighSI Z-score available.
 				hi[i] = s.SmHighSI
-				hiZ[i] = s.ZHighSI
 				hiT99[i], hiTM99[i] = t.TwoBulk.HighSIP99, t.TwoBulk.HighSIMp99
 				hiT95[i], hiTM95[i] = t.TwoBulk.HighSIP95, t.TwoBulk.HighSIMp95
 			}
 			if hasLowBulk && !hasBothBulks {
 				li[i] = s.SmLowSI
-				liZ[i] = s.ZLowSI
 				liT99[i], liTM99[i] = t.TwoBulk.LowSIP99, t.TwoBulk.LowSIMp99
 				liT95[i], liTM95[i] = t.TwoBulk.LowSIP95, t.TwoBulk.LowSIMp95
 			}
@@ -214,19 +187,11 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 			if hasOneBulk {
 				afDev[i] = s.SmAFDev
 				obG[i] = s.SmOneBulkG
-				obLod[i] = s.SmOneBulkLOD
-				obBB[i] = s.SmOneBulkBBLogBF
-				afDevZ[i] = s.ZAFDev
-				obGZ[i] = s.ZOneBulkG
-				obLodZ[i] = s.ZOneBulkLOD
-				obBBZ[i] = s.ZOneBulkBBLogBF
 
 				ob := t.OneBulk
 				afDevT99[i], afDevTM99[i] = ob.AFDevP99, ob.AFDevMp99
 				afDevT95[i], afDevTM95[i] = ob.AFDevP95, ob.AFDevMp95
 				obGT99[i], obGT95[i] = ob.OneBulkGstatP99, ob.OneBulkGstatP95
-				obLodT99[i], obLodT95[i] = ob.OneBulkLODP99, ob.OneBulkLODP95
-				obBBT99[i], obBBT95[i] = ob.OneBulkBBLogBFP99, ob.OneBulkBBLogBFP95
 			}
 
 			compositeZ[i] = s.CompositeZ
@@ -250,20 +215,15 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		// ── individual raw-value charts ──────────────────────────────────────
 
 		if hasBothBulks {
+			individualPage.AddCharts(siCharts(chrom, x, hi, li,
+				[4]float64{avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95)},
+				[4]float64{avg(liT99), avg(liT95), avg(liTM99), avg(liTM95)}, signedDSI, chromBRM)...)
 			individualPage.AddCharts(
-				createRawValueChart(chrom+" HighSI", x, hi,
-					avg(hiT99), avg(hiT95), avg(hiTM99), avg(hiTM95), true, chromBRM),
-				createRawValueChart(chrom+" LowSI", x, li,
-					avg(liT99), avg(liT95), avg(liTM99), avg(liTM95), true, chromBRM),
 				dsiChart(chrom, x, dsi, avg(dsiT99), avg(dsiT95), avg(dsiTM99), avg(dsiTM95), signedDSI, chromBRM),
 				createRawValueChart(chrom+" G-statistic", x, gs,
 					avg(gsT99), avg(gsT95), 0, 0, false, chromBRM),
 				createRawValueChart(chrom+" ED⁴", x, ed,
 					avg(edT99), avg(edT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" LOD", x, lod,
-					avg(lodT99), avg(lodT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" BB log-BF", x, bbl,
-					avg(bblT99), avg(bblT95), 0, 0, false, chromBRM),
 			)
 		}
 
@@ -285,24 +245,21 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 					avg(afDevT99), avg(afDevT95), avg(afDevTM99), avg(afDevTM95), true, chromBRM),
 				createRawValueChart(chrom+" One-bulk G-statistic", x, obG,
 					avg(obGT99), avg(obGT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" One-bulk LOD", x, obLod,
-					avg(obLodT99), avg(obLodT95), 0, 0, false, chromBRM),
-				createRawValueChart(chrom+" One-bulk BB log-BF", x, obBB,
-					avg(obBBT99), avg(obBBT95), 0, 0, false, chromBRM),
 			)
 		}
-
-		// ── robust Z-score overlay ───────────────────────────────────────────
-
-		robustZPage.AddCharts(
-			createZOverlayChart(
-				chrom, bsaType, x,
-				hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ,
-				afDevZ, obGZ, obLodZ, obBBZ,
-				hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk,
-				chromBRM,
-			),
-		)
+		if hmmOn {
+			ht := entries[0].t.HMM              // genome-wide, the same at every site
+			finite := func(v float64) float64 { // a failed null leaves +Inf; JSON can't carry it
+				if math.IsInf(v, 0) || math.IsNaN(v) {
+					return 0
+				}
+				return v
+			}
+			individualPage.AddCharts(
+				createRawValueChart(chrom+" HMM LOD (genome-wide thresholds)", x, hmm,
+					finite(ht.LODP99), finite(ht.LODP95), 0, 0, false, chromBRM),
+			)
+		}
 
 		// ── composite signal chart ───────────────────────────────────────────
 		// Use the empirical CompositeZ thresholds from the first variant on this
@@ -327,7 +284,6 @@ func GeneratePlots(cfg utils.AnalysisConfig, bsaType string, smoothed []stats.Sm
 		name string
 	}{
 		{individualPage, fmt.Sprintf("GoBSAseq.%s.individual_plots.html", bsaType)},
-		{robustZPage, fmt.Sprintf("GoBSAseq.%s.robust_z_overlay.html", bsaType)},
 		{compositePage, fmt.Sprintf("GoBSAseq.%s.composite_signal.html", bsaType)},
 	}
 	for _, p := range pages {
@@ -418,6 +374,24 @@ func commonGlobalOpts(title, subtitle, yLabel, width, height string, bidirection
 // tm99 / tm95   — lower-tail (negative) thresholds; ignored when
 //
 //	hasNegativeThresh is false.
+//
+// siCharts draws the two bulks' SI. Without polarity (2b, --ref-parent none)
+// SI is the REF fraction: it is labelled as such and drawn without
+// thresholds, because a QTL's signal cancels across SNPs there.
+// hiT and liT are the mean p99, p95, Mp99 and Mp95 thresholds.
+func siCharts(chrom string, x []int64, hi, li []float64, hiT, liT [4]float64, signed bool, brm []stats.BRMBlock) []components.Charter {
+	if !signed {
+		return []components.Charter{
+			createRawValueChart(chrom+" High bulk REF fraction (polarity unknown: not a QTL track)", x, hi, 0, 0, 0, 0, false, brm),
+			createRawValueChart(chrom+" Low bulk REF fraction (polarity unknown: not a QTL track)", x, li, 0, 0, 0, 0, false, brm),
+		}
+	}
+	return []components.Charter{
+		createRawValueChart(chrom+" HighSI", x, hi, hiT[0], hiT[1], hiT[2], hiT[3], true, brm),
+		createRawValueChart(chrom+" LowSI", x, li, liT[0], liT[1], liT[2], liT[3], true, brm),
+	}
+}
+
 // dsiChart draws ΔSI, or |ΔSI| (upper thresholds only) when polarity is unknown.
 func dsiChart(chrom string, x []int64, y []float64, t99, t95, tm99, tm95 float64, signed bool, brm []stats.BRMBlock) *charts.Line {
 	if signed {
@@ -519,176 +493,6 @@ func createRawValueChart(
 	return line
 }
 
-// ── robust Z-score overlay chart ─────────────────────────────────────────────
-
-// statColor returns the hex colour assigned to each statistic series, matching
-// the legacy palette exactly.
-func statColor(name string) string {
-	switch name {
-	case "HighSI":
-		return "#1f77b4"
-	case "LowSI":
-		return "#ff7f0e"
-	case "DeltaSI":
-		return "#2ca02c"
-	case "Gstat":
-		return "#17becf"
-	case "ED":
-		return "#d62728"
-	case "LOD":
-		return "#9467bd"
-	case "BBLogBF":
-		return "#8c564b"
-	case "AFDev":
-		return "#e377c2"
-	case "OneBulkG":
-		return "#17becf"
-	case "OneBulkLOD":
-		return "#9467bd"
-	case "OneBulkBB":
-		return "#8c564b"
-	}
-	return "#7f7f7f"
-}
-
-// createZOverlayChart draws all available robust Z-score series on one chart
-// per chromosome, with ±2 / ±3 reference lines and BRM block shading.
-// This replaces the legacy createRobustZOverlayChart; it is bsaType-aware so
-// it only draws the series relevant to the current analysis mode.
-func createZOverlayChart(
-	chrom, bsaType string,
-	x []int64,
-	hiZ, liZ, dsiZ, gsZ, edZ, lodZ, bblZ []float64,
-	afDevZ, obGZ, obLodZ, obBBZ []float64,
-	hasHighBulk, hasLowBulk, hasBothBulks, hasOneBulk bool,
-	brmBlocks []stats.BRMBlock,
-) *charts.Line {
-
-	title := chrom + " — Robust Z-score Overlay"
-	subtitle := "Genome-wide robust Z-score (background median+MAD). " +
-		"z = ±2 suggestive · z = ±3 significant. Shaded bands: BRM blocks."
-
-	line := charts.NewLine()
-	line.SetGlobalOptions(commonGlobalOpts(title, subtitle, "Robust Z-score", chartWidth, chartHeight, true)...)
-
-	line.SetGlobalOptions(
-		charts.WithYAxisOpts(opts.YAxis{
-			Name:         "Robust Z-score",
-			NameLocation: "middle",
-			NameGap:      55,
-			SplitLine:    &opts.SplitLine{Show: opts.Bool(true)},
-			AxisLabel: &opts.AxisLabel{
-				Formatter: opts.FuncOpts(`function(v) {
-					let m = {3:'z=3 ★', 2:'z=2 ●', 0:'0', '-2':'z=-2 ●', '-3':'z=-3 ★'};
-					let k = parseFloat(v.toFixed(1));
-					return m[k] !== undefined ? m[k] : v.toFixed(1);
-				}`),
-			},
-		}),
-		charts.WithTooltipOpts(opts.Tooltip{
-			Show:        opts.Bool(true),
-			Trigger:     "axis",
-			AxisPointer: &opts.AxisPointer{Type: "cross"},
-			Formatter: opts.FuncOpts(`function(params) {
-				let pos = params[0].axisValue;
-				let posStr = pos >= 1e6 ? (pos/1e6).toFixed(3)+' Mb' : pos >= 1000 ? (pos/1000).toFixed(2)+' kb' : pos+' bp';
-				let result = '<strong>' + posStr + '</strong><br/>';
-				let refSeries = ['z=0','z=+2 (sugg.)','z=+3 (sig.)','z=-2 (sugg.)','z=-3 (sig.)'];
-				params.forEach(function(item) {
-					if (refSeries.indexOf(item.seriesName) !== -1) return;
-					let val = parseFloat(item.value);
-					if (isNaN(val)) return;
-					let sig = '';
-					if (Math.abs(val) >= 3.0)      sig = ' <span style="color:#e74c3c;font-weight:bold">★ significant</span>';
-					else if (Math.abs(val) >= 2.0) sig = ' <span style="color:#f39c12">● suggestive</span>';
-					result += item.marker + ' ' + item.seriesName + ': ' + val.toFixed(3) + sig + '<br/>';
-				});
-				return result;
-			}`),
-		}),
-	)
-
-	n := len(x)
-	mkRef := func(val float64) []opts.LineData {
-		d := make([]opts.LineData, n)
-		for i := range d {
-			d[i] = opts.LineData{Value: val}
-		}
-		return d
-	}
-
-	// Reference lines — z=0 carries the BRM mark-area.
-	zeroOpts := []charts.SeriesOpts{
-		charts.WithLineStyleOpts(opts.LineStyle{Type: "solid", Width: 1, Color: "#bdc3c7"}),
-		charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-	}
-	zeroOpts = append(zeroOpts, brmMarkAreaOpts(brmBlocks, x)...)
-
-	line.SetXAxis(positionLabels(x)).
-		AddSeries("z=0", mkRef(0), zeroOpts...).
-		AddSeries("z=+2 (sugg.)", mkRef(zSugg),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries("z=+3 (sig.)", mkRef(zSig),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries("z=-2 (sugg.)", mkRef(-zSugg),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.4, Color: "#f39c12"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		).
-		AddSeries("z=-3 (sig.)", mkRef(-zSig),
-			charts.WithLineStyleOpts(opts.LineStyle{Type: "dashed", Width: 1.8, Color: "#e74c3c"}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Opacity: opts.Float(0)}),
-		)
-
-	// Statistic Z-score series — only rendered when available for this bsaType.
-	type zSeriesDef struct {
-		name string
-		data []float64
-		w    float32
-	}
-	var series []zSeriesDef
-	if hasBothBulks {
-		series = append(series,
-			zSeriesDef{"HighSI", hiZ, 2.0},
-			zSeriesDef{"LowSI", liZ, 2.0},
-			zSeriesDef{"DeltaSI", dsiZ, 3.0},
-			zSeriesDef{"Gstat", gsZ, 2.0},
-			zSeriesDef{"ED", edZ, 2.0},
-			zSeriesDef{"LOD", lodZ, 2.0},
-			zSeriesDef{"BBLogBF", bblZ, 2.0},
-		)
-	} else {
-		if hasHighBulk {
-			series = append(series, zSeriesDef{"HighSI", hiZ, 2.0})
-		}
-		if hasLowBulk {
-			series = append(series, zSeriesDef{"LowSI", liZ, 2.0})
-		}
-	}
-	if hasOneBulk {
-		series = append(series,
-			zSeriesDef{"AFDev", afDevZ, 3.0},
-			zSeriesDef{"OneBulkG", obGZ, 2.0},
-			zSeriesDef{"OneBulkLOD", obLodZ, 2.0},
-			zSeriesDef{"OneBulkBB", obBBZ, 2.0},
-		)
-	}
-
-	for _, s := range series {
-		col := statColor(s.name)
-		line.AddSeries(s.name, floatSliceToLineData(s.data),
-			charts.WithLineChartOpts(opts.LineChart{Smooth: opts.Bool(true)}),
-			charts.WithLineStyleOpts(opts.LineStyle{Width: s.w, Color: col}),
-			charts.WithItemStyleOpts(opts.ItemStyle{Color: col, Opacity: opts.Float(0)}),
-		)
-	}
-
-	return line
-}
-
 // ── composite signal chart ────────────────────────────────────────────────────
 
 // createCompositeChart renders both the Stouffer CompositeZ (signed, from
@@ -709,8 +513,8 @@ func createCompositeChart(
 
 	title := chrom + " — Composite Signal"
 	subtitle := fmt.Sprintf(
-		"Stouffer CompositeZ (ΔSI + G-stat + LOD, k=%d) and max |Z| envelope. "+
-			"Dashed lines: empirical MC upper-tail p99 (%.3f) and p95 (%.3f). "+
+		"Stouffer CompositeZ (ΔSI + G-stat + HMM LOD, k=%d) and max |Z| envelope. "+
+			"Dashed lines: genome-null simulation p99 (%.3f) and p95 (%.3f). "+
 			"Shaded bands: BRM blocks.",
 		czThresh.NumStats, czP99, czP95,
 	)

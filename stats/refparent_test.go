@@ -35,22 +35,23 @@ func TestAbsDeltaSIStatConfigs(t *testing.T) {
 	var names []string
 	for _, c := range absDeltaSIStatConfigs {
 		names = append(names, c.name)
-		if c.name == "DeltaSI+" || c.name == "DeltaSI-" {
-			t.Fatalf("signed ΔSI track %q in the |ΔSI| set", c.name)
+		if c.name == "DeltaSI+" || c.name == "DeltaSI-" || c.name == "HMMLOD" {
+			t.Fatalf("track %q in the |ΔSI| set (no signed ΔSI or HMM without polarity)", c.name)
 		}
 	}
-	if len(absDeltaSIStatConfigs) != len(twoBulkStatConfigs)-1 || names[1] != "AbsDeltaSI" {
+	if len(absDeltaSIStatConfigs) != len(twoBulkStatConfigs)-2 || names[1] != "AbsDeltaSI" {
 		t.Fatalf("unexpected |ΔSI| track set %v", names)
 	}
 }
 
 func TestConsolidateAbsDeltaSINotFolded(t *testing.T) {
-	sm := []SmoothedStats{{ZDeltaSI: -2, ZGstat: 0, ZLOD: 0}}
-	consolidate(sm, true, true, true, false, false)
-	if want := -2 / math.Sqrt(3); math.Abs(sm[0].CompositeZ-want) > 1e-6 {
+	// 2b without --ref-parent: no HMM, so k = 2.
+	sm := []SmoothedStats{{ZDeltaSI: -2, ZGstat: 0}}
+	consolidate(sm, true, true, true, false, false, false)
+	if want := -2 / math.Sqrt(2); math.Abs(sm[0].CompositeZ-want) > 1e-6 {
 		t.Fatalf("unsigned CompositeZ = %v, want %v (Z(|ΔSI|) not folded)", sm[0].CompositeZ, want)
 	}
-	consolidate(sm, true, true, true, false, true)
+	consolidate(sm, true, true, true, false, true, true)
 	if want := 2 / math.Sqrt(3); math.Abs(sm[0].CompositeZ-want) > 1e-6 {
 		t.Fatalf("signed CompositeZ = %v, want %v", sm[0].CompositeZ, want)
 	}

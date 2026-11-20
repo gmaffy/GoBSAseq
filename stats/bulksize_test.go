@@ -73,7 +73,7 @@ func TestBulkSizesPerMode(t *testing.T) {
 func TestCalculateThresholdsRejectsMissingBulkSize(t *testing.T) {
 	cfg := utils.AnalysisConfig{Population: "F2", Rep: 10, OutputDir: t.TempDir(), HighBulkSize: 20}
 	sm := []SmoothedStats{{CHROM: "chr1", POS: 1, Depth: 30}}
-	if _, err := CalculateThresholds(cfg, "lplb", sm); err == nil {
+	if _, err := CalculateThresholds(cfg, "lplb", nil, sm); err == nil {
 		t.Fatal("expected error when the low bulk size is missing")
 	}
 }

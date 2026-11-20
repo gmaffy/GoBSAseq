@@ -52,13 +52,11 @@ type ConsolidatedQTL struct {
 	DeltaSI *Peak
 	Gstat   *Peak
 	ED      *Peak
-	LOD     *Peak
-	BBLogBF *Peak
 
-	AFDev          *Peak
-	OneBulkG       *Peak
-	OneBulkLOD     *Peak
-	OneBulkBBLogBF *Peak
+	AFDev    *Peak
+	OneBulkG *Peak
+
+	HMMLOD *Peak // two-bulk or one-bulk pool-HMM LOD
 }
 
 type Tail int
@@ -390,23 +388,27 @@ type peakStatConfig struct {
 	label   string
 }
 
+// hmmLODStatConfig scans the pool-HMM LOD (not smoothed) against its
+// genome-wide null thresholds.
+var hmmLODStatConfig = peakStatConfig{"HMMLOD", func(s SmoothedStats) float64 { return s.HMMLOD },
+	func(t Thresholds) float64 { return t.HMM.LODP99 }, func(t Thresholds) float64 { return t.HMM.LODP95 }, UpperTail, "HMMLOD"}
+
 var twoBulkStatConfigs = []peakStatConfig{
 	{"Gstat", func(s SmoothedStats) float64 { return s.SmGstat }, func(t Thresholds) float64 { return t.TwoBulk.GstatP99 }, func(t Thresholds) float64 { return t.TwoBulk.GstatP95 }, UpperTail, "Gstat"},
 	{"DeltaSI+", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP99 }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIP95 }, UpperTail, "DeltaSI+"},
 	{"DeltaSI-", func(s SmoothedStats) float64 { return s.SmDeltaSI }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIMp99 }, func(t Thresholds) float64 { return t.TwoBulk.DeltaSIMp95 }, LowerTail, "DeltaSI-"},
 	{"ED4", func(s SmoothedStats) float64 { return s.SmED }, func(t Thresholds) float64 { return t.TwoBulk.ED4P99 }, func(t Thresholds) float64 { return t.TwoBulk.ED4P95 }, UpperTail, "ED4"},
-	{"LOD", func(s SmoothedStats) float64 { return s.SmLOD }, func(t Thresholds) float64 { return t.TwoBulk.LODP99 }, func(t Thresholds) float64 { return t.TwoBulk.LODP95 }, UpperTail, "LOD"},
-	{"BBLogBF", func(s SmoothedStats) float64 { return s.SmBBLogBF }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP99 }, func(t Thresholds) float64 { return t.TwoBulk.BBLogBFP95 }, UpperTail, "BBLogBF"},
+	hmmLODStatConfig,
 }
 
 // absDeltaSIStatConfigs replaces twoBulkStatConfigs when polarity is unknown
 // (2b, --ref-parent none): SmDeltaSI holds smoothed |ΔSI|, so there is one
-// upper-tail track and no DeltaSI- track.
+// upper-tail track, no DeltaSI- track and no HMM LOD.
 var absDeltaSIStatConfigs = func() []peakStatConfig {
 	var out []peakStatConfig
 	for _, c := range twoBulkStatConfigs {
 		switch c.name {
-		case "DeltaSI-":
+		case "DeltaSI-", "HMMLOD": // no lower ΔSI tail; no HMM without polarity
 			continue
 		case "DeltaSI+":
 			c.name, c.label = "AbsDeltaSI", "AbsDeltaSI"
@@ -420,8 +422,7 @@ var oneBulkStatConfigs = []peakStatConfig{
 	{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevP99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevP95 }, UpperTail, "AFDev"},
 	{"AFDev", func(s SmoothedStats) float64 { return s.SmAFDev }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp99 }, func(t Thresholds) float64 { return t.OneBulk.AFDevMp95 }, LowerTail, "AFDev-"},
 	{"OneBulkGstat", func(s SmoothedStats) float64 { return s.SmOneBulkG }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkGstatP95 }, UpperTail, "OneBulkGstat"},
-	{"OneBulkLOD", func(s SmoothedStats) float64 { return s.SmOneBulkLOD }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkLODP95 }, UpperTail, "OneBulkLOD"},
-	{"OneBulkBBLogBF", func(s SmoothedStats) float64 { return s.SmOneBulkBBLogBF }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP99 }, func(t Thresholds) float64 { return t.OneBulk.OneBulkBBLogBFP95 }, UpperTail, "OneBulkBBLogBF"},
+	hmmLODStatConfig,
 }
 
 func collectPeaks(sm []SmoothedStats, th []Thresholds, configs []peakStatConfig) []PeakIntersection {
@@ -457,11 +458,9 @@ func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
 	case "ED", "ED4":
 		q.ED = peak
 
-	case "LOD":
-		q.LOD = peak
+	case "HMMLOD":
+		q.HMMLOD = peak
 
-	case "BBLogBF":
-		q.BBLogBF = peak
 
 	case "AFDev", "AFDev+", "AFDev-":
 		q.AFDev = peak
@@ -469,11 +468,7 @@ func addEvidence(q *ConsolidatedQTL, p PeakIntersection) {
 	case "OneBulkGstat":
 		q.OneBulkG = peak
 
-	case "OneBulkLOD":
-		q.OneBulkLOD = peak
 
-	case "OneBulkBBLogBF":
-		q.OneBulkBBLogBF = peak
 	}
 }
 
@@ -518,12 +513,9 @@ func mergeConsolidatedQTL(a, b ConsolidatedQTL) ConsolidatedQTL {
 	mergePeak(&a.DeltaSI, b.DeltaSI)
 	mergePeak(&a.Gstat, b.Gstat)
 	mergePeak(&a.ED, b.ED)
-	mergePeak(&a.LOD, b.LOD)
-	mergePeak(&a.BBLogBF, b.BBLogBF)
 	mergePeak(&a.AFDev, b.AFDev)
 	mergePeak(&a.OneBulkG, b.OneBulkG)
-	mergePeak(&a.OneBulkLOD, b.OneBulkLOD)
-	mergePeak(&a.OneBulkBBLogBF, b.OneBulkBBLogBF)
+	mergePeak(&a.HMMLOD, b.HMMLOD)
 
 	return a
 }
@@ -693,18 +685,15 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 			"DeltaSI_Pos", "DeltaSI_Value",
 			"Gstat_Pos", "Gstat_Value",
 			"ED_Pos", "ED_Value",
-			"LOD_Pos", "LOD_Value",
-			"BBLogBF_Pos", "BBLogBF_Value",
 		)
 	}
 	if hasOneBulk {
 		header = append(header,
 			"AFDev_Pos", "AFDev_Value",
 			"OneBulkG_Pos", "OneBulkG_Value",
-			"OneBulkLOD_Pos", "OneBulkLOD_Value",
-			"OneBulkBBLogBF_Pos", "OneBulkBBLogBF_Value",
 		)
 	}
+	header = append(header, "HMMLOD_Pos", "HMMLOD_Value")
 
 	f.SetSheetRow("Sheet1", "A1", &header)
 
@@ -730,15 +719,12 @@ func WriteIndividualQTLsToExcel(qtls []ConsolidatedQTL, bsaType string, filename
 			addPeakData(&rowData, qtl.DeltaSI)
 			addPeakData(&rowData, qtl.Gstat)
 			addPeakData(&rowData, qtl.ED)
-			addPeakData(&rowData, qtl.LOD)
-			addPeakData(&rowData, qtl.BBLogBF)
 		}
 		if hasOneBulk {
 			addPeakData(&rowData, qtl.AFDev)
 			addPeakData(&rowData, qtl.OneBulkG)
-			addPeakData(&rowData, qtl.OneBulkLOD)
-			addPeakData(&rowData, qtl.OneBulkBBLogBF)
 		}
+		addPeakData(&rowData, qtl.HMMLOD)
 
 		cell, _ := excelize.CoordinatesToCellName(1, row)
 		f.SetSheetRow("Sheet1", cell, &rowData)

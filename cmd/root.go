@@ -218,6 +218,12 @@ var rootCmd = &cobra.Command{
 			color.Red("Error: --one-bulk-p0 must be empirical or theoretical, got %q", oneBulkP0Mode)
 			os.Exit(1)
 		}
+		cmPerMb, _ := cmd.Flags().GetFloat64("cm-per-mb")
+		nullReps, _ := cmd.Flags().GetInt("null-reps")
+		if cmPerMb < 0 || nullReps < 20 {
+			color.Red("Error: --cm-per-mb must be ≥ 0 and --null-reps ≥ 20")
+			os.Exit(1)
+		}
 		refParent, _ := cmd.Flags().GetString("ref-parent")
 		refParent = strings.ToLower(strings.TrimSpace(refParent))
 		if refParent != "high" && refParent != "low" && refParent != "none" {
@@ -440,6 +446,8 @@ var rootCmd = &cobra.Command{
 			RequireNonParentAllele: requireNonParent,
 			RefParent:              refParent,
 			OneBulkP0Mode:          oneBulkP0Mode,
+			CMPerMb:                cmPerMb,
+			NullReps:               nullReps,
 			OutputDir:              resultsDir,
 
 			HighParentName:     highParentName,
@@ -516,13 +524,15 @@ func init() {
 	rootCmd.Flags().Int("min-GQ", 0, "Minimum genotype quality (GQ) for PARENT samples; 0 = disabled, applied only when GQ present (not applied to bulks, to avoid AF-correlated bias)")
 	rootCmd.Flags().Bool("no-split-multiallelic", false, "Do not decompose multi-allelic records into biallelic records before filtering")
 	rootCmd.Flags().Bool("require-nonparent-allele", false, "One parent + one bulk modes: drop sites where the bulk has <2 reads of the allele the parent does not carry (removes non-segregating sites, but also QTL markers where the bulk is fixed for the parent's allele)")
+	rootCmd.Flags().Float64("cm-per-mb", 0, "Recombination rate for the HMM LOD, in cM per Mb. 0 = assume 1 Morgan (one crossover per meiosis) over each chromosome")
+	rootCmd.Flags().Int("null-reps", 200, "Number of simulated no-QTL genomes for the genome-wide HMM LOD and CompositeZ thresholds")
 	rootCmd.Flags().String("one-bulk-p0", "empirical", "One-bulk modes: null allele frequency of the high-parent allele. empirical = genome-wide median per polarity (absorbs reference mapping bias); theoretical = the population's expected value")
 	rootCmd.Flags().String("ref-parent", "none", "Bulks-only (2b) mode: which parent the reference genome is (high, low or none). high/low fixes allele polarity so ΔSI is signed; none (unknown, or the reference is not a parent) makes 2b use |ΔSI|. Use high/low only if the reference is that parent or the same inbred line. Ignored when a parent sample is given")
 	rootCmd.Flags().Float64("min-pooled-maf", -1, "Segregation floor for 2b/hp2b/lp2b: minimum pooled minor allele frequency of the two bulks (-1 = auto: 0.4 x expected minor AF, 0.2 for F2; 0 = off)")
 
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
-	rootCmd.Flags().Int64P("step-size", "s", 100000, "Step Size")
+	rootCmd.Flags().Int64P("step-size", "s", 100000, "Smoothing grid spacing (bp) on dense chromosomes: kernels are evaluated on this grid and interpolated to markers; capped at window/40 (σ/20)")
 	rootCmd.Flags().Int64("min-qtl-width", 0, "Minimum QTL width in bp (0 uses smoothing sigma)")
 	rootCmd.Flags().Int64("merge-distance", 0, "Maximum gap in bp to merge same-direction QTL support (0 uses smoothing sigma)")
 	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum significant markers supporting a QTL")

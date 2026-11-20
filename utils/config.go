@@ -78,6 +78,12 @@ type AnalysisConfig struct {
 	// also when empty) estimates it per polarity from the data to absorb
 	// reference mapping bias, "theoretical" uses the population's expected value.
 	OneBulkP0Mode string
+	// CMPerMb is the genome-wide recombination rate for the HMM LOD, in cM per
+	// Mb. 0 (default) assumes 1 Morgan over each chromosome's marker span.
+	CMPerMb float64
+	// NullReps is the number of simulated no-QTL genomes used for the HMM LOD
+	// and CompositeZ thresholds.
+	NullReps int
 	// Region calling controls. A zero value selects biologically conservative
 	// defaults derived from the Gaussian smoothing bandwidth.
 	MinQTLWidth   int64

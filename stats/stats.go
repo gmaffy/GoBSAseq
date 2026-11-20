@@ -26,6 +26,8 @@ type BSAstats struct {
 	POS   int64
 	REF   string
 	ALT   string
+	// HighIsAlt: the high-parent allele is ALT (from the filter's polarity).
+	HighIsAlt bool
 
 	// Reads on other ALTs of a split multi-allelic record (not in H/L).
 	HighBulkOther int
@@ -38,16 +40,17 @@ type BSAstats struct {
 	HighSI    float64
 	LowSI     float64
 
-	DeltaSI        float64
-	Gstat          float64
-	ED             float64
-	LOD            float64
-	BBLogBF        float64
-	OneBulkP0      float64
-	OneBulkAFDev   float64
-	OneBulkGstat   float64
-	OneBulkLOD     float64
-	OneBulkBBLogBF float64
+	DeltaSI      float64
+	Gstat        float64
+	ED           float64
+	OneBulkP0    float64
+	OneBulkAFDev float64
+	OneBulkGstat float64
+
+	// HMMLOD is the linkage-aware LOD from the pool HMM (see hmm.go). It is
+	// computed along each chromosome after the per-site statistics, in the
+	// smoothing step, and is not itself smoothed.
+	HMMLOD float64
 
 	// HighDepth and LowDepth are each bulk's informative depth (REF + target
 	// ALT reads; 0 when the mode lacks that bulk).
@@ -293,7 +296,7 @@ type rawCalc struct {
 // precision; rounding happens only in the TSV. (Rounding stored values to
 // 6 dp zeroed ED⁴ whenever |ΔSI| < 0.027, about 16% of null sites.)
 func (c *rawCalc) site(site *filter.Site) BSAstats {
-	s := BSAstats{CHROM: site.Chrom, POS: site.Pos, REF: site.Ref, ALT: site.Alt}
+	s := BSAstats{CHROM: site.Chrom, POS: site.Pos, REF: site.Ref, ALT: site.Alt, HighIsAlt: site.HighIsAlt}
 	// The filter has already decided polarity (which allele the high parent
 	// carries; in 2b mode from --ref-parent).
 	highIsAlt := site.HighIsAlt
@@ -325,8 +328,6 @@ func (c *rawCalc) site(site *filter.Site) BSAstats {
 		}
 		s.Gstat = GStatistic(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
 		s.ED = euclideanDistance4(s.HighSI, s.LowSI)
-		s.LOD = lod(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
-		s.BBLogBF = betaBinomialLogBF(s.HighBulkH, s.HighBulkL, s.LowBulkH, s.LowBulkL)
 	}
 
 	if c.oneBulk {
@@ -341,8 +342,6 @@ func (c *rawCalc) site(site *filter.Site) BSAstats {
 		s.OneBulkP0 = p0
 		s.OneBulkAFDev = si - p0
 		s.OneBulkGstat = oneBulkGStatistic(h, l, p0)
-		s.OneBulkLOD = oneBulkLOD(h, l, p0)
-		s.OneBulkBBLogBF = oneBulkBetaBinomialLogBF(h, l, p0)
 	}
 	return s
 }
@@ -526,10 +525,10 @@ func rawHeader(lay rawLayout) []byte {
 		header = append(header, "LowBulkGT", "LowBulkAD", "LowBulkOther", "LowBulkL", "LowBulkH", "LowSI")
 	}
 	if lay.highBulk && lay.lowBulk {
-		header = append(header, DeltaSIName(lay.signedDSI), "Gstat", "ED4", "LOD", "BBLogBF", "HighDepth", "LowDepth")
+		header = append(header, DeltaSIName(lay.signedDSI), "Gstat", "ED4", "HighDepth", "LowDepth")
 	}
 	if lay.highBulk != lay.lowBulk {
-		header = append(header, "P0", "AFDev", "Gstat1", "LOD1", "BBLogBF1")
+		header = append(header, "P0", "AFDev", "Gstat1")
 	}
 	header = append(header, "Depth")
 	return []byte(strings.Join(header, "\t") + "\n")
@@ -568,11 +567,10 @@ func appendRawRow(buf []byte, s *BSAstats, site *filter.Site, r siteRoles, lay r
 	if lay.highBulk && lay.lowBulk {
 		buf = f6(f6(buf, s.DeltaSI), s.Gstat)
 		buf = strconv.AppendFloat(tab(buf), s.ED, 'g', 6, 64)
-		buf = f6(f6(buf, s.LOD), s.BBLogBF)
 		buf = itoa(itoa(buf, s.HighDepth), s.LowDepth)
 	}
 	if lay.highBulk != lay.lowBulk {
-		buf = f6(f6(f6(f6(f6(buf, s.OneBulkP0), s.OneBulkAFDev), s.OneBulkGstat), s.OneBulkLOD), s.OneBulkBBLogBF)
+		buf = f6(f6(f6(buf, s.OneBulkP0), s.OneBulkAFDev), s.OneBulkGstat)
 	}
 	buf = itoa(buf, s.Depth)
 	return append(buf, '\n')
@@ -679,92 +677,3 @@ func oneBulkGStatistic(success, fail int, p0 float64) float64 {
 	return 2 * g
 }
 
-func oneBulkLOD(success, fail int, p0 float64) float64 {
-	n := float64(success + fail)
-	if n == 0 || p0 <= 0 || p0 >= 1 {
-		return 0
-	}
-
-	phat := float64(success) / n
-	logAlt := binomialLogLikelihood(float64(success), n, phat)
-	logNull := binomialLogLikelihood(float64(success), n, p0)
-	return (logAlt - logNull) / math.Log(10)
-}
-
-func oneBulkBetaBinomialLogBF(success, fail int, p0 float64) float64 {
-	if success+fail == 0 || p0 <= 0 || p0 >= 1 {
-		return 0
-	}
-
-	logAlt := logBeta(0.5+float64(success), 0.5+float64(fail)) - logBeta(0.5, 0.5)
-	logNull := float64(success)*math.Log(p0) + float64(fail)*math.Log(1-p0)
-	return (logAlt - logNull) / math.Log(10)
-}
-
-func binomialLogLikelihood(k, n, p float64) float64 {
-	const eps = 1e-10
-	if p <= 0 {
-		p = eps
-	}
-	if p >= 1 {
-		p = 1 - eps
-	}
-	return k*math.Log(p) + (n-k)*math.Log(1-p)
-}
-
-func logBeta(a, b float64) float64 {
-	la, _ := math.Lgamma(a)
-	lb, _ := math.Lgamma(b)
-	lab, _ := math.Lgamma(a + b)
-	return la + lb - lab
-}
-
-// lod is the two-binomial likelihood ratio (log10) for different allele
-// frequencies in two bulks: a1/b1 are the two allele counts in bulk 1, a2/b2 in
-// bulk 2. It is symmetric in the allele order.
-func lod(a1, b1, a2, b2 int) float64 {
-	n1 := float64(a1 + b1)
-	n2 := float64(a2 + b2)
-	total := n1 + n2
-	if n1 == 0 || n2 == 0 || total == 0 {
-		return 0
-	}
-
-	const eps = 1e-10
-	clamp := func(p float64) float64 {
-		if p <= 0 {
-			return eps
-		}
-		if p >= 1 {
-			return 1 - eps
-		}
-		return p
-	}
-
-	p1 := clamp(float64(a1) / n1)
-	p2 := clamp(float64(a2) / n2)
-	p0 := clamp(float64(a1+a2) / total)
-
-	logLik := func(k, n, p float64) float64 {
-		if n == 0 {
-			return 0
-		}
-		return k*math.Log(p) + (n-k)*math.Log(1-p)
-	}
-
-	logL1 := logLik(float64(a1), n1, p1) + logLik(float64(a2), n2, p2)
-	logL0 := logLik(float64(a1), n1, p0) + logLik(float64(a2), n2, p0)
-	return (logL1 - logL0) / math.Log(10)
-}
-
-func betaBinomialLogBF(highSucc, highFail, lowSucc, lowFail int) float64 {
-	alphaH, betaH := 0.5, 0.5
-	alphaL, betaL := 0.5, 0.5
-
-	logAlt := logBeta(alphaH+float64(highSucc), betaH+float64(highFail)) - logBeta(alphaH, betaH)
-	logAlt += logBeta(alphaL+float64(lowSucc), betaL+float64(lowFail)) - logBeta(alphaL, betaL)
-
-	alpha0, beta0 := 0.5, 0.5
-	logNull := logBeta(alpha0+float64(highSucc+lowSucc), beta0+float64(highFail+lowFail)) - logBeta(alpha0, beta0)
-	return (logAlt - logNull) / math.Log(10)
-}

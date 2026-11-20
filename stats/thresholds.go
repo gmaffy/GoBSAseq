@@ -28,6 +28,14 @@ type Thresholds struct {
 	TwoBulk TwoBulkThresholds
 	OneBulk OneBulkThresholds
 	Z       ZThresholds
+	HMM     HMMThresholds
+}
+
+// HMMThresholds are genome-wide thresholds for the HMM LOD: the 99% and 95%
+// quantiles of the maximum LOD over simulated no-QTL genomes (hmmnull.go).
+// Zero when the HMM LOD is not computed.
+type HMMThresholds struct {
+	LODP99, LODP95 float64
 }
 
 type TwoBulkThresholds struct {
@@ -38,18 +46,14 @@ type TwoBulkThresholds struct {
 	DeltaSIP99, DeltaSIP95   float64
 	DeltaSIMp99, DeltaSIMp95 float64
 
-	GstatP99, GstatP95     float64
-	ED4P99, ED4P95         float64
-	LODP99, LODP95         float64
-	BBLogBFP99, BBLogBFP95 float64
+	GstatP99, GstatP95 float64
+	ED4P99, ED4P95     float64
 }
 
 type OneBulkThresholds struct {
-	AFDevP99, AFDevP95                   float64
-	AFDevMp99, AFDevMp95                 float64 // lower tail
-	OneBulkGstatP99, OneBulkGstatP95     float64
-	OneBulkLODP99, OneBulkLODP95         float64
-	OneBulkBBLogBFP99, OneBulkBBLogBFP95 float64
+	AFDevP99, AFDevP95               float64
+	AFDevMp99, AFDevMp95             float64 // lower tail
+	OneBulkGstatP99, OneBulkGstatP95 float64
 }
 
 type ZThresholds struct {
@@ -198,8 +202,6 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 	dsiArr := make([]float64, p.rep)
 	gsArr := make([]float64, p.rep)
 	edArr := make([]float64, p.rep)
-	lodArr := make([]float64, p.rep)
-	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
 		// Stage 1: realised diploid genotype dosage in each pool.
@@ -228,8 +230,6 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 		}
 		gsArr[i] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
 		edArr[i] = euclideanDistance4(hSI, lSI)
-		lodArr[i] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
-		bbArr[i] = betaBinomialLogBF(int(hAlt), int(hRef), int(lAlt), int(lRef))
 	}
 
 	sort.Float64s(hSIArr)
@@ -237,8 +237,6 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 	sort.Float64s(dsiArr)
 	sort.Float64s(gsArr)
 	sort.Float64s(edArr)
-	sort.Float64s(lodArr)
-	sort.Float64s(bbArr)
 
 	q := func(arr []float64, p float64) float64 {
 		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
@@ -266,8 +264,6 @@ func simulateTwoBulk(p simParams) TwoBulkThresholds {
 
 		GstatP99: q(gsArr, 0.995), GstatP95: q(gsArr, 0.95),
 		ED4P99: q(edArr, 0.995), ED4P95: q(edArr, 0.95),
-		LODP99: q(lodArr, 0.995), LODP95: q(lodArr, 0.95),
-		BBLogBFP99: q(bbArr, 0.995), BBLogBFP95: q(bbArr, 0.95),
 	}
 }
 
@@ -318,8 +314,6 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 
 	afDevArr := make([]float64, p.rep)
 	gsArr := make([]float64, p.rep)
-	lodArr := make([]float64, p.rep)
-	bbArr := make([]float64, p.rep)
 
 	for i := 0; i < p.rep; i++ {
 		// Stage 1: realised diploid genotype dosage in the pool.
@@ -334,14 +328,10 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 
 		afDevArr[i] = si - p.p0One
 		gsArr[i] = oneBulkGStatistic(alt, ref, p.p0One)
-		lodArr[i] = oneBulkLOD(alt, ref, p.p0One)
-		bbArr[i] = oneBulkBetaBinomialLogBF(alt, ref, p.p0One)
 	}
 
 	sort.Float64s(afDevArr)
 	sort.Float64s(gsArr)
-	sort.Float64s(lodArr)
-	sort.Float64s(bbArr)
 
 	q := func(arr []float64, p float64) float64 {
 		return r6(stat.Quantile(p, stat.Empirical, arr, nil))
@@ -351,8 +341,6 @@ func simulateOneBulk(p simParams) OneBulkThresholds {
 		AFDevP99: q(afDevArr, 0.995), AFDevP95: q(afDevArr, 0.95),
 		AFDevMp99: q(afDevArr, 0.005), AFDevMp95: q(afDevArr, 0.05),
 		OneBulkGstatP99: q(gsArr, 0.995), OneBulkGstatP95: q(gsArr, 0.95),
-		OneBulkLODP99: q(lodArr, 0.995), OneBulkLODP95: q(lodArr, 0.95),
-		OneBulkBBLogBFP99: q(bbArr, 0.995), OneBulkBBLogBFP95: q(bbArr, 0.95),
 	}
 }
 
@@ -375,359 +363,26 @@ func simulateOneBulkCached(p simParams) OneBulkThresholds {
 	return v.(OneBulkThresholds)
 }
 
-// ── Empirical Z thresholds ───────────────────────────────────────────────────
+// ── CompositeZ ───────────────────────────────────────────────────────────────
 
-// empiricalZThresholds is the fallback used when calculateEmpiricalCompositeZThresholds
-// fails.  It uses standard-normal quantiles (2.576 / 1.960), which are a
-// reasonable approximation for high-depth, F2/RIL populations.  The primary
-// path always runs the full Monte Carlo simulation.
-func empiricalZThresholds(bsaType string) ZThresholds {
-	numStats := countZStats(bsaType)
-	return ZThresholds{
-		ZP99: 2.576, ZP95: 1.960,
-		CompositeZP99: 2.576, CompositeZP95: 1.960,
-		NumStats: numStats,
-	}
+// fallbackZThresholds is used only if the null simulation cannot run. It uses
+// standard-normal quantiles (2.576 / 1.960).
+func fallbackZThresholds(k int) ZThresholds {
+	return ZThresholds{ZP99: 2.576, ZP95: 1.960, CompositeZP99: 2.576, CompositeZP95: 1.960, NumStats: k}
 }
 
-// ── Empirical CompositeZ thresholds from Monte Carlo simulation ──────────────
-
-// compositeZSimParams bundles parameters for CompositeZ null simulation.
-// All fields are used by the two-stage pipeline null simulation.
-type compositeZSimParams struct {
-	// repDepth is the representative sequencing depth used for null read sampling.
-	repDepth int
-	// highBulkSize / lowBulkSize / oneBulkSize are the number of individuals in
-	// each pool; they determine the between-individual variance added in Stage 1.
-	highBulkSize int
-	lowBulkSize  int
-	oneBulkSize  int
-	// p0 is the expected null allele frequency for the population structure.
-	p0 float64
-	// hasBothBulks / hasOneBulk mirror the bsaType flags.
-	hasBothBulks bool
-	hasOneBulk   bool
-	// numStats is the number of Z-scores combined into CompositeZ (k).
-	numStats int
-	// rep is the number of Monte Carlo draws.
-	rep        int
-	population string
-}
-
-// medianOfAbsDeviations computes MAD (median absolute deviation from median).
-func medianOfAbsDeviations(vals []float64, med float64) float64 {
-	absDevs := make([]float64, len(vals))
-	for i, v := range vals {
-		absDevs[i] = math.Abs(v - med)
-	}
-	return medianOf(absDevs)
-}
-
-// robustZNormCols normalises each column of a rep×k matrix in-place using the
-// same (median, 1.4826·MAD) estimator applied genome-wide in normalise().
-// This mimics the genome-wide MAD step so the simulated CompositeZ null matches
-// the scale of the real CompositeZ track.
-func robustZNormCols(mat []float64, rep, k int) {
-	const cf = 1.4826
-	col := make([]float64, rep)
-	for j := 0; j < k; j++ {
-		for i := 0; i < rep; i++ {
-			col[i] = mat[i*k+j]
-		}
-		med := medianOf(col)
-		mad := medianOfAbsDeviations(col, med) * cf
-		if mad == 0 {
-			// MAD=0 fallback: classical SD
-			var mean, ss float64
-			for _, v := range col {
-				mean += v
-			}
-			mean /= float64(rep)
-			for _, v := range col {
-				d := v - mean
-				ss += d * d
-			}
-			mad = math.Sqrt(ss/float64(rep)) * cf // use cf-scaled SD as proxy
-			if mad == 0 {
-				continue
-			}
-		}
-		for i := 0; i < rep; i++ {
-			mat[i*k+j] = (mat[i*k+j] - med) / mad
-		}
-	}
-}
-
-// simulateNullCompositeZTwoBulk generates the empirical null distribution of
-// CompositeZ for two-bulk experiments by running the full pipeline null:
-//
-//  1. Stage 1 — population sampling:
-//     hAF ~ population-specific genotype sampling(highBulkSize)
-//     lAF ~ population-specific genotype sampling(lowBulkSize)
-//
-//  2. Stage 2 — sequencing sampling:
-//     obs_hAlt ~ Binomial(repDepth, hAF)
-//     obs_lAlt ~ Binomial(repDepth, lAF)
-//
-//  3. Compute the same raw statistics (ΔSI, G-stat, ED⁴, LOD, BB log-BF, HighSI,
-//     LowSI) that the real pipeline computes from the same counts.
-//
-//  4. Robust-Z normalise each statistic column across all reps, mirroring the
-//     genome-wide normalise() step.
-//
-//  5. Combine: CompositeZ = Σ Zᵢ / √k.
-//
-// Because the statistics are derived from the same two allele-count vectors they
-// are strongly correlated; the resulting null distribution captures that
-// correlation and is therefore better calibrated than naïve N(0,1) Stouffer.
-func simulateNullCompositeZTwoBulk(p compositeZSimParams) []float64 {
-	if p.repDepth <= 0 || p.highBulkSize <= 0 || p.lowBulkSize <= 0 || p.rep <= 0 {
-		return nil
-	}
-
-	rng := rand.New(rand.NewSource(nextSeed()))
-	k := p.numStats
-	mat := make([]float64, p.rep*k) // row-major: mat[i*k+j] = rep i, stat j
-
-	for i := 0; i < p.rep; i++ {
-		// Stage 1: realised allele frequencies in the two pools.
-		realHAF := samplePoolAF(rng, p.population, p.highBulkSize, p.p0)
-		realLAF := samplePoolAF(rng, p.population, p.lowBulkSize, p.p0)
-		// Guard boundary values so Stage 2 Binomial is valid.
-		if realHAF <= 0 {
-			realHAF = 0
-		}
-		if realHAF >= 1 {
-			realHAF = 1
-		}
-		if realLAF <= 0 {
-			realLAF = 0
-		}
-		if realLAF >= 1 {
-			realLAF = 1
-		}
-
-		// Stage 2: observed read counts.
-		distRH := distuv.Binomial{N: float64(p.repDepth), P: realHAF, Src: rng}
-		distRL := distuv.Binomial{N: float64(p.repDepth), P: realLAF, Src: rng}
-		hAlt := distRH.Rand()
-		lAlt := distRL.Rand()
-		hRef := float64(p.repDepth) - hAlt
-		lRef := float64(p.repDepth) - lAlt
-
-		hSI := hAlt / float64(p.repDepth)
-		lSI := lAlt / float64(p.repDepth)
-
-		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
-		//   col 0: |DeltaSI|  (|ZDeltaSI|) — absolute value mirrors consolidate()
-		//   col 1: Gstat      (ZGstat)
-		//   col 2: LOD        (ZLOD)
-		// Using |DeltaSI| ensures all three components are non-negative, producing
-		// a symmetric null so a single upper-tail threshold is correct and complete.
-		mat[i*k+0] = math.Abs(hSI - lSI)
-		mat[i*k+1] = GStatistic(int(hAlt), int(hRef), int(lAlt), int(lRef))
-		mat[i*k+2] = lod(int(hRef), int(hAlt), int(lRef), int(lAlt))
-	}
-
-	// Step 4: robust-Z normalise columns (mirrors genome-wide normalise()).
-	robustZNormCols(mat, p.rep, k)
-
-	// Step 5: Stouffer combine.
-	nullCompositeZ := make([]float64, p.rep)
-	sqrtK := math.Sqrt(float64(k))
-	for i := 0; i < p.rep; i++ {
-		sum := 0.0
-		for j := 0; j < k; j++ {
-			sum += mat[i*k+j]
-		}
-		nullCompositeZ[i] = sum / sqrtK
-	}
-	return nullCompositeZ
-}
-
-// simulateNullCompositeZOneBulk generates the empirical null distribution of
-// CompositeZ for one-bulk experiments using the same two-stage pipeline null
-// approach as simulateNullCompositeZTwoBulk.
-//
-// Statistics computed (k=3, matching consolidate() and countZStats()):
-//
-//	[AFDev, OneBulkGstat, OneBulkLOD]
-//
-// OneBulkBBLogBF and any leading SI column are excluded from CompositeZ in
-// consolidate() and are therefore not simulated here.
-func simulateNullCompositeZOneBulk(p compositeZSimParams) []float64 {
-	bulkSize := p.oneBulkSize
-	if p.repDepth <= 0 || bulkSize <= 0 || p.rep <= 0 {
-		return nil
-	}
-
-	rng := rand.New(rand.NewSource(nextSeed()))
-	k := p.numStats
-	mat := make([]float64, p.rep*k)
-
-	for i := 0; i < p.rep; i++ {
-		// Stage 1: realised allele frequency in the pool.
-		realAF := samplePoolAF(rng, p.population, bulkSize, p.p0)
-		if realAF <= 0 {
-			realAF = 0
-		}
-		if realAF >= 1 {
-			realAF = 1
-		}
-
-		// Stage 2: observed reads.
-		distR := distuv.Binomial{N: float64(p.repDepth), P: realAF, Src: rng}
-		altF := distR.Rand()
-		alt := int(altF)
-		ref := p.repDepth - alt
-		si := altF / float64(p.repDepth)
-
-		// Fill exactly k=3 statistic columns matching consolidate() and countZStats():
-		//   col 0: |AFDev|       (|ZAFDev|) — absolute value mirrors consolidate()
-		//   col 1: OneBulkGstat  (ZOneBulkG)
-		//   col 2: OneBulkLOD    (ZOneBulkLOD)
-		// Using |AFDev| ensures all three components are non-negative, producing
-		// a symmetric null so a single upper-tail threshold is correct and complete.
-		mat[i*k+0] = math.Abs(si - p.p0) // |AFDev|
-		mat[i*k+1] = oneBulkGStatistic(alt, ref, p.p0)
-		mat[i*k+2] = oneBulkLOD(alt, ref, p.p0)
-	}
-
-	// Robust-Z normalise and Stouffer combine.
-	robustZNormCols(mat, p.rep, k)
-
-	nullCompositeZ := make([]float64, p.rep)
-	sqrtK := math.Sqrt(float64(k))
-	for i := 0; i < p.rep; i++ {
-		sum := 0.0
-		for j := 0; j < k; j++ {
-			sum += mat[i*k+j]
-		}
-		nullCompositeZ[i] = sum / sqrtK
-	}
-	return nullCompositeZ
-}
-
-// calculateEmpiricalCompositeZThresholds computes empirical CompositeZ thresholds
-// by running the full two-stage pipeline null through simulateNullCompositeZTwoBulk
-// or simulateNullCompositeZOneBulk.  Both the upper and lower tails are derived
-// directly from the simulated distribution so they are valid even for asymmetric
-// nulls (e.g. backcross populations where p0 ≠ 0.5).
-func calculateEmpiricalCompositeZThresholds(
-	cfg utils.AnalysisConfig,
-	bsaType string,
-	smoothed []SmoothedStats,
-	rep int,
-) (ZThresholds, error) {
-	if len(smoothed) == 0 {
-		return ZThresholds{}, fmt.Errorf("no smoothed data")
-	}
-	if rep <= 0 {
-		rep = cfg.Rep
-		if rep <= 0 {
-			rep = 1000
-		}
-	}
-
-	// Null allele frequency for the mapping population.
-	p0, err := ExpectedAF(cfg.Population)
-	if err != nil {
-		return ZThresholds{}, fmt.Errorf("cannot determine null AF: %w", err)
-	}
-
-	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
-	numStats := countZStats(bsaType)
-
-	highBulkSize, lowBulkSize, oneBulkSize, err := cfg.BulkSizes(bsaType)
-	if err != nil {
-		return ZThresholds{}, err
-	}
-
-	// Representative sequencing depth: use the median across all smoothed variants.
-	repDepth := 100
-	if len(smoothed) > 0 {
-		depths := make([]int, len(smoothed))
-		for i, s := range smoothed {
-			depths[i] = s.Depth
-		}
-		sort.Ints(depths)
-		repDepth = depths[len(depths)/2]
-	}
-
-	var allNullCompositeZ []float64
-
-	if hasBothBulks {
-		params := compositeZSimParams{
-			repDepth:     repDepth,
-			highBulkSize: highBulkSize,
-			lowBulkSize:  lowBulkSize,
-			oneBulkSize:  oneBulkSize,
-			p0:           p0,
-			population:   cfg.Population,
-			hasBothBulks: true,
-			hasOneBulk:   false,
-			numStats:     numStats,
-			rep:          rep,
-		}
-		allNullCompositeZ = simulateNullCompositeZTwoBulk(params)
-	} else if hasOneBulk {
-		params := compositeZSimParams{
-			repDepth:     repDepth,
-			highBulkSize: highBulkSize,
-			lowBulkSize:  lowBulkSize,
-			oneBulkSize:  oneBulkSize,
-			p0:           p0,
-			population:   cfg.Population,
-			hasBothBulks: false,
-			hasOneBulk:   true,
-			numStats:     numStats,
-			rep:          rep,
-		}
-		allNullCompositeZ = simulateNullCompositeZOneBulk(params)
-	}
-
-	if len(allNullCompositeZ) == 0 {
-		return ZThresholds{}, fmt.Errorf("no null CompositeZ values generated")
-	}
-
-	sort.Float64s(allNullCompositeZ)
-
-	// CompositeZ is now always ≥ 0 (all components are non-negative after using
-	// |ZDeltaSI| / |ZAFDev| in consolidate()).  The null distribution is therefore
-	// one-sided, so we take the 99th and 95th percentiles directly rather than
-	// the 99.5th / 97.5th that a two-tailed test would require.
-	czP99 := r6(stat.Quantile(0.99, stat.Empirical, allNullCompositeZ, nil))
-	czP95 := r6(stat.Quantile(0.95, stat.Empirical, allNullCompositeZ, nil))
-
-	return ZThresholds{
-		ZP99:          2.576, // Retain theoretical for individual per-stat Z-scores
-		ZP95:          1.960,
-		CompositeZP99: czP99,
-		CompositeZP95: czP95,
-		NumStats:      numStats,
-	}, nil
-}
-
-// countZStats returns k, the number of Z-scores summed by consolidate() into
-// CompositeZ.  It MUST mirror the czs slice built in consolidate() exactly;
-// any change to the statistic set there requires a matching change here.
-//
-// Current mapping (see consolidate() in smoothing.go for rationale):
-//
-//	Two-bulk  → k = 3  (ZDeltaSI, ZGstat, ZLOD)
-//	One-bulk  → k = 3  (ZAFDev, ZOneBulkG, ZOneBulkLOD)
-//
-// Note: HighSI, LowSI, ED4, BBLogBF, and OneBulkBBLogBF are intentionally
-// excluded from CompositeZ (they remain available in MaxAbsZ and individual
-// Z-score columns).
-func countZStats(bsaType string) int {
+// countZStats returns k, the number of Z-scores consolidate combines into
+// CompositeZ: two per bulk layout (|ZΔSI| + ZG, or |ZAFDev| + ZG1) plus ZHMMLOD
+// when the HMM LOD is computed. TestCompositeZStatCountMatchesConsolidate
+// checks it against consolidate.
+func countZStats(bsaType string, hmm bool) int {
 	_, _, hasBothBulks, hasOneBulk := BulkFlags(bsaType)
 	n := 0
-	if hasBothBulks {
-		n += 3 // ZDeltaSI, ZGstat, ZLOD
-	}
-	if hasOneBulk {
-		n += 3 // ZAFDev, ZOneBulkG, ZOneBulkLOD
+	if hasBothBulks || hasOneBulk {
+		n = 2
+		if hmm {
+			n++
+		}
 	}
 	return n
 }
@@ -848,9 +503,14 @@ func warmUpOneBulkCache(smoothed []SmoothedStats, p simParams) {
 // p0 values are derived from cfg.Population via ExpectedAF — the expected
 // allele frequency under H₀ for the given mapping population structure.
 // The number of Monte Carlo draws is taken from cfg.SimRep (must be > 0).
+// CalculateThresholds returns per-site thresholds. Per-statistic thresholds
+// (SI, ΔSI, G, ED⁴, AFDev, G1) come from single-SNP simulations at each site's
+// depths; HMM LOD and CompositeZ thresholds come from the genome-wide null
+// simulation over raw's markers (hmmnull.go).
 func CalculateThresholds(
 	cfg utils.AnalysisConfig,
 	bsaType string,
+	raw []BSAstats,
 	smoothed []SmoothedStats,
 ) ([]Thresholds, error) {
 
@@ -902,17 +562,18 @@ func CalculateThresholds(
 		warmUpOneBulkCache(smoothed, base)
 	}
 
-	// Use empirical CompositeZ thresholds from Monte Carlo simulation
-	zThresh, err := calculateEmpiricalCompositeZThresholds(cfg, bsaType, smoothed, cfg.Rep)
+	// HMM LOD and CompositeZ thresholds from the genome-wide null.
+	zThresh, hmmThresh, err := genomeNullThresholds(cfg, bsaType, raw)
 	if err != nil {
-		color.Yellow("Warning: falling back to theoretical Z thresholds: %v", err)
-		zThresh = empiricalZThresholds(bsaType)
+		color.Yellow("Warning: genome-wide null failed (%v); CompositeZ falls back to normal quantiles and the HMM LOD has no threshold", err)
+		zThresh = fallbackZThresholds(countZStats(bsaType, HMMAvailable(cfg, bsaType)))
+		hmmThresh = HMMThresholds{LODP99: math.Inf(1), LODP95: math.Inf(1)}
 	}
 
 	// Assign thresholds to each variant by depth lookup (cache hit guaranteed).
 	thresholds := make([]Thresholds, len(smoothed))
 	for i, sm := range smoothed {
-		t := Thresholds{Z: zThresh}
+		t := Thresholds{Z: zThresh, HMM: hmmThresh}
 
 		if hasBothBulks {
 			p := base
@@ -978,19 +639,16 @@ func writeThresholdsTSV(
 			"DeltaSI_P99", "DeltaSI_P95", "DeltaSI_Mp99", "DeltaSI_Mp95",
 			"Gstat_P99", "Gstat_P95",
 			"ED4_P99", "ED4_P95",
-			"LOD_P99", "LOD_P95", // P99 before P95 — consistent throughout
-			"BBLogBF_P99", "BBLogBF_P95",
 		)
 	}
 	if hasOneBulk {
 		header = append(header,
 			"AFDev_P99", "AFDev_P95", "AFDev_Mp99", "AFDev_Mp95",
 			"OneBulkGstat_P99", "OneBulkGstat_P95",
-			"OneBulkLOD_P99", "OneBulkLOD_P95",
-			"OneBulkBBLogBF_P99", "OneBulkBBLogBF_P95",
 		)
 	}
 	header = append(header,
+		"HMMLOD_P99", "HMMLOD_P95", // genome-wide (max over null genomes)
 		"Z_P99", "Z_P95",
 		"CompositeZ_P99", "CompositeZ_P95",
 	)
@@ -1020,8 +678,6 @@ func writeThresholdsTSV(
 				f4(tb.DeltaSIP99), f4(tb.DeltaSIP95), f4(tb.DeltaSIMp99), f4(tb.DeltaSIMp95),
 				f4(tb.GstatP99), f4(tb.GstatP95),
 				f4(tb.ED4P99), f4(tb.ED4P95),
-				f4(tb.LODP99), f4(tb.LODP95),
-				f4(tb.BBLogBFP99), f4(tb.BBLogBFP95),
 			)
 		}
 		if hasOneBulk {
@@ -1029,13 +685,12 @@ func writeThresholdsTSV(
 			row = append(row,
 				f4(ob.AFDevP99), f4(ob.AFDevP95), f4(ob.AFDevMp99), f4(ob.AFDevMp95),
 				f4(ob.OneBulkGstatP99), f4(ob.OneBulkGstatP95),
-				f4(ob.OneBulkLODP99), f4(ob.OneBulkLODP95),
-				f4(ob.OneBulkBBLogBFP99), f4(ob.OneBulkBBLogBFP95),
 			)
 		}
 
 		z := t.Z
 		row = append(row,
+			f4(t.HMM.LODP99), f4(t.HMM.LODP95),
 			f4(z.ZP99), f4(z.ZP95),
 			f4(z.CompositeZP99), f4(z.CompositeZP95),
 		)

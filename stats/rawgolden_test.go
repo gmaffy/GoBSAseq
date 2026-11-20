@@ -76,8 +76,8 @@ func numericDump(raw []BSAstats) []byte {
 	g := func(v float64) string { return strconv.FormatFloat(v, 'g', -1, 64) }
 	for _, s := range raw {
 		fmt.Fprintln(&b, s.CHROM, s.POS, s.REF, s.ALT, s.HighBulkL, s.HighBulkH, s.LowBulkL, s.LowBulkH,
-			g(s.HighSI), g(s.LowSI), g(s.DeltaSI), g(s.Gstat), g(s.ED), g(s.LOD), g(s.BBLogBF),
-			g(s.OneBulkP0), g(s.OneBulkAFDev), g(s.OneBulkGstat), g(s.OneBulkLOD), g(s.OneBulkBBLogBF),
+			g(s.HighSI), g(s.LowSI), g(s.DeltaSI), g(s.Gstat), g(s.ED),
+			g(s.OneBulkP0), g(s.OneBulkAFDev), g(s.OneBulkGstat), s.HighIsAlt,
 			s.HighBulkOther, s.LowBulkOther, s.HighDepth, s.LowDepth, s.Depth)
 	}
 	return b.Bytes()

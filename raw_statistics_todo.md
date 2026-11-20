@@ -67,11 +67,13 @@ Every stored value is rounded with `math.Round(x*1e6)/1e6` (`stats.go:287-333`).
 `GStatistic` adds 0.5 to all four cells. This is neither Magwene et al. (2011) G nor a Haldane correction (0.5 added only to zero cells). It pulls G toward 0 at low depth.
 - [x] Now the standard G with 0·ln 0 = 0 (no pseudo-count), which matches Magwene and QTLseqr and lets G′ methods be applied later. Keep the current version behind a flag only if someone needs it.
 
-### 2.3 LOD duplicates G (MEDIUM; claude A5, gemini, grok)
+### 2.3 LOD duplicates G (MEDIUM; claude A5, gemini, grok) — DONE (replaced)
+**Resolved:** the per-SNP LOD/LOD1 and the beta-binomial Bayes factors (BBLogBF/BBLogBF1) are removed. They are replaced by the pool-HMM LOD (`stats/hmm.go`), computed along each chromosome with linkage and pool sampling built in, with genome-wide thresholds from a null simulation (`stats/hmmnull.go`). CompositeZ now uses |Z_ΔSI| + Z_G + Z_HMMLOD.
+
 In two-bulk mode `lod` = G_nopseudo / (2 ln 10); one-bulk LOD1 = G1 / (2 ln 10) exactly. After robust Z they are the same track, so CompositeZ counts that statistic twice.
-- [ ] Remove LOD from CompositeZ (k = 2), in `smoothing.go` and in the threshold null together. Note that CompositeZ may be replaced altogether by the genome-wide null (claude_review B1).
-- [ ] Either drop the LOD column, or keep it as a convenience column documented as "G / 4.605". It is not a Morton LOD, and the README's "LOD > 3" rule does not apply.
-- [ ] Once 2.2 is done, LOD becomes an exact rescaling of G, so it should be derived from G (one less log-likelihood computation per site) if it stays.
+- [x] Remove LOD from CompositeZ (k = 2), in `smoothing.go` and in the threshold null together. Note that CompositeZ may be replaced altogether by the genome-wide null (claude_review B1).
+- [x] Either drop the LOD column, or keep it as a convenience column documented as "G / 4.605". It is not a Morton LOD, and the README's "LOD > 3" rule does not apply.
+- [x] Once 2.2 is done, LOD becomes an exact rescaling of G, so it should be derived from G (one less log-likelihood computation per site) if it stays.
 
 ### 2.4 ED⁴ definition (cosmetic) — DONE (×4)
 - [x] Either multiply by 4 (the literature ED⁴ for a biallelic site is 4Δ⁴) or rename the column to `DeltaSI4`. Published cutoffs do not transfer otherwise.

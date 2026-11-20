@@ -67,8 +67,7 @@ func TestWriteRawTSVReportsWriteErrors(t *testing.T) {
 	}
 }
 
-// Known 2×2 tables: standard G (no pseudo-counts, 0·ln 0 = 0), and the
-// two-bulk LOD is the same likelihood ratio on the log10 scale.
+// Known 2×2 tables: standard G (no pseudo-counts, 0·ln 0 = 0).
 func TestGStatisticKnownValues(t *testing.T) {
 	cases := []struct {
 		a1, b1, a2, b2 int
@@ -84,9 +83,6 @@ func TestGStatisticKnownValues(t *testing.T) {
 		g := GStatistic(c.a1, c.b1, c.a2, c.b2)
 		if math.Abs(g-c.want) > 1e-3 {
 			t.Errorf("G%v = %.4f, want %.4f", []int{c.a1, c.b1, c.a2, c.b2}, g, c.want)
-		}
-		if l := lod(c.a1, c.b1, c.a2, c.b2); c.want > 0 && math.Abs(g-2*math.Ln10*l) > 1e-6 {
-			t.Errorf("G%v = %v but 2·ln10·LOD = %v", []int{c.a1, c.b1, c.a2, c.b2}, g, 2*math.Ln10*l)
 		}
 		if g2 := GStatistic(c.b1, c.a1, c.b2, c.a2); math.Abs(g-g2) > 1e-12 {
 			t.Errorf("G not symmetric in allele order: %v vs %v", g, g2)
