@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/gmaffy/GoBSAseq/utils"
@@ -20,7 +18,7 @@ import (
 // chromosome and every linked SNP informs the same pool frequency.
 //
 // Pool model. A bulk of n plants is modelled as U = round(c·n) exchangeable
-// units, c being the population variance scale (PopulationVarianceScale).
+// units, c being the population variance scale (utils.Population.VarScale).
 // Each unit carries the high allele with probability π = the population's
 // expected high-allele frequency, so the prior of j is Binomial(U, π). This
 // matches the mean p0 and the pool-sampling variance p0(1−p0)/(c·n) of every
@@ -86,47 +84,16 @@ type poolModel struct {
 	err   float64   // sequencing error rate in the read model
 }
 
-// mapExpansion is the number of meioses' worth of recombination a
-// population's chromosomes carry relative to one F2 meiosis.
-func mapExpansion(pop string) (float64, error) {
-	p := strings.ToUpper(strings.TrimSpace(pop))
-	switch p {
-	case "F2":
-		return 1, nil
-	case "F3":
-		return 1.5, nil
-	case "F4":
-		return 1.75, nil
-	case "RIL":
-		return 2, nil
-	}
-	if strings.HasPrefix(p, "BC") {
-		s := strings.TrimSuffix(strings.TrimSuffix(p[2:], "H"), "L")
-		f2 := strings.HasSuffix(s, "F2")
-		if n, err := strconv.Atoi(strings.TrimSuffix(s, "F2")); err == nil && n >= 1 {
-			if f2 {
-				return float64(n + 1), nil
-			}
-			return float64(n), nil
-		}
-	}
-	return 0, fmt.Errorf("unknown population structure: %s", pop)
-}
-
 func newPoolModel(pop string, bulkSize int) (poolModel, error) {
 	if bulkSize <= 0 {
 		return poolModel{}, fmt.Errorf("bulk size must be > 0, got %d", bulkSize)
 	}
-	pi, err := ExpectedAF(pop)
+	p, err := utils.ParsePopulation(pop)
 	if err != nil {
 		return poolModel{}, err
 	}
-	e, err := mapExpansion(pop)
-	if err != nil {
-		return poolModel{}, err
-	}
-	U := max(1, int(math.Round(PopulationVarianceScale(pop)*float64(bulkSize))))
-	m := poolModel{U: U, pi: pi, exp: e, prior: binomPMF(U, pi), freq: make([]float64, U+1), err: hmmSeqError}
+	U := max(1, int(math.Round(p.VarScale*float64(bulkSize))))
+	m := poolModel{U: U, pi: p.P0, exp: p.MapExpansion, prior: binomPMF(U, p.P0), freq: make([]float64, U+1), err: hmmSeqError}
 	for j := range m.freq {
 		m.freq[j] = float64(j) / float64(U)
 	}

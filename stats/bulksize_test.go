@@ -11,7 +11,7 @@ import (
 )
 
 // The pool AF sampler must reproduce the analytic mean (ExpectedAF) and
-// variance p(1-p)/(scale*n) (PopulationVarianceScale) for every population.
+// variance p(1-p)/(scale*n) (Population.VarScale) for every population.
 func TestSamplePoolAFMatchesAnalyticMoments(t *testing.T) {
 	const n, reps = 20, 200000
 	for _, pop := range []string{"F2", "F3", "F4", "RIL", "BC1H", "BC1L", "BC2H", "BC1F2H", "BC1F2L", "BC2F2H", "BC3F2L"} {
@@ -19,7 +19,8 @@ func TestSamplePoolAFMatchesAnalyticMoments(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wantVar := p0 * (1 - p0) / (PopulationVarianceScale(pop) * n)
+		popn, _ := utils.ParsePopulation(pop)
+		wantVar := p0 * (1 - p0) / (popn.VarScale * n)
 		rng := rand.New(rand.NewSource(1))
 		var sum, ss float64
 		for range reps {
@@ -82,7 +83,7 @@ func TestCalculateThresholdsRejectsMissingBulkSize(t *testing.T) {
 
 // samplePoolAF draws the high-parent allele frequency of a pool of bulkSize
 // diploid plants by genotype dosage (F2/F3/F4 selfing, RIL, BCn, BCnF2): a
-// plant-level reference for PopulationVarianceScale, which the HMM pool model
+// plant-level reference for Population.VarScale, which the HMM pool model
 // and the marker weights use.
 func samplePoolAF(rng *rand.Rand, population string, bulkSize int, p0 float64) float64 {
 	p := strings.ToUpper(strings.TrimSpace(population))

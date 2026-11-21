@@ -1,19 +1,19 @@
 package stats
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/utils"
 )
 
-// BRMBlock is a simple block record for BRM output.
+// BRMBlock is a BRM block: [Start, Stop] where |signal| ≥ u·σ, and its peak
+// (the largest |signal|): position, signal, the signal threshold u·σ there
+// and the standardised z = signal/σ, which is what is compared with u.
 type BRMBlock struct {
 	Chrom     string
 	Start     int64
@@ -21,398 +21,204 @@ type BRMBlock struct {
 	PeakPos   int64
 	Peak      float64
 	Threshold float64
+	PeakZ     float64
+	NMarkers  int // markers beyond the line (--min-qtl-markers)
 }
 
-// inverseNormalCDF implements an approximation of the inverse standard normal CDF
-// using the algorithm by Peter J. Acklam. Accurate enough for typical alpha values.
-func inverseNormalCDF(p float64) float64 {
-	if p <= 0 || p >= 1 {
-		if p <= 0 {
+// brmModel is a mode's BRM test at a marker: the signal and its null
+// variance. BRM calls markers where |signal| ≥ u·σ, i.e. |z| ≥ u for the
+// standardised z = signal/σ; u comes from the genome-wide null (BRMU in
+// Thresholds), so the error rate --brm-alpha is genome-wide.
+//
+// Signals: the smoothed signed ΔSI (two-bulk, polarity known); √max(smoothed
+// bias-corrected ΔSI², 0), a polarity-free |ΔAF| estimate (2b without
+// --ref-parent; one-sided); the smoothed AF deviation SmAFDev (one-bulk, from
+// the bias-corrected P0).
+//
+// Null variance σ² = pool variance + smoothed read variance:
+//   - pool: p(1−p)/(V_scale·n) per bulk, p the null frequency (p0; one-bulk:
+//     the site's P0), V_scale the population variance scale (2 for F2), n the
+//     bulk size. It is a single position's variance, a slight upper bound for
+//     its kernel average (linked pool frequencies vary little in the kernel).
+//   - read: ReadVar0 + ρ·ReadVar1 from the kernel pass, the exact variance of
+//     the smoothed value under beta-binomial reads with overdispersion ρ
+//     (RunBRM requires it).
+type brmModel struct {
+	signal    func(*SmoothedStats) float64
+	sigma2    func(s *SmoothedStats, rho float64) float64
+	polarFree bool // 2b without --ref-parent: the signal is √(ΔSI²c) ≥ 0
+}
+
+func newBRMModel(cfg utils.AnalysisConfig, bsaType string) (*brmModel, error) {
+	_, _, both, one := BulkFlags(bsaType)
+	if !both && !one {
+		return nil, fmt.Errorf("BRM: mode %q has no bulk", bsaType)
+	}
+	high, low, oneN, err := cfg.BulkSizes(bsaType)
+	if err != nil {
+		return nil, err
+	}
+	pop, err := utils.ParsePopulation(cfg.Population)
+	if err != nil {
+		return nil, err
+	}
+	p0, c := pop.P0, pop.VarScale
+	read := func(s *SmoothedStats, rho float64) float64 { return s.ReadVar0 + rho*s.ReadVar1 }
+	m := &brmModel{}
+	if both {
+		v := p0 * (1 - p0)
+		pool := v/(c*float64(high)) + v/(c*float64(low))
+		m.signal = func(s *SmoothedStats) float64 { return s.SmDeltaSI }
+		if !cfg.SignedDeltaSI(bsaType) {
+			m.signal = func(s *SmoothedStats) float64 { return math.Sqrt(math.Max(s.SmDeltaSI2, 0)) }
+			m.polarFree = true
+		}
+		m.sigma2 = func(s *SmoothedStats, rho float64) float64 { return pool + read(s, rho) }
+		return m, nil
+	}
+	pAt := func(s *SmoothedStats) float64 {
+		if s.OneBulkP0 > 0 && s.OneBulkP0 < 1 {
+			return s.OneBulkP0
+		}
+		return p0
+	}
+	m.signal = func(s *SmoothedStats) float64 { return s.SmAFDev }
+	m.sigma2 = func(s *SmoothedStats, rho float64) float64 {
+		p := pAt(s)
+		return p*(1-p)/(c*float64(oneN)) + read(s, rho)
+	}
+	return m, nil
+}
+
+// z is the standardised BRM statistic at a marker, |signal|/σ (the
+// polarity-free signal is ≥ 0, so this is one-sided there).
+func (m *brmModel) z(s *SmoothedStats, rho float64) float64 {
+	sd := math.Sqrt(m.sigma2(s, rho))
+	if !(sd > 0) {
+		return 0
+	}
+	return math.Abs(m.signal(s)) / sd
+}
+
+// blocks scans one chromosome's markers (sorted by position) for runs with
+// |signal| ≥ u·σ.
+func (m *brmModel) blocks(chrom string, stats []SmoothedStats, rho, u float64) []BRMBlock {
+	return scanBRMBlocks(chrom, stats, u, func(s *SmoothedStats) (float64, float64) {
+		return m.signal(s), math.Sqrt(m.sigma2(s, rho))
+	})
+}
+
+// scanBRMBlocks returns the runs of one chromosome's markers (sorted by
+// position) where |value| ≥ u·σ, with value and σ from eval (scanCrossings:
+// interpolated ends; the peak is the largest |value|).
+func scanBRMBlocks(chrom string, stats []SmoothedStats, u float64, eval func(*SmoothedStats) (value, sigma float64)) []BRMBlock {
+	n := len(stats)
+	value, sigma := make([]float64, n), make([]float64, n)
+	for i := range stats {
+		value[i], sigma[i] = eval(&stats[i])
+	}
+	margin := func(i int) float64 {
+		if !(u*sigma[i] > 0) {
 			return math.Inf(-1)
 		}
-		return math.Inf(1)
+		return math.Abs(value[i]) - u*sigma[i]
 	}
-	// Coefficients in rational approximations
-	// Implementation adapted from https://web.archive.org/web/20150910023224/http://home.online.no/~pjacklam/notes/invnorm/
-	var a = []float64{-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
-		1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00}
-	var b = []float64{-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
-		6.680131188771972e+01, -1.328068155288572e+01}
-	var c = []float64{-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
-		-2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00}
-	var d = []float64{7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00}
-
-	// Define break-points.
-	pLow := 0.02425
-	pHigh := 1 - pLow
-	var q, r, x float64
-	if p < pLow {
-		q = math.Sqrt(-2 * math.Log(p))
-		x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q + c[5]) / (((d[0]*q+d[1])*q+d[2])*q + d[3])
-		return -x
-	}
-	if p > pHigh {
-		q = math.Sqrt(-2 * math.Log(1-p))
-		x = (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q + c[5]) / (((d[0]*q+d[1])*q+d[2])*q + d[3])
-		return x
-	}
-	q = p - 0.5
-	r = q * q
-	x = (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r + a[5]) * q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r + 1)
-	return x
-}
-
-// PopulationVarianceScale returns the exact scaling factor for segregation variance
-// based on the mapping population structure. This factor adjusts the binomial
-// variance p(1-p)/n to match the true variance Var(p) of the pooled individuals.
-func PopulationVarianceScale(pop string) float64 {
-	p := strings.ToUpper(strings.TrimSpace(pop))
-	switch p {
-	case "F2":
-		return 2.0
-	case "F3":
-		return 4.0 / 3.0 // 1.333...
-	case "F4":
-		return 8.0 / 7.0 // 1.142...
-	case "RIL":
-		return 1.0
-	}
-
-	if strings.HasPrefix(p, "BC") {
-		suffix := p[2:]
-		var n int
-		var err error
-
-		if strings.HasSuffix(suffix, "F2H") || strings.HasSuffix(suffix, "F2L") {
-			n, err = strconv.Atoi(suffix[:len(suffix)-3])
-			if err == nil && n >= 1 {
-				q2 := math.Pow(0.5, float64(n-1))
-				return (4.0 - q2) / (3.0 - q2)
-			}
-		} else if strings.HasSuffix(suffix, "H") || strings.HasSuffix(suffix, "L") {
-			n, err = strconv.Atoi(suffix[:len(suffix)-1])
-			if err == nil && n >= 1 {
-				q := math.Pow(0.5, float64(n))
-				return 2.0 * (1.0 - 0.5*q) / (1.0 - q)
-			}
-		}
-	}
-
-	return 1.0 // Default to RIL-like (most conservative)
-}
-
-// calculateBRMBlocksTwoBulk applies BRM block detection for two-bulk smoothed windows.
-// uAlpha should be the standard-normal quantile corresponding to 1 - alpha/2.
-//
-// The threshold is calculated based on the expected variance of the allele frequency
-// deviation between two bulks in the given population:
-//
-//	σ² = [(n1 + n2) / (V_scale * n1 * n2)] * p * (1-p)
-//
-// where V_scale is the population variance scale (e.g., 2.0 for F2) and p is the
-// average allele frequency across bulks.
-// bulkDepths returns a site's high- and low-bulk depths (at least 1), falling
-// back to the effective depth when per-bulk depths are absent.
-func bulkDepths(s SmoothedStats) (float64, float64) {
-	dH, dL := s.HighDepth, s.LowDepth
-	if dH <= 0 || dL <= 0 {
-		dH, dL = s.Depth, s.Depth
-	}
-	return math.Max(float64(dH), 1), math.Max(float64(dL), 1)
-}
-
-// brmTwoBulkSignal is what two-bulk BRM tests at a marker: the |ΔAF|
-// estimate (signed: the smoothed ΔSI, whose sign is kept for the peak) and
-// the allele frequency for its null variance.
-type brmTwoBulkSignal func(s SmoothedStats) (value, af float64)
-
-// brmSigned: smoothed signed ΔSI, af = mean smoothed SI (polarity known).
-func brmSigned(s SmoothedStats) (float64, float64) { return s.SmDeltaSI, (s.SmHighSI + s.SmLowSI) / 2 }
-
-// brmPolarityFree returns the signal for 2b without --ref-parent: √max(smoothed
-// bias-corrected ΔSI², 0), an estimate of |ΔAF| that needs no polarity, with
-// af = p0 (the smoothed SI are REF fractions there, ≈ 0.5 whatever the true
-// frequencies).
-func brmPolarityFree(p0 float64) brmTwoBulkSignal {
-	return func(s SmoothedStats) (float64, float64) { return math.Sqrt(math.Max(s.SmDeltaSI2, 0)), p0 }
-}
-
-func calculateBRMBlocksTwoBulk(chrom string, stats []SmoothedStats, highBulkSize, lowBulkSize int, popScale, uAlpha float64, signal brmTwoBulkSignal) []BRMBlock {
-	if len(stats) == 0 || highBulkSize <= 0 || lowBulkSize <= 0 || uAlpha <= 0 {
-		return nil
-	}
-
-	n1 := float64(highBulkSize)
-	n2 := float64(lowBulkSize)
 	var blocks []BRMBlock
-	inBlock := false
-	startIdx := 0
-	peakIdx := 0
-	peak := 0.0
-	peakThreshold := 0.0
-
-	emitBlock := func(startIdx, stopIdx, peakIdx int, peak, threshold float64) {
-		start := stats[startIdx].POS
-		if startIdx > 0 {
-			start = (stats[startIdx-1].POS + stats[startIdx].POS) / 2
-		}
-		stop := stats[stopIdx].POS
-		if stopIdx < len(stats)-1 {
-			stop = (stats[stopIdx].POS + stats[stopIdx+1].POS) / 2
-		}
-		if stop < start {
-			stop = start
-		}
-		blocks = append(blocks, BRMBlock{Chrom: chrom, Start: start, Stop: stop, PeakPos: stats[peakIdx].POS, Peak: peak, Threshold: threshold})
-	}
-
-	for i, s := range stats {
-		value, af := signal(s)
-		if af < 0.05 {
-			af = 0.05
-		}
-		if af > 0.95 {
-			af = 0.95
-		}
-		// Law of total variance: pool sampling variance is attenuated by
-		// sequencing, then binomial read sampling is added back, each bulk at
-		// its own depth.
-		dH, dL := bulkDepths(s)
-		poolH := af * (1 - af) / (popScale * n1)
-		poolL := af * (1 - af) / (popScale * n2)
-		variance := poolH*(1-1/dH) + af*(1-af)/dH + poolL*(1-1/dL) + af*(1-af)/dL
-		threshold := uAlpha * math.Sqrt(variance)
-		significant := threshold > 0 && math.Abs(value) >= threshold
-
-		if significant {
-			if !inBlock {
-				inBlock = true
-				startIdx = i
-				peakIdx = i
-				peak = value
-				peakThreshold = threshold
-				continue
-			}
-			if math.Abs(value) > math.Abs(peak) {
-				peakIdx = i
-				peak = value
-				peakThreshold = threshold
-			}
-			continue
-		}
-
-		if inBlock {
-			stopIdx := i - 1
-			emitBlock(startIdx, stopIdx, peakIdx, peak, peakThreshold)
-			inBlock = false
-		}
-	}
-
-	if inBlock {
-		stopIdx := len(stats) - 1
-		emitBlock(startIdx, stopIdx, peakIdx, peak, peakThreshold)
+	for _, c := range scanCrossings(n, func(i int) float64 { return float64(stats[i].POS) }, margin,
+		func(i int) float64 { return math.Abs(value[i]) }) {
+		p := c.peak
+		blocks = append(blocks, BRMBlock{Chrom: chrom, Start: int64(math.Round(c.start)), Stop: int64(math.Round(c.end)),
+			PeakPos: stats[p].POS, Peak: value[p], Threshold: u * sigma[p], PeakZ: value[p] / sigma[p], NMarkers: c.last - c.first + 1})
 	}
 	return blocks
 }
 
-// calculateBRMBlocksOneBulk mirrors the one-bulk BRM logic (testing SI vs expectedSI).
-//
-// The threshold is calculated based on the expected variance of the allele frequency
-// in a single bulk relative to the expected null frequency (p0):
-//
-//	σ² = (p0 * (1-p0)) / (V_scale * n)
-//
-// where V_scale is the population variance scale and n is the bulk size.
-func calculateBRMBlocksOneBulk(chrom string, stats []SmoothedStats, bulkSize int, popScale, expectedSI, uAlpha float64) []BRMBlock {
-	if len(stats) == 0 || bulkSize <= 0 || uAlpha <= 0 {
-		return nil
-	}
-	p0 := expectedSI
-	if math.IsNaN(p0) || p0 <= 0 || p0 >= 1 {
-		p0 = 0.5
-	}
-	if p0 < 0.05 {
-		p0 = 0.05
-	}
-	if p0 > 0.95 {
-		p0 = 0.95
-	}
-
-	n := float64(bulkSize)
-
-	var blocks []BRMBlock
-	inBlock := false
-	startIdx := 0
-	peakIdx := 0
-	peak := 0.0
-	peakThreshold := 0.0
-
-	emitBlock := func(startIdx, stopIdx, peakIdx int, peak, threshold float64) {
-		start := stats[startIdx].POS
-		if startIdx > 0 {
-			start = (stats[startIdx-1].POS + stats[startIdx].POS) / 2
-		}
-		stop := stats[stopIdx].POS
-		if stopIdx < len(stats)-1 {
-			stop = (stats[stopIdx].POS + stats[stopIdx+1].POS) / 2
-		}
-		if stop < start {
-			stop = start
-		}
-		blocks = append(blocks, BRMBlock{Chrom: chrom, Start: start, Stop: stop, PeakPos: stats[peakIdx].POS, Peak: peak, Threshold: threshold})
-	}
-
-	for i, s := range stats {
-		d := math.Max(float64(s.Depth), 1)
-		poolVar := p0 * (1 - p0) / (popScale * n)
-		variance := poolVar*(1-1/d) + p0*(1-p0)/d
-		threshold := uAlpha * math.Sqrt(variance)
-		if !(threshold > 0) {
-			continue
-		}
-		// In one-bulk case SmoothedStats.SmAFDev holds AF deviation; but sm.SmHighSI or SmAFDev may be used.
-		// Use SmAFDev when available (one-bulk pipeline sets it), else compute deviation from expected using SmHighSI.
-		var deviation float64
-		if s.SmAFDev != 0 {
-			deviation = s.SmAFDev
-		} else {
-			deviation = s.SmHighSI - expectedSI
-		}
-		significant := math.Abs(deviation) >= threshold
-		if significant {
-			if !inBlock {
-				inBlock = true
-				startIdx = i
-				peakIdx = i
-				peak = deviation
-				peakThreshold = threshold
-				continue
-			}
-			if math.Abs(deviation) > math.Abs(peak) {
-				peakIdx = i
-				peak = deviation
-				peakThreshold = threshold
-			}
-			continue
-		}
-		if inBlock {
-			stopIdx := i - 1
-			emitBlock(startIdx, stopIdx, peakIdx, peak, peakThreshold)
-			inBlock = false
-		}
-	}
-	if inBlock {
-		stopIdx := len(stats) - 1
-		emitBlock(startIdx, stopIdx, peakIdx, peak, peakThreshold)
-	}
-	return blocks
-}
-
-// RunBRM runs BRM block detection across chromosomes and writes a TSV of blocks.
-func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats) ([]BRMBlock, error) {
+// RunBRM runs BRM block detection across chromosomes (in sorted order) and
+// writes a TSV of blocks. th supplies the genome-wide threshold BRMU (|z| ≥ u)
+// and the read overdispersion Rho from the null simulation.
+func RunBRM(cfg utils.AnalysisConfig, bsaType string, sm []SmoothedStats, th Thresholds) ([]BRMBlock, error) {
 
 	color.Cyan("===================================== Running BRM block detection =========================================")
 	if len(sm) == 0 {
 		return nil, nil
 	}
-
-	_, _, hasBoth, hasOne := BulkFlags(bsaType)
-	highBulkSize, lowBulkSize, oneBulkSize, err := cfg.BulkSizes(bsaType)
+	if !(th.BRMU > 0) || math.IsInf(th.BRMU, 0) {
+		return nil, fmt.Errorf("BRM: no genome-wide threshold (the null simulation must run first)")
+	}
+	m, err := newBRMModel(cfg, bsaType)
 	if err != nil {
 		return nil, err
 	}
-	popScale := PopulationVarianceScale(cfg.Population)
-	uAlpha := inverseNormalCDF(1 - cfg.BrmAlpha/2)
-
-	// Two-bulk BRM tests the smoothed signed ΔSI against a zero-centred null.
-	// With unknown polarity (2b, --ref-parent none) the sign of ΔSI is
-	// arbitrary per SNP, so BRM tests √(smoothed bias-corrected ΔSI²) instead:
-	// the same |ΔAF|, estimated without polarity (direction not reported).
-	signal := brmTwoBulkSignal(brmSigned)
-	if hasBoth && !cfg.SignedDeltaSI(bsaType) {
-		p0, err := ExpectedAF(cfg.Population)
-		if err != nil {
-			return nil, err
+	for i := range sm {
+		if !(sm[i].ReadVar0 > 0) {
+			return nil, fmt.Errorf("BRM: smoothed marker %s:%d has no read variance (smooth with the scorer)", sm[i].CHROM, sm[i].POS)
 		}
-		signal = brmPolarityFree(p0)
+	}
+	if m.polarFree {
 		color.Cyan("BRM: polarity-free form (2b without --ref-parent): √(smoothed bias-corrected ΔSI²); block peaks have no direction")
 	}
+	color.Cyan("BRM: |z| ≥ %.3f (genome-wide α = %g from %d null genomes; ρ = %.4f)", th.BRMU, th.BRMAlpha, th.NullReps, th.Rho)
 
-	// group by chrom
-	byChrom := make(map[string][]SmoothedStats)
-	for _, s := range sm {
-		byChrom[s.CHROM] = append(byChrom[s.CHROM], s)
-	}
-
+	// Chromosomes in sorted order (stable output), scanned in place; blocks
+	// with fewer than --min-qtl-markers markers are dropped before merging.
+	minMarkers := cfg.EffectiveMinQTLMarkers()
 	var allBlocks []BRMBlock
-	for chrom, stats := range byChrom {
-		sort.Slice(stats, func(i, j int) bool { return stats[i].POS < stats[j].POS })
-		var blocks []BRMBlock
-		if hasBoth {
-			blocks = calculateBRMBlocksTwoBulk(chrom, stats, highBulkSize, lowBulkSize, popScale, uAlpha, signal)
-		} else if hasOne {
-			// expectedSI: use expectedHighAlleleP0 if available, else 0.5
-			expectedSI, _ := ExpectedAF(cfg.Population)
-			if expectedSI == 0 {
-				expectedSI = 0.5
+	for _, c := range byChromosome(sm) {
+		blocks := m.blocks(c.chrom, c.sm, th.Rho, th.BRMU)
+		kept := blocks[:0]
+		for _, b := range blocks {
+			if b.NMarkers >= minMarkers {
+				kept = append(kept, b)
 			}
-			blocks = calculateBRMBlocksOneBulk(chrom, stats, oneBulkSize, popScale, expectedSI, uAlpha)
 		}
-		if len(blocks) > 0 {
-			allBlocks = append(allBlocks, mergeBRMBlocks(blocks, cfg.EffectiveMergeDistance())...)
+		if len(kept) > 0 {
+			allBlocks = append(allBlocks, mergeBRMBlocks(kept, cfg.EffectiveMergeDistance())...)
 		}
 	}
 
-	// write TSV
-	outDir := filepath.Join(cfg.OutputDir, "stats")
-	if err := os.MkdirAll(outDir, 0775); err != nil {
-		return nil, err
-	}
-	outPath := filepath.Join(outDir, fmt.Sprintf("GoBSAseq.%s.brm_blocks.tsv", bsaType))
-	f, err := os.Create(outPath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	fmt.Fprintln(f, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK\tTHRESHOLD")
-	for _, b := range allBlocks {
-		fmt.Fprintf(f, "%s\t%d\t%d\t%d\t%.6f\t%.6f\n", b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.Threshold)
+	outPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.brm_blocks.tsv", bsaType))
+	if err := writeBRMBlocks(outPath, allBlocks); err != nil {
+		return nil, fmt.Errorf("writing %s: %w", outPath, err)
 	}
 	color.Green("BRM blocks written to %s", outPath)
 	return allBlocks, nil
 }
 
-func mergeBRMBlocks(blocks []BRMBlock, gap int64) []BRMBlock {
-	if len(blocks) <= 1 {
-		return blocks
+// writeBRMBlocks writes the blocks TSV, returning any write, flush or close
+// error.
+func writeBRMBlocks(path string, blocks []BRMBlock) (err error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o775); err != nil {
+		return err
 	}
-	sorted := append([]BRMBlock(nil), blocks...)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Chrom != sorted[j].Chrom {
-			return sorted[i].Chrom < sorted[j].Chrom
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); err == nil {
+			err = cerr
 		}
-		return sorted[i].Start < sorted[j].Start
-	})
+	}()
+	w := bufio.NewWriter(f)
+	fmt.Fprintln(w, "CHROM\tSTART\tSTOP\tPEAK_POS\tPEAK\tTHRESHOLD\tPEAK_Z")
+	for _, b := range blocks {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%.6f\t%.6f\t%.3f\n", b.Chrom, b.Start, b.Stop, b.PeakPos, b.Peak, b.Threshold, b.PeakZ)
+	}
+	return w.Flush()
+}
 
-	out := make([]BRMBlock, 0, len(sorted))
-	current := sorted[0]
-	for i := 1; i < len(sorted); i++ {
-		next := sorted[i]
-		sameSign := current.Peak == 0 || next.Peak == 0 || (current.Peak > 0) == (next.Peak > 0)
-		if next.Chrom == current.Chrom && sameSign && next.Start <= current.Stop+gap {
-			if next.Stop > current.Stop {
-				current.Stop = next.Stop
+// mergeBRMBlocks joins one chromosome's blocks (in position order, as
+// scanBRMBlocks returns them) whose peaks have the same sign and which are at
+// most gap bp apart (consecutive blocks only, as before); the merged block
+// keeps the larger peak and counts all its markers.
+func mergeBRMBlocks(blocks []BRMBlock, gap int64) []BRMBlock {
+	return mergeRuns(blocks, gap, func(b *BRMBlock) (string, float64, float64) { return b.Chrom, float64(b.Start), float64(b.Stop) },
+		func(a, b *BRMBlock) bool { return a.Peak == 0 || b.Peak == 0 || (a.Peak > 0) == (b.Peak > 0) },
+		func(a *BRMBlock, b BRMBlock) {
+			a.Stop = max(a.Stop, b.Stop)
+			a.NMarkers += b.NMarkers
+			if math.Abs(b.Peak) > math.Abs(a.Peak) {
+				a.PeakPos, a.Peak, a.Threshold, a.PeakZ = b.PeakPos, b.Peak, b.Threshold, b.PeakZ
 			}
-			if math.Abs(next.Peak) > math.Abs(current.Peak) {
-				current.Peak = next.Peak
-				current.PeakPos = next.PeakPos
-				current.Threshold = next.Threshold
-			}
-			continue
-		}
-		out = append(out, current)
-		current = next
-	}
-	out = append(out, current)
-	return out
+		})
 }

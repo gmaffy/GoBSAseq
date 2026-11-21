@@ -37,6 +37,13 @@ type SmoothedStats struct {
 	// NEff is the effective number of markers behind the smoothed values,
 	// (Σw)²/Σw² over the kernel weights.
 	NEff float64
+	// ReadVar0 + ρ·ReadVar1 is the read-sampling variance of the smoothed
+	// Gaussian tracks (ΔSI, AFDev, ΔSI²c) under the null, for read
+	// overdispersion ρ: Σ l_m²·r_m over the effective kernel weights l_m
+	// (including the local linear fit near chromosome ends) and each marker's
+	// beta-binomial read variance r_m = r0_m + ρ·r1_m (readVariance). BRM adds
+	// the pool variance. Zero when not computed.
+	ReadVar0, ReadVar1 float64
 
 	// ── smoothed raw values ─────────────────────────────────────────────
 	// Two-bulk
@@ -113,11 +120,12 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 // CompositeZ) on raw stats whose HMMLOD is already filled. The real data and every null-simulation replicate
 // go through it, so thresholds are calibrated on exactly what is scanned.
 type scorer struct {
-	bw     float64
-	step   float64 // smoothing grid spacing (gridStep)
-	weight func(*BSAstats) float64
-	hmm    *hmmSetup // for the null simulation; nil when the HMM LOD is not computed
-	lay    smoothLayout
+	bw      float64
+	step    float64 // smoothing grid spacing (gridStep)
+	weight  func(*BSAstats) float64
+	readVar func(*BSAstats) (float64, float64) // readVariance
+	hmm     *hmmSetup                          // for the null simulation; nil when the HMM LOD is not computed
+	lay     smoothLayout
 }
 
 func newScorer(cfg utils.AnalysisConfig, bsaType string) (*scorer, error) {
@@ -126,8 +134,12 @@ func newScorer(cfg utils.AnalysisConfig, bsaType string) (*scorer, error) {
 	if err != nil {
 		return nil, err
 	}
+	readVar, err := readVariance(cfg, bsaType)
+	if err != nil {
+		return nil, err
+	}
 	bw := float64(cfg.WindowSize) / 2
-	sc := &scorer{bw: bw, step: gridStep(int64(cfg.StepSize), bw), weight: weight,
+	sc := &scorer{bw: bw, step: gridStep(int64(cfg.StepSize), bw), weight: weight, readVar: readVar,
 		lay: smoothLayout{highBulk: hb, lowBulk: lb, signedDSI: cfg.SignedDeltaSI(bsaType), hmm: HMMAvailable(cfg, bsaType)}}
 	if sc.lay.hmm {
 		if sc.hmm, err = newHMMSetup(cfg, bsaType); err != nil {
@@ -151,7 +163,7 @@ func (sc *scorer) score(raw []BSAstats, report bool, every int) ([]SmoothedStats
 // input order.
 func (sc *scorer) scoreOrdered(raw []BSAstats, order *markerOrder, report bool, every int) ([]SmoothedStats, error) {
 	smoothed, err := gaussianSmoothOpts(raw, smoothOpts{bw: sc.bw, step: sc.step, weight: sc.weight,
-		lay: sc.lay, report: report, every: every, order: order})
+		lay: sc.lay, report: report, every: every, order: order, readVar: sc.readVar})
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +240,11 @@ func markerWeight(cfg utils.AnalysisConfig, bsaType string) (func(*BSAstats) flo
 	if err != nil {
 		return nil, err
 	}
-	c := PopulationVarianceScale(cfg.Population)
+	pop, err := utils.ParsePopulation(cfg.Population)
+	if err != nil {
+		return nil, err
+	}
+	c := pop.VarScale
 	if _, _, both, _ := BulkFlags(bsaType); both {
 		pool := 1/(c*float64(high)) + 1/(c*float64(low))
 		return func(s *BSAstats) float64 {
@@ -241,6 +257,50 @@ func markerWeight(cfg utils.AnalysisConfig, bsaType string) (func(*BSAstats) flo
 	}
 	pool := 1 / (c * float64(one))
 	return func(s *BSAstats) float64 { return 1 / (pool + 1/math.Max(float64(s.Depth), 1)) }, nil
+}
+
+// readVariance returns a marker's null read-sampling variance terms for the
+// Gaussian BRM signal (two-bulk ΔSI, one-bulk AFDev): r0 + ρ·r1, summed over
+// the bulks, with per bulk at depth d and null frequency p
+//
+//	r = q·(1 + (d−1)ρ)/d,  q = E[f(1−f)] = p(1−p) − Var(pool),  Var(pool) = p(1−p)/(c·n)
+//
+// (beta-binomial reads around the pool frequency f; c the population variance
+// scale, n the bulk size). p is p0 in two-bulk modes and the site's
+// bias-corrected P0 in one-bulk modes.
+func readVariance(cfg utils.AnalysisConfig, bsaType string) (func(*BSAstats) (float64, float64), error) {
+	high, low, one, err := cfg.BulkSizes(bsaType)
+	if err != nil {
+		return nil, err
+	}
+	pop, err := utils.ParsePopulation(cfg.Population)
+	if err != nil {
+		return nil, err
+	}
+	p0, c := pop.P0, pop.VarScale
+	bulk := func(p float64, n, depth int) (r0, r1 float64) {
+		d := math.Max(float64(depth), 1)
+		q := p * (1 - p) * (1 - 1/(c*float64(n)))
+		return q / d, q * (d - 1) / d
+	}
+	if _, _, both, _ := BulkFlags(bsaType); both {
+		return func(s *BSAstats) (float64, float64) {
+			dH, dL := s.HighDepth, s.LowDepth
+			if dH <= 0 || dL <= 0 {
+				dH, dL = s.Depth, s.Depth
+			}
+			a0, a1 := bulk(p0, high, dH)
+			b0, b1 := bulk(p0, low, dL)
+			return a0 + b0, a1 + b1
+		}, nil
+	}
+	return func(s *BSAstats) (float64, float64) {
+		p := s.OneBulkP0
+		if !(p > 0 && p < 1) {
+			p = p0
+		}
+		return bulk(p, one, s.Depth)
+	}, nil
 }
 
 // smoothKernel is how a statistic is smoothed.
@@ -428,6 +488,9 @@ type smoothOpts struct {
 	report bool         // print the sparse-marker summary
 	every  int          // > 1: output only every n-th marker of each chromosome (compact, chromosome order)
 	order  *markerOrder // precomputed marker order; nil = build it
+	// readVar, if set, gives a marker's null read variance terms (r0, r1:
+	// variance r0 + ρ·r1); the Gaussian pass then fills ReadVar0/ReadVar1.
+	readVar func(*BSAstats) (r0, r1 float64)
 }
 
 // gridStep is the smoothing grid spacing: --step-size, capped at σ/20 so
@@ -635,7 +698,9 @@ func (k *kernelSpec) eval(c *chromWork, qi int, w window, acc *kernelAcc, edgeFi
 	clear(acc.g)
 	clear(acc.t)
 	clear(acc.l)
-	var g0, g1, g2, w2 float64     // Gaussian moments Σw·dⁱ, Σw²
+	var g0, g1, g2, w2 float64 // Gaussian moments Σw·dⁱ, Σw²
+	var va, vb [3]float64      // read variance moments Σw²·r·dⁱ for r0 (va) and r1 (vb)
+	rvOn := c.nrv != nil
 	var s0, s1, s2, s3, s4 float64 // tricube moments Σt·uⁱ
 	for m := w.lo; m < w.hi; m++ {
 		d := (pos[m] - pK) * k.invBw
@@ -649,6 +714,16 @@ func (k *kernelSpec) eval(c *chromWork, qi int, w window, acc *kernelAcc, edgeFi
 			w2 += wm * wm
 		} else { // aggregated: Σ(wt·K)² = K²·Σwt²
 			w2 += kg * kg * c.nwt2[m]
+		}
+		if rvOn { // Σ(wt·K)²·r = K²·Σwt²·r
+			k2 := kg * kg
+			a0, b0 := k2*c.nrv[2*m], k2*c.nrv[2*m+1]
+			va[0] += a0
+			va[1] += a0 * d
+			va[2] += a0 * d * d
+			vb[0] += b0
+			vb[1] += b0 * d
+			vb[2] += b0 * d * d
 		}
 		row := c.nvals[m*nf : (m+1)*nf : (m+1)*nf]
 		for f := range ng {
@@ -687,6 +762,23 @@ func (k *kernelSpec) eval(c *chromWork, qi int, w window, acc *kernelAcc, edgeFi
 	alpha := 0.0
 	if edgeFit {
 		alpha = edgeBlend(math.Min(pK-c.pos[0], c.pos[len(c.pos)-1]-pK), k.bw)
+	}
+	if rvOn {
+		// The Gaussian estimate is Σ l_m·x_m with effective weights
+		// l_m = w_m·(a + b·d_m): a = 1/g0, b = 0 for the local average;
+		// blended with the local linear fit β0 (weights w·(g2 − g1·d)/D),
+		// a = (1−α)/g0 + α·g2/D, b = −α·g1/D. Its variance is
+		// Σ w²·r·(a + b·d)² = a²·M0 + 2ab·M1 + b²·M2.
+		a, b := 0.0, 0.0
+		if g0 > 0 {
+			a = 1 / g0
+			if den := g0*g2 - g1*g1; alpha > 0 && w.hi-w.lo >= 2 && den > 1e-12*g0*g2 {
+				a = (1-alpha)/g0 + alpha*g2/den
+				b = -alpha * g1 / den
+			}
+		}
+		c.rv[2*qi] = a*a*va[0] + 2*a*b*va[1] + b*b*va[2]
+		c.rv[2*qi+1] = a*a*vb[0] + 2*a*b*vb[1] + b*b*vb[2]
 	}
 	res := c.res[qi*nf : (qi+1)*nf]
 	for f := range nf {
@@ -728,12 +820,14 @@ type chromWork struct {
 	nwt   []float64 // neighbour weights (Σ marker weights)
 	nwt2  []float64 // Σ marker weight² per neighbour; nil when neighbours are markers
 	nvals []float64 // neighbour values (weighted means), row-major [neighbour][field]
+	nrv   []float64 // Σ marker weight²·(r0, r1) per neighbour, row-major [neighbour][2]; nil if not computed
 	q     []float64 // query positions, sorted (markers, or grid points plus sparse markers)
 	grid  bool      // grid mode: dense markers are interpolated between grid points
 	gq    []int     // grid mode: q-index of each grid point
 	mq    []int     // grid mode: q-index of a marker evaluated exactly, or −1
 	res   []float64 // results, row-major [query][field]
 	neff  []float64 // NEff per query
+	rv    []float64 // read variance terms (ReadVar0, ReadVar1) per query, row-major [query][2]; nil if not computed
 }
 
 // sparseIntervalMarkers: in grid mode, markers in a grid interval holding at
@@ -749,6 +843,10 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 	n, nf := len(idx), len(fields)
 	c := &chromWork{name: raw[idx[0]].CHROM, idx: idx, pos: make([]float64, n)}
 	wt, vals := make([]float64, n), make([]float64, n*nf)
+	var rv []float64 // per marker wt²·(r0, r1)
+	if o.readVar != nil {
+		rv = make([]float64, 2*n)
+	}
 	for k, ri := range idx {
 		s := &raw[ri]
 		c.pos[k] = float64(s.POS)
@@ -756,8 +854,12 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 		for f, fd := range fields {
 			vals[k*nf+f] = fd.get(s)
 		}
+		if rv != nil {
+			r0, r1 := o.readVar(s)
+			rv[2*k], rv[2*k+1] = wt[k]*wt[k]*r0, wt[k]*wt[k]*r1
+		}
 	}
-	c.q, c.npos, c.nwt, c.nvals = c.pos, c.pos, wt, vals
+	c.q, c.npos, c.nwt, c.nvals, c.nrv = c.pos, c.pos, wt, vals, rv
 
 	// Grid mode for dense chromosomes. A grid needs a positive span: markers
 	// all at one position (e.g. a multi-allelic site split on a tiny contig)
@@ -778,9 +880,9 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 		for k, ri := range idx {
 			isRep[k] = o.order.rep[ri]
 		}
-		u := newPosUnits(c.pos, wt, vals, nf, isRep)
+		u := newPosUnits(c.pos, wt, vals, rv, nf, isRep)
 		if dup {
-			c.npos, c.nwt, c.nwt2, c.nvals = u.pos, u.w, u.w2, u.means()
+			c.npos, c.nwt, c.nwt2, c.nvals, c.nrv = u.pos, u.w, u.w2, u.means(), u.rv
 		}
 		if grid {
 			c.buildGrid(first, last, o.step)
@@ -789,6 +891,9 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 	}
 	c.res = make([]float64, len(c.q)*nf)
 	c.neff = make([]float64, len(c.q))
+	if c.nrv != nil {
+		c.rv = make([]float64, 2*len(c.q))
+	}
 	return c
 }
 
@@ -797,11 +902,12 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 // row-major [unit][field]) and the index of the position's first marker.
 type posUnits struct {
 	pos, w, w2, sums []float64
+	rv               []float64 // representative's wt²·(r0, r1), [unit][2]; nil if not computed
 	first            []int
 	nf               int
 }
 
-func newPosUnits(pos, wt, vals []float64, nf int, isRep []bool) *posUnits {
+func newPosUnits(pos, wt, vals, rv []float64, nf int, isRep []bool) *posUnits {
 	u := &posUnits{nf: nf}
 	for k := 0; k < len(pos); {
 		j, r := k, k
@@ -818,6 +924,9 @@ func newPosUnits(pos, wt, vals []float64, nf int, isRep []bool) *posUnits {
 		u.first = append(u.first, k)
 		for f := range nf {
 			u.sums = append(u.sums, w*vals[r*nf+f])
+		}
+		if rv != nil {
+			u.rv = append(u.rv, rv[2*r], rv[2*r+1])
 		}
 		k = j
 	}
@@ -852,12 +961,16 @@ const aggregateBinSigmas = 100
 // the centroid cancels the first-order kernel error, Σw·(pos − centroid) = 0;
 // what remains is second order in the bin width (σ/100).
 func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
-	c.npos, c.nwt, c.nwt2, c.nvals = nil, nil, nil, nil
+	c.npos, c.nwt, c.nwt2, c.nvals, c.nrv = nil, nil, nil, nil, nil
 	sums := make([]float64, nf)
+	var rv0, rv1 float64 // Σ wt²·(r0, r1) of the point
 	add := func(p, w, w2 float64) {
 		c.npos = append(c.npos, p)
 		c.nwt = append(c.nwt, w)
 		c.nwt2 = append(c.nwt2, w2)
+		if u.rv != nil {
+			c.nrv = append(c.nrv, rv0, rv1)
+		}
 		for f := range nf {
 			v := 0.0
 			if w > 0 {
@@ -870,6 +983,9 @@ func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
 	for k := 0; k < u.n(); {
 		if c.mq[u.first[k]] >= 0 { // exactly evaluated (sparse interval): keep the unit
 			copy(sums, u.sums[k*nf:(k+1)*nf])
+			if u.rv != nil {
+				rv0, rv1 = u.rv[2*k], u.rv[2*k+1]
+			}
 			add(u.pos[k], u.w[k], u.w2[k])
 			k++
 			continue
@@ -884,10 +1000,15 @@ func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
 		hi = math.Min(hi, u.pos[k]+width) // bin: within the interval and ≤ width
 		var w, w2, wp float64
 		clear(sums)
+		rv0, rv1 = 0, 0
 		j := k
 		for ; j < u.n() && c.mq[u.first[j]] < 0 && u.pos[j] < hi; j++ {
 			w += u.w[j]
 			w2 += u.w2[j]
+			if u.rv != nil {
+				rv0 += u.rv[2*j]
+				rv1 += u.rv[2*j+1]
+			}
 			wp += u.w[j] * u.pos[j]
 			for f := range nf {
 				sums[f] += u.sums[j*nf+f]
@@ -967,10 +1088,13 @@ func (c *chromWork) emit(raw []BSAstats, out *[]SmoothedStats, keep []bool, fiel
 		if c.grid {
 			qk = c.mq[k]
 		}
-		var nEff float64
+		var nEff, rv0, rv1 float64
 		val := func(f int) float64 { return c.res[qk*nf+f] }
 		if qk >= 0 {
 			nEff = c.neff[qk]
+			if c.rv != nil {
+				rv0, rv1 = c.rv[2*qk], c.rv[2*qk+1]
+			}
 		} else { // interpolate between the grid points around the marker
 			p := c.pos[k]
 			for g+2 < len(c.gq) && c.q[c.gq[g+1]] <= p {
@@ -982,6 +1106,10 @@ func (c *chromWork) emit(raw []BSAstats, out *[]SmoothedStats, keep []bool, fiel
 				t = math.Min(math.Max((p-c.q[a])/span, 0), 1)
 			}
 			nEff = c.neff[a] + t*(c.neff[b]-c.neff[a])
+			if c.rv != nil {
+				rv0 = c.rv[2*a] + t*(c.rv[2*b]-c.rv[2*a])
+				rv1 = c.rv[2*a+1] + t*(c.rv[2*b+1]-c.rv[2*a+1])
+			}
 			val = func(f int) float64 {
 				x, y := c.res[a*nf+f], c.res[b*nf+f]
 				return x + t*(y-x)
@@ -1003,6 +1131,7 @@ func (c *chromWork) emit(raw []BSAstats, out *[]SmoothedStats, keep []bool, fiel
 		s.CHROM, s.POS, s.REF, s.ALT = r.CHROM, r.POS, r.REF, r.ALT
 		s.Depth, s.HighDepth, s.LowDepth = r.Depth, r.HighDepth, r.LowDepth
 		s.NEff = nEff
+		s.ReadVar0, s.ReadVar1 = rv0, rv1
 		s.HMMLOD = r.HMMLOD
 		if hasOneBulk {
 			s.OneBulkP0 = r.OneBulkP0

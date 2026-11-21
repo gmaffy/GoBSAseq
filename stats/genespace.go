@@ -101,7 +101,7 @@ func RunGeneSpace(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath stri
 
 	color.Green("Step 1: Annotating variants with SnpEff ...")
 	annotErr, annotatedTsvFiles := annotation.CreateSuperVcf([]string{filteredVcfPath}, cfg.SnpEffDB, true, cfg.GeneDesc, cfg.Prg)
-	
+
 	if annotErr != nil {
 		return fmt.Errorf("RunGeneSpace: SnpEff annotation failed: %w", annotErr)
 	}
@@ -159,10 +159,23 @@ func GeneSpaceFromBRM(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath 
 	return RunGeneSpace(cfg, bsaType, filteredVcfPath, ivs)
 }
 
-func GeneSpaceFromMerged(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath string, merged []MergedQTL) error {
-	ivs := make([]GeneSpaceInterval, len(merged))
-	for i, m := range merged {
-		ivs[i] = m
+// GeneSpaceFromFinal runs gene-space analysis on the consensus final QTLs:
+// their core (all methods above threshold), or their span with
+// --gene-space-span. Loci with partial support are skipped.
+func GeneSpaceFromFinal(cfg utils.AnalysisConfig, bsaType string, filteredVcfPath string, qtls []FinalQTL) error {
+	var ivs []GeneSpaceInterval
+	for _, q := range qtls {
+		if !q.Consensus {
+			continue
+		}
+		if cfg.GeneSpaceSpan {
+			q.Start, q.Stop = q.SpanStart, q.SpanStop
+		}
+		ivs = append(ivs, q)
+	}
+	if len(ivs) == 0 {
+		color.Yellow("Gene space analysis: no consensus QTLs")
+		return nil
 	}
 	return RunGeneSpace(cfg, bsaType, filteredVcfPath, ivs)
 }

@@ -125,9 +125,8 @@ func TestHMMLODCalibration(t *testing.T) {
 	}
 	// Two-bulk with known polarity (binomial and overdispersed reads; HMM LOD
 	// and signed BRM), and 2b without --ref-parent with REF from either parent
-	// at random per SNP (no HMM LOD; polarity-free BRM). BRM is checked as the
-	// fraction of no-QTL genomes with any block (it is a pointwise α = 0.05
-	// test, so this is reported, not asserted).
+	// at random per SNP (no HMM LOD; polarity-free BRM). BRM's threshold is
+	// genome-wide at α = 0.05: about 5 of 100 no-QTL genomes may get a block.
 	for _, sc := range []struct {
 		mode, refParent string
 		rho             float64
@@ -157,7 +156,17 @@ func TestHMMLODCalibration(t *testing.T) {
 			t.Fatal(err)
 		}
 		rhoHat, _ := estimateRho(tmpl, newMarkerOrder(tmpl), sim)
-		var over95, over99, czOver95, czOver99, brmGenomes int
+		var over95, over99, czOver95, czOver99, brmGenomes, consGenomes, ind99, ind95 int
+		hmmOn, signed, gap := HMMAvailable(cfg, sc.mode), cfg.SignedDeltaSI(sc.mode), cfg.EffectiveMergeDistance()
+		consensus := func(sm []SmoothedStats, blocks []BRMBlock) []FinalQTL {
+			var out []FinalQTL
+			for _, q := range ConsensusQTLs(sm, th, blocks, nil, signed, hmmOn, gap, 1) {
+				if q.Consensus {
+					out = append(out, q)
+				}
+			}
+			return out
+		}
 		// per-statistic: null genomes where any scanned smoothed track crosses its p99 / p95
 		var statOver99, statOver95 int
 		lay := scorer.lay
@@ -191,19 +200,39 @@ func TestHMMLODCalibration(t *testing.T) {
 			if cz > zt.CompositeZP99 {
 				czOver99++
 			}
-			if blocks, _ := RunBRM(cfg, sc.mode, sm); len(blocks) > 0 {
+			blocks, _ := RunBRM(cfg, sc.mode, sm, th)
+			if len(blocks) > 0 {
 				brmGenomes++
+			}
+			if len(consensus(sm, blocks)) > 0 {
+				consGenomes++
+			}
+			// individual QTL list: any p99 QTL; any suggestive (p95-only) QTL
+			_, qs := DetectIndividualQTLs(sm, th, sc.mode, signed, gap, 1)
+			has99, has95 := false, false
+			for _, q := range qs {
+				has99, has95 = has99 || q.Threshold == "p99", has95 || q.Threshold == "p95"
+			}
+			if has99 {
+				ind99++
+			}
+			if has95 {
+				ind95++
 			}
 		}
 		// power: one QTL dataset
 		qraw := withHMM(p.datasetPhase(rng, 20, sc.rho, true, sc.randomPhase))
 		qsm, _ := scorer.score(qraw, false, 1)
-		qBRM := 0
-		if blocks, _ := RunBRM(cfg, sc.mode, qsm); len(blocks) > 0 {
-			for _, b := range blocks {
-				if b.Chrom == "A" && b.Start <= 15_000_000 && b.Stop >= 15_000_000 {
-					qBRM = 1
-				}
+		qBRM, qCons := 0, false
+		qBlocks, _ := RunBRM(cfg, sc.mode, qsm, th)
+		for _, b := range qBlocks {
+			if b.Chrom == "A" && b.Start <= 15_000_000 && b.Stop >= 15_000_000 {
+				qBRM = 1
+			}
+		}
+		for _, q := range consensus(qsm, qBlocks) {
+			if q.Chrom == "A" && q.SpanStart <= 15_000_000 && q.SpanStop >= 15_000_000 {
+				qCons = true
 			}
 		}
 		qmax := 0.0
@@ -214,6 +243,20 @@ func TestHMMLODCalibration(t *testing.T) {
 		}
 		if HMMAvailable(cfg, sc.mode) && (over99 > 5 || over95 > 12) {
 			t.Errorf("%s/%s rho=%.3f: null genomes over p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, over95, nNull, over99, nNull)
+		}
+		if brmGenomes > 12 {
+			t.Errorf("%s/%s rho=%.3f: %d/%d null genomes with a BRM block at genome-wide α = 0.05", sc.mode, sc.refParent, sc.rho, brmGenomes, nNull)
+		}
+		if consGenomes > 5 {
+			t.Errorf("%s/%s rho=%.3f: %d/%d null genomes with a consensus QTL", sc.mode, sc.refParent, sc.rho, consGenomes, nNull)
+		}
+		if ind99 > 10 {
+			t.Errorf("%s/%s rho=%.3f: %d/%d null genomes with a p99 individual QTL", sc.mode, sc.refParent, sc.rho, ind99, nNull)
+		}
+		t.Logf("  individual QTLs: null genomes with a p99 QTL %d/%d, with a suggestive p95 QTL %d/%d", ind99, nNull, ind95, nNull)
+		t.Logf("  final consensus: null genomes with a consensus QTL %d/%d; QTL found %v", consGenomes, nNull, qCons)
+		if qBRM != 1 {
+			t.Errorf("%s/%s rho=%.3f: BRM missed the QTL", sc.mode, sc.refParent, sc.rho)
 		}
 		if czOver99 > 5 || czOver95 > 12 {
 			t.Errorf("%s/%s rho=%.3f: null genomes over CompositeZ p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, czOver95, nNull, czOver99, nNull)
@@ -228,8 +271,8 @@ func TestHMMLODCalibration(t *testing.T) {
 				qcz = math.Max(qcz, qsm[i].CompositeZ)
 			}
 		}
-		t.Logf("%s ref-parent=%s rho=%.3f (estimated %.4f): HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ p95/p99 %.2f/%.2f, null genomes over %d/%d | QTL max LOD %.1f, max CompositeZ %.1f | BRM: null genomes with a block %d/%d, QTL found %v",
-			sc.mode, sc.refParent, sc.rho, rhoHat, ht.LODP95, ht.LODP99, over95, over99, nNull, zt.CompositeZP95, zt.CompositeZP99, czOver95, czOver99, qmax, qcz, brmGenomes, nNull, qBRM == 1)
+		t.Logf("%s ref-parent=%s rho=%.3f (estimated %.4f): HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ p95/p99 %.2f/%.2f, null genomes over %d/%d | QTL max LOD %.1f, max CompositeZ %.1f | BRM |z| ≥ %.2f: null genomes with a block %d/%d, QTL found %v",
+			sc.mode, sc.refParent, sc.rho, rhoHat, ht.LODP95, ht.LODP99, over95, over99, nNull, zt.CompositeZP95, zt.CompositeZP99, czOver95, czOver99, qmax, qcz, th.BRMU, brmGenomes, nNull, qBRM == 1)
 	}
 }
 

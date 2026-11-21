@@ -303,7 +303,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	color.Cyan("STEP 5/10: Calculating BRM blocks ...\n")
 
 	// ------------------------------------------ BRM blocks ------------------------------------------------------- //
-	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats)
+	brmBlocks, err := stats.RunBRM(*cfg, btype, smoothedStats, thresholds)
 	if err != nil {
 		return err
 	}
@@ -320,8 +320,8 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	mergeGap := cfg.EffectiveMergeDistance()
 
-	_, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, cfg.SignedDeltaSI(btype), mergeGap)
-	err = stats.WriteIndividualQTLsToExcel(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
+	individualPeaks, qtls := stats.DetectIndividualQTLs(smoothedStats, thresholds, btype, cfg.SignedDeltaSI(btype), mergeGap, cfg.EffectiveMinQTLMarkers())
+	err = stats.WriteIndividualQTLs(qtls, btype, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.individual.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing individual QTLs to Excel: %v\n", err)
 		return err
@@ -332,8 +332,8 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
 
-	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, btype, mergeGap)
-	err = stats.WriteCompositeZQTLsToExcel(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
+	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, mergeGap, cfg.EffectiveMinQTLMarkers())
+	err = stats.WriteCompositeZQTLs(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
 	if err != nil {
 		fmt.Printf("Error writing composite Z QTLs to Excel: %v\n", err)
 		return err
@@ -342,15 +342,21 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	color.Cyan("STEP 8/10: Merging QTLs and BRM blocks ...\n")
+	color.Cyan("STEP 8/10: Final QTLs: consensus of HMM LOD, BRM and CompositeZ ...\n")
 
-	merged := stats.MergeCompositeBRM(compositePeaks, brmBlocks, mergeGap)
-	err = stats.WriteFinalQTLsToExcel(merged, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.final.qtl.xlsx", btype)))
-	if err != nil {
-		fmt.Printf("Error writing final QTLs to Excel: %v\n", err)
+	final := stats.ConsensusQTLs(smoothedStats, thresholds, brmBlocks, individualPeaks,
+		cfg.SignedDeltaSI(btype), stats.HMMAvailable(*cfg, btype), mergeGap, cfg.EffectiveMinQTLMarkers())
+	if err := stats.WriteFinalQTLs(final, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.final.qtl.xlsx", btype))); err != nil {
+		color.Red("Error writing final QTLs: %v", err)
 		return err
 	}
-	color.Green("Merged intervals: %d", len(merged))
+	nCons := 0
+	for _, q := range final {
+		if q.Consensus {
+			nCons++
+		}
+	}
+	color.Green("Final QTLs: %d consensus, %d loci with partial support", nCons, len(final)-nCons)
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
@@ -368,7 +374,7 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 	// --------------------------------------------------- Gene Space ---------------------------------------------- //
 	if len(missingGeneSpaceParams(cfg)) == 0 {
 		hardFilteredVcfPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.hardfiltered.vcf.gz", btype))
-		if err := stats.GeneSpaceFromMerged(*cfg, btype, hardFilteredVcfPath, merged); err != nil {
+		if err := stats.GeneSpaceFromFinal(*cfg, btype, hardFilteredVcfPath, final); err != nil {
 			color.Red("Gene space analysis error: %v", err)
 			return err
 		}

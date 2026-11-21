@@ -144,11 +144,18 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 	}
 	every := nullEvery(order, raw, sc.bw)
 	ext := nullExtremes(sc.lay)
+	alpha := cfg.BrmAlpha
+	var brm *brmModel // BRM's genome-wide threshold, when --brm-alpha is valid
+	if alpha > 0 && alpha < 1 {
+		if brm, err = newBRMModel(cfg, bsaType); err != nil {
+			return Thresholds{}, err
+		}
+	}
 
 	color.Cyan("Genome-wide null: %d simulated no-QTL genomes at the real markers and depths\n", reps)
 	bar := progressbar.Default(int64(reps), "Null genomes")
 	rng := rand.New(rand.NewSource(nullSeed))
-	hmmMax := make([]float64, 0, reps)
+	hmmMax, brmMax := make([]float64, 0, reps), make([]float64, 0, reps)
 	buf := make([]BSAstats, len(raw))
 	for range reps {
 		sim.replicate(rng, buf)
@@ -170,11 +177,22 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 		for _, e := range ext {
 			e.observe(sm)
 		}
+		if brm != nil {
+			mz := 0.0
+			for i := range sm {
+				mz = math.Max(mz, brm.z(&sm[i], rho))
+			}
+			brmMax = append(brmMax, mz)
+		}
 		_ = bar.Add(1)
 	}
 	_ = bar.Finish()
 
 	th := Thresholds{Rho: rho, NullReps: reps}
+	if brm != nil {
+		th.BRMU, th.BRMAlpha = r6(extremeQuantile(brmMax, 1-alpha)), alpha
+		color.Green("BRM genome-wide threshold: |z| ≥ %.3f (α = %g)\n", th.BRMU, alpha)
+	}
 	th.Z.NumStats = countZStats(bsaType)
 	for _, e := range ext {
 		e.apply(&th)

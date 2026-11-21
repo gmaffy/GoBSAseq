@@ -575,10 +575,10 @@ func euclideanDistance4(hSI, lSI float64) float64 {
 	return 4 * d * d * d * d
 }
 
-// ExpectedAF is the expected high-parent allele frequency under H₀; see
-// utils.ExpectedAF (moved there so the filter can use it without an import cycle).
-func ExpectedAF(popStruc string) (float64, error) {
-	return utils.ExpectedAF(popStruc)
+// ExpectedAF is the population's expected high-parent allele frequency
+// under H₀ (utils.ParsePopulation).
+func ExpectedAF(population string) (float64, error) {
+	return utils.ExpectedAF(population)
 }
 
 func oneBulkGStatistic(success, fail int, p0 float64) float64 {

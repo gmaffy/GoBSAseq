@@ -29,6 +29,11 @@ type Thresholds struct {
 	HMM      HMMThresholds
 	Rho      float64 // read overdispersion simulated in the null (estimateRho)
 	NullReps int     // simulated no-QTL genomes
+	// BRMU is the BRM threshold on the standardised statistic |z| (brmModel):
+	// the (1 − BRMAlpha) quantile of the genome-wide maximum |z| of the null
+	// genomes, so BRMAlpha (--brm-alpha) is a genome-wide error rate. 0 when
+	// not computed (BRMAlpha outside (0, 1)).
+	BRMU, BRMAlpha float64
 }
 
 // HMMThresholds are the HMM LOD thresholds; zero when it is not computed.
@@ -80,6 +85,9 @@ func countZStats(bsaType string) int {
 func CalculateThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (Thresholds, error) {
 	if _, _, _, err := cfg.BulkSizes(bsaType); err != nil {
 		return Thresholds{}, err
+	}
+	if !(cfg.BrmAlpha > 0 && cfg.BrmAlpha < 1) {
+		return Thresholds{}, fmt.Errorf("--brm-alpha must be in (0, 1), got %v", cfg.BrmAlpha)
 	}
 	color.Cyan("\n============================ Calculating genome-wide thresholds (%s) ============================\n", bsaType)
 	th, err := genomeNullThresholds(cfg, bsaType, raw)
@@ -142,6 +150,9 @@ func writeThresholdsTSV(path string, t Thresholds, bsaType string, signedDSI, hm
 		row("HMMLOD", "upper", t.HMM.LODP99, t.HMM.LODP95)
 	}
 	row("CompositeZ", "upper", t.Z.CompositeZP99, t.Z.CompositeZP95)
+	if t.BRMU > 0 {
+		fmt.Fprintf(w, "# BRM: blocks where |z| = |signal|/σ ≥ %.6g (genome-wide alpha = %g)\n", t.BRMU, t.BRMAlpha)
+	}
 	if err := w.Flush(); err != nil {
 		return err
 	}

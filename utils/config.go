@@ -82,9 +82,9 @@ type AnalysisConfig struct {
 	// NullReps is the number of simulated no-QTL genomes used for the HMM LOD
 	// and CompositeZ thresholds.
 	NullReps int
-	// Region calling controls. A zero value selects biologically conservative
-	// defaults derived from the Gaussian smoothing bandwidth.
-	MinQTLWidth   int64
+	// Region calling controls. MergeDistance 0 selects the Gaussian smoothing
+	// σ; MinQTLMarkers is the fewest markers beyond the threshold line a
+	// region needs (EffectiveMinQTLMarkers).
 	MergeDistance int64
 	MinQTLMarkers int
 	OutputDir     string
@@ -125,9 +125,12 @@ type AnalysisConfig struct {
 	Ref      string
 	Protein  string
 	Gff      string
-	Cds      string
-	GeneDesc string
-	Prg      string
+	// GeneSpaceSpan: gene-space analysis on the final QTLs' span instead of
+	// their consensus core.
+	GeneSpaceSpan bool
+	Cds           string
+	GeneDesc      string
+	Prg           string
 
 	Merger             string
 	Caller             string
@@ -136,6 +139,11 @@ type AnalysisConfig struct {
 	ModelType          string
 	Verbose            bool
 	Threads            int
+}
+
+// EffectiveMinQTLMarkers is MinQTLMarkers, at least 1.
+func (cfg AnalysisConfig) EffectiveMinQTLMarkers() int {
+	return max(cfg.MinQTLMarkers, 1)
 }
 
 // EffectiveMergeDistance returns the maximum bp gap bridged when merging adjacent

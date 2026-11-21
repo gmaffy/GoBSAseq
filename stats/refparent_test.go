@@ -31,15 +31,15 @@ func TestNullExtremesAbsDeltaSI(t *testing.T) {
 	}
 }
 
-func TestAbsDeltaSIStatConfigs(t *testing.T) {
+func TestAbsDeltaSITracks(t *testing.T) {
 	var names []string
-	for _, c := range absDeltaSIStatConfigs {
+	for _, c := range absDeltaSITracks {
 		names = append(names, c.name)
 		if c.name == "DeltaSI+" || c.name == "DeltaSI-" || c.name == "HMMLOD" {
 			t.Fatalf("track %q in the |ΔSI| set (no signed ΔSI or HMM without polarity)", c.name)
 		}
 	}
-	if len(absDeltaSIStatConfigs) != len(twoBulkStatConfigs)-2 || names[1] != "AbsDeltaSI" {
+	if len(absDeltaSITracks) != len(twoBulkTracks)-2 || names[1] != "AbsDeltaSI" {
 		t.Fatalf("unexpected |ΔSI| track set %v", names)
 	}
 }

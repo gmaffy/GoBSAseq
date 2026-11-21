@@ -79,7 +79,9 @@ gobsaseq -V <vcf> -P <parents> -B <bulks> \
 | `-w` / `--window-size` | int64 | `2000000` | Gaussian kernel width (bp); σ = width / 2 |
 | `-s` / `--step-size` | int64 | `100000` | Reserved for future regular-grid summaries; marker-centred smoothing does not currently use it |
 | `-m` / `--population` | string | `F2` | Population: `F2`, `F3`, `RIL`, `BC{n}H`, `BC{n}L`, `BC{n}F2H`, `BC{n}F2L` |
-| `--brm-alpha` | float64 | `0.05` | BRM significance level |
+| `--brm-alpha` | float64 | `0.05` | BRM genome-wide error rate: the chance that a genome without QTLs gets any BRM block |
+| `--merge-distance` | int | `0` | Gap in bp within which same-direction regions are joined (0 = smoothing σ, window/2) |
+| `--min-qtl-markers` | int | `5` | Fewest markers beyond the threshold line a region needs (individual statistics, CompositeZ, BRM) |
 | `--rep` | int | — | Deprecated and ignored: all thresholds come from the genome-wide null (`--null-reps`) |
 
 #### Variant Filtering
@@ -134,6 +136,7 @@ GATK semantics apply: a record fails only when an annotation is **present** and 
 |------|-------------|
 | `--snpEffDB` | snpEff database ID (e.g., `GRCh38.p13`) |
 | `--gff` | GFF3 annotation file |
+| `--gene-space-span` | Gene space analysis on each final QTL's span instead of its consensus core |
 | `--cds` | CDS FASTA file |
 | `-r` / `--reference` | Reference genome FASTA |
 | `--protein` | Protein FASTA file |
@@ -195,12 +198,13 @@ stats/
   *.raw.tsv                        # Per-variant raw statistics
   *.smoothed_and_normalised.tsv    # Gaussian smoothed + robust Z-scores
   *.thresholds.tsv                 # Genome-wide thresholds (one row per statistic and tail), with ρ and --null-reps
-  *.brm_blocks.tsv                 # BRM-detected blocks
+  *.brm_blocks.tsv                 # BRM blocks: CHROM, START, STOP, PEAK_POS, PEAK, THRESHOLD (u·σ at the peak), PEAK_Z (signal/σ)
   *.hardfiltered.vcf.gz (+.tbi)    # Filtered VCF with tabix index
   *.lowqual.vcf.gz                 # Records where no ALT passed (kept samples only)
 qtls/
-  *.compositez.qtl.xlsx            # CompositeZ QTL intervals (genome-wide threshold)
-  *.final.qtl.xlsx                 # Interval-level union of CompositeZ + BRM evidence
+  *.individual.qtl.xlsx / .tsv     # Individual-statistic QTLs (by direction)
+  *.compositez.qtl.xlsx / .tsv     # CompositeZ QTL intervals (genome-wide threshold)
+  *.final.qtl.xlsx / .tsv          # Final QTLs: consensus of HMM LOD, BRM and CompositeZ (plus loci with partial support)
 plots/
   *.individual_plots.html          # Per-statistic charts with thresholds
   *.composite_signal.html          # CompositeZ + MaxAbsZ overview
@@ -214,7 +218,15 @@ genespace/  (if annotation enabled)
 
 **Smoothed TSV**: Adds `Sm_*` (smoothed values), `Z_*` (robust Z-scores), `CompositeZ` (Stouffer), `MaxAbsZ`. `HMMLOD` is carried over from the raw TSV unchanged (no Z).
 
-**Merged QTLs**: `CHROM`, `START`, `STOP`, `SOURCE` (`ZScore`/`BRM`/`ZScore+BRM`), `Z_PEAK`, `BRM_PEAK`, `BRM_THRESHOLD`.
+**Individual QTLs**: each statistic is scanned across the genome at its p99 threshold; only if it has no p99 region anywhere are its p95 regions reported, labelled `p95 (suggestive)`. Regions are joined into QTLs by direction: ΔSI/AFDev upper-tail (`+`, high-parent allele enriched in the high bulk) and lower-tail (`−`) regions are never joined, even when they overlap; unsigned statistics (G′, ED⁴, |ΔSI|, G1, HMM LOD) join the signed QTL they overlap most, or form `none` QTLs. Each QTL lists each statistic's strongest peak.
+
+**Final QTLs**: a locus is formed by HMM LOD regions (above the genome-wide p99), BRM blocks and CompositeZ regions (above the genome-wide p99) that overlap or lie within `--merge-distance`. It is a **consensus** QTL when every available method supports it: all three, or BRM and CompositeZ in `2b` without `--ref-parent` (no HMM LOD). Columns:
+- `Start`/`Stop`: the core, where all methods are above threshold. `Span_Start`/`Span_Stop`: the union of their regions.
+- `Consensus` (yes/no), `Support` (e.g. `HMMLOD+BRM+CompositeZ`; loci with partial support are listed but are not final).
+- `Direction`: `+`/`−` from the BRM peak, `none` without polarity, `mixed` if BRM blocks of both signs fall in the locus.
+- `Lead_Pos`: the midpoint of the HMM LOD's 1.5-LOD support interval (else the BRM peak). Then each method's peak, value and threshold (BRM also z), the HMM support interval, and the individual statistics overlapping the locus.
+
+Gene space analysis runs on the consensus QTLs' cores (`--gene-space-span` for spans). On simulated data no QTL-free genome out of 100 produced a consensus QTL.
 
 ---
 
@@ -250,10 +262,13 @@ genespace/  (if annotation enabled)
                           same code as the data. Every scanned statistic (smoothed ΔSI, G′, ED⁴, AFDev, G1,
                           SI; HMM LOD; CompositeZ) gets genome-wide thresholds: quantiles of its genome
                           maximum (and minimum for lower tails; two-tailed tracks split the level)
-5. BRM Detection       → Bayesian regression model block detection (incorporates bulk size)
-6. QTL Detection       → Regions exceeding the genome-wide CompositeZ threshold
-7. Individual QTLs     → Per-statistic intervals above their genome-wide thresholds
-8. Merge               → Union of Z-score and BRM intervals
+5. BRM Detection       → Block Regression Mapping (Huang et al. 2020): runs of markers where the smoothed
+                          ΔSI / AFDev exceeds u·σ of the smoothed value (pool + read variance); u from the
+                          genome-wide null, so --brm-alpha is a genome-wide error rate
+6. Individual QTLs     → Each statistic's regions beyond its genome-wide p99 (p95 "suggestive" only if the
+                          statistic has no p99 region anywhere), joined by direction (+/−/none)
+7. CompositeZ QTLs     → Regions above the genome-wide CompositeZ p99 (same p95 rule)
+8. Final QTLs         → Consensus of HMM LOD, BRM and CompositeZ regions (core, span, lead position)
 9. Plots               → Interactive HTML charts (echarts) with all thresholds
 10. Gene Space         → Annotate QTLs with genes (optional, requires --gff)
 ```
@@ -269,7 +284,7 @@ genespace/  (if annotation enabled)
 | **HMM LOD** | Pool hidden-Markov-model LOD: log₁₀ of the likelihood of all reads on the chromosome with the pool frequency at the site free vs. under no QTL; genome-wide thresholds from simulated no-QTL genomes |
 | **Robust Z-score** | `(x − median) / (1.4826 × MAD)`; outlier-resistant |
 | **Composite Z** | Stouffer: `Σ Zᵢ / √k`; combines all Z-scores |
-| **BRM** | Threshold = `u_α √((n₁+n₂)·p(1−p) / (V_scale·n₁n₂))` for two-bulk |
+| **BRM** | Threshold = `u·σ`, u the (1 − `--brm-alpha`) quantile of the null genomes' maximum \|z\| = \|signal\|/σ (extreme-value fit; about 2.9 at α = 0.05), σ² = pool variance `p₀(1−p₀)(1/n₁+1/n₂)/V_scale` + the read-sampling variance of the smoothed value, `Σ l_m²·r_m` over the kernel's effective weights with beta-binomial read variance (estimated ρ) |
 | **MC Thresholds** | Two-stage: `Binomial(bulk_size, p₀) → Binomial(depth, realized_af)`; empirical per-depth thresholds |
 
 ### Population Structures
@@ -312,7 +327,7 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 |--------|-----------|----------------|-------------|
 | **Composite Z-score** | Genome-wide null simulation (extreme-value fit to genome maxima) | **Primary** | `*.compositez.qtl.xlsx` |
 | **Individual statistics** | Genome-wide null simulation (per statistic) | **Secondary** | `*.individual.qtl.xlsx` |
-| **BRM Blocks** | Analytical window-based | **Secondary** | `*.brm_blocks.tsv` |
+| **BRM Blocks** | Standardised smoothed signal, genome-wide null threshold | **Secondary** | `*.brm_blocks.tsv` |
 
 **CompositeZ and individual-statistic detection are run by default.** The threshold TSV records every threshold used: they are genome-wide, so a p99 threshold has a 1% chance of being crossed anywhere in a genome without QTLs.
 
@@ -376,7 +391,7 @@ GoBSAseq provides **two complementary QTL detection approaches**:
 | Empty output TSVs | All variants removed by filters | Reduce stringency; verify samples are segregating |
 | No QTLs detected | Low power or weak signal | Check max CompositeZ in smoothed TSV; try `--brm-alpha 0.10` |
 | HTML plots won't render | Browser blocks local files | Serve with `python3 -m http.server 8000` |
-| BRM and Z-score disagree | Expected — different methods | Consensus intervals (`ZScore+BRM`) are most robust |
+| Methods disagree | Expected — different methods | Final QTLs need every method; loci with partial support are listed with their `Support` |
 
 ---
 

@@ -234,10 +234,14 @@ var rootCmd = &cobra.Command{
 		windowSize, _ := cmd.Flags().GetInt64("window-size")
 		stepSize, _ := cmd.Flags().GetInt64("step-size")
 		population, _ := cmd.Flags().GetString("population")
+		if _, err := utils.ParsePopulation(population); err != nil {
+			color.Red("Error: --population: %v", err)
+			os.Exit(1)
+		}
 		brmAlpha, _ := cmd.Flags().GetFloat64("brm-alpha")
-		minQTLWidth, _ := cmd.Flags().GetInt64("min-qtl-width")
 		mergeDistance, _ := cmd.Flags().GetInt64("merge-distance")
 		minQTLMarkers, _ := cmd.Flags().GetInt("min-qtl-markers")
+		geneSpaceSpan, _ := cmd.Flags().GetBool("gene-space-span")
 		outputDir, _ := cmd.Flags().GetString("out")
 
 		lightFiltering, _ := cmd.Flags().GetBool("light-filtering")
@@ -435,9 +439,9 @@ var rootCmd = &cobra.Command{
 			WindowSize:             winSize,
 			StepSize:               step,
 			BrmAlpha:               brmAlpha,
-			MinQTLWidth:            minQTLWidth,
 			MergeDistance:          mergeDistance,
 			MinQTLMarkers:          minQTLMarkers,
+			GeneSpaceSpan:          geneSpaceSpan,
 			MinGQ:                  minGQ,
 			SplitMultiallelic:      !noSplitMultiallelic,
 			MinPooledMAF:           minPooledMAF,
@@ -531,7 +535,8 @@ func init() {
 	// ------------------------------------------------- Smoothing -------------------------------------------------- //
 	rootCmd.Flags().Int64P("window-size", "w", 2000000, "Window Size")
 	rootCmd.Flags().Int64P("step-size", "s", 100000, "Smoothing grid spacing (bp) on dense chromosomes: kernels are evaluated on this grid and interpolated to markers; capped at window/40 (σ/20)")
-	rootCmd.Flags().Int64("min-qtl-width", 0, "Minimum QTL width in bp (0 uses smoothing sigma)")
+	rootCmd.Flags().Int64("min-qtl-width", 0, "Ignored: width follows from smoothing; use --min-qtl-markers")
+	_ = rootCmd.Flags().MarkDeprecated("min-qtl-width", "region width follows from smoothing; use --min-qtl-markers")
 	rootCmd.Flags().Int64("merge-distance", 0, "Maximum gap in bp to merge same-direction QTL support (0 uses smoothing sigma)")
 	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum significant markers supporting a QTL")
 
@@ -561,6 +566,7 @@ func init() {
 
 	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
 	rootCmd.Flags().String("gff", "", "gff3 file path")
+	rootCmd.Flags().Bool("gene-space-span", false, "Gene space analysis on the final QTLs' span (union of HMM LOD, BRM and CompositeZ regions) instead of their consensus core")
 	rootCmd.Flags().String("cds", "", "cds file path")
 	rootCmd.Flags().StringP("reference", "r", "", "reference file path")
 	rootCmd.Flags().String("protein", "", "protein fasta path")

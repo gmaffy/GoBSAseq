@@ -92,7 +92,8 @@ func TestPoolModelMoments(t *testing.T) {
 			sq += p * m.freq[j] * m.freq[j]
 		}
 		p0, _ := ExpectedAF(pop)
-		want := p0 * (1 - p0) / (PopulationVarianceScale(pop) * 30)
+		popn, _ := utils.ParsePopulation(pop)
+		want := p0 * (1 - p0) / (popn.VarScale * 30)
 		if math.Abs(mean-p0) > 1e-9 || math.Abs((sq-mean*mean)/want-1) > 0.05 {
 			t.Errorf("%s: mean %.4f (want %.4f), var %.6f (want %.6f)", pop, mean, p0, sq-mean*mean, want)
 		}
@@ -120,6 +121,9 @@ func TestGenomeNullThresholdsRuns(t *testing.T) {
 	}
 	if tb := th.TwoBulk; !(tb.GstatP99 >= tb.GstatP95 && tb.GstatP95 > 0 && tb.DeltaSIP99 > 0 && tb.DeltaSIMp99 < 0 && tb.ED4P99 > 0) {
 		t.Fatalf("per-statistic thresholds %+v", tb)
+	}
+	if th.BRMU != 0 { // BrmAlpha unset: no BRM threshold
+		t.Fatalf("BRMU = %v without --brm-alpha", th.BRMU)
 	}
 	if zt.NumStats != 2 {
 		t.Fatalf("NumStats = %d, want 2", zt.NumStats)

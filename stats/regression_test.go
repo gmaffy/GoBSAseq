@@ -24,31 +24,6 @@ func TestFindPeakIntersectionsGenomeWideThreshold(t *testing.T) {
 	}
 }
 
-func TestMergeCompositeBRMPreservesDisconnectedLoci(t *testing.T) {
-	peaks := []PeakIntersection{
-		{Chrom: "chr1", Start: 100, End: 200, PeakPos: 150, PeakValue: 5, ThresholdLevel: "p99"},
-		{Chrom: "chr1", Start: 500, End: 600, PeakPos: 550, PeakValue: 4, ThresholdLevel: "p99"},
-	}
-	merged := MergeCompositeBRM(peaks, nil, 0)
-	if len(merged) != 2 {
-		t.Fatalf("expected two disconnected QTLs, got %#v", merged)
-	}
-}
-
-func TestMergeCompositeBRMBridgesNearbyLoci(t *testing.T) {
-	peaks := []PeakIntersection{
-		{Chrom: "chr1", Start: 100, End: 200, PeakPos: 150, PeakValue: 5, ThresholdLevel: "p99"},
-		{Chrom: "chr1", Start: 250, End: 350, PeakPos: 300, PeakValue: 4, ThresholdLevel: "p99"},
-	}
-	merged := MergeCompositeBRM(peaks, nil, 50)
-	if len(merged) != 1 {
-		t.Fatalf("expected one merged QTL, got %#v", merged)
-	}
-	if merged[0].Start != 100 || merged[0].Stop != 350 {
-		t.Fatalf("unexpected merged span: %#v", merged[0])
-	}
-}
-
 func TestConsolidateQTLsMergesWithinGap(t *testing.T) {
 	peaks := []PeakIntersection{
 		{Chrom: "chr1", Start: 100, End: 200, PeakPos: 150, PeakValue: 2, ThresholdLevel: "p99", Stat: "Gstat"},
