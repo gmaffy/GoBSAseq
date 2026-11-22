@@ -79,9 +79,13 @@ type AnalysisConfig struct {
 	// CMPerMb is the genome-wide recombination rate for the HMM LOD, in cM per
 	// Mb. 0 (default) assumes 1 Morgan over each chromosome's marker span.
 	CMPerMb float64
-	// NullReps is the number of simulated no-QTL genomes used for the HMM LOD
-	// and CompositeZ thresholds.
+	// NullReps is the number of simulated no-QTL genomes used for the
+	// genome-wide thresholds (HMM LOD, BRM, DsiGconsensusZ and every smoothed
+	// track).
 	NullReps int
+	// NoNullCache recomputes the genome-wide null instead of reusing a cached
+	// one from an earlier run on the same data and settings.
+	NoNullCache bool
 	// Region calling controls. MergeDistance 0 selects the Gaussian smoothing
 	// σ; MinQTLMarkers is the fewest markers beyond the threshold line a
 	// region needs (EffectiveMinQTLMarkers).

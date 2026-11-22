@@ -276,10 +276,10 @@ func setLead(q *ConsolidatedQTL, sm []SmoothedStats) {
 	}
 }
 
-// DetectCompositeZQTLs finds CompositeZ regions (genome-wide p99, or p95 when
-// there is no p99 region anywhere) and joins those within mergeGap.
-func DetectCompositeZQTLs(smoothed []SmoothedStats, th Thresholds, mergeGap int64, minMarkers int) []PeakIntersection {
-	found := scanGenome(byChromosome(smoothed), "CompositeZ", th.Z.CompositeZP99, th.Z.CompositeZP95,
-		func(s SmoothedStats) float64 { return s.CompositeZ }, UpperTail, minMarkers, "")
+// DetectDsiGconsensusZQTLs finds DsiGconsensusZ regions (genome-wide p99, or
+// p95 when there is no p99 region anywhere) and joins those within mergeGap.
+func DetectDsiGconsensusZQTLs(smoothed []SmoothedStats, th Thresholds, mergeGap int64, minMarkers int) []PeakIntersection {
+	found := scanGenome(byChromosome(smoothed), methodDsiG, th.Consensus.P99, th.Consensus.P95,
+		func(s SmoothedStats) float64 { return s.DsiGconsensusZ }, UpperTail, minMarkers, "")
 	return mergePeakIntersections(found, mergeGap)
 }

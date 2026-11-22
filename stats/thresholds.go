@@ -17,18 +17,20 @@ import (
 // genome, as scanned (smoothed tracks after smoothing, the HMM LOD as is), so
 // P99 means a 1% chance that a genome without QTLs crosses it anywhere.
 //
-// One-sided statistics (G′, ED⁴, G1, |ΔSI|, HMM LOD, CompositeZ) use the
+// One-sided statistics (G′, ED⁴, G1, |ΔSI|, HMM LOD, DsiGconsensusZ) use the
 // level whole: P99/P95 are the 99%/95% quantiles of the genome maxima.
 // Two-tailed ones (ΔSI, AFDev, SI) split it between the tails: P99/P95 are
 // the 99.5%/97.5% quantiles of the maxima, and Mp99/Mp95 the matching lower
 // quantiles of the minima.
 type Thresholds struct {
-	TwoBulk  TwoBulkThresholds
-	OneBulk  OneBulkThresholds
-	Z        ZThresholds
-	HMM      HMMThresholds
-	Rho      float64 // read overdispersion simulated in the null (estimateRho)
-	NullReps int     // simulated no-QTL genomes
+	TwoBulk TwoBulkThresholds
+	OneBulk OneBulkThresholds
+	// Consensus: DsiGconsensusZ's thresholds and the null model that
+	// standardises it (dsigconsensus.go).
+	Consensus ConsensusThresholds
+	HMM       HMMThresholds
+	Rho       float64 // read overdispersion simulated in the null (estimateRho)
+	NullReps  int     // simulated no-QTL genomes
 	// BRMU is the BRM threshold on the standardised statistic |z| (brmModel):
 	// the (1 − BRMAlpha) quantile of the genome-wide maximum |z| of the null
 	// genomes, so BRMAlpha (--brm-alpha) is a genome-wide error rate. 0 when
@@ -64,24 +66,13 @@ type OneBulkThresholds struct {
 	OneBulkGstatP99, OneBulkGstatP95 float64
 }
 
-// ZThresholds are the CompositeZ thresholds; NumStats is the number of
-// Z-scores CompositeZ combines.
-type ZThresholds struct {
-	CompositeZP99, CompositeZP95 float64
-	NumStats                     int
-}
-
-// countZStats returns k, the number of Z-scores consolidate combines into
-// CompositeZ (smoothLayout.compositeCount): 2 in every mode, |ZΔSI| + ZG′ or
-// |ZAFDev| + ZG1. The HMM LOD is a separate track.
-func countZStats(bsaType string) int {
-	hb, lb, _, _ := BulkFlags(bsaType)
-	return smoothLayout{highBulk: hb, lowBulk: lb, signedDSI: true}.compositeCount()
-}
-
 // CalculateThresholds runs the genome-wide null simulation over raw's markers
 // and depths and returns the analysis's thresholds, also written to
-// stats/GoBSAseq.<bsaType>.thresholds.tsv.
+// stats/GoBSAseq.<bsaType>.thresholds.tsv. The result is cached in
+// stats/GoBSAseq.<bsaType>.null_cache.gob, keyed on everything the null
+// depends on (nullcache.go), so a re-run on the same data and settings (e.g.
+// with other QTL-calling or plotting options) reuses it; cfg.NoNullCache
+// (--no-null-cache) always recomputes.
 func CalculateThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (Thresholds, error) {
 	if _, _, _, err := cfg.BulkSizes(bsaType); err != nil {
 		return Thresholds{}, err
@@ -90,9 +81,22 @@ func CalculateThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAstat
 		return Thresholds{}, fmt.Errorf("--brm-alpha must be in (0, 1), got %v", cfg.BrmAlpha)
 	}
 	color.Cyan("\n============================ Calculating genome-wide thresholds (%s) ============================\n", bsaType)
-	th, err := genomeNullThresholds(cfg, bsaType, raw)
-	if err != nil {
-		return Thresholds{}, fmt.Errorf("genome-wide null simulation: %w", err)
+	cachePath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.null_cache.gob", bsaType))
+	key := nullCacheKey(cfg, bsaType, raw)
+	th, cached := Thresholds{}, false
+	if !cfg.NoNullCache {
+		th, cached = loadNullCache(cachePath, key)
+	}
+	if cached {
+		color.Green("Reusing the genome-wide null from %s (same markers, depths and settings; --no-null-cache recomputes it)", cachePath)
+	} else {
+		var err error
+		if th, err = genomeNullThresholds(cfg, bsaType, raw); err != nil {
+			return Thresholds{}, fmt.Errorf("genome-wide null simulation: %w", err)
+		}
+		if err := saveNullCache(cachePath, key, th); err != nil {
+			color.Yellow("Could not cache the genome-wide null: %v", err)
+		}
 	}
 	outPath := filepath.Join(cfg.OutputDir, "stats", fmt.Sprintf("GoBSAseq.%s.thresholds.tsv", bsaType))
 	if err := writeThresholdsTSV(outPath, th, bsaType, cfg.SignedDeltaSI(bsaType), HMMAvailable(cfg, bsaType)); err != nil {
@@ -149,7 +153,10 @@ func writeThresholdsTSV(path string, t Thresholds, bsaType string, signedDSI, hm
 	if hmm {
 		row("HMMLOD", "upper", t.HMM.LODP99, t.HMM.LODP95)
 	}
-	row("CompositeZ", "upper", t.Z.CompositeZP99, t.Z.CompositeZP95)
+	row("DsiGconsensusZ", "upper", t.Consensus.P99, t.Consensus.P95)
+	if t.Consensus.Model != nil {
+		fmt.Fprintf(w, "# DsiGconsensusZ: null correlation of its two components r = %.4f (from %d null genomes)\n", t.Consensus.R, t.Consensus.Model.Reps)
+	}
 	if t.BRMU > 0 {
 		fmt.Fprintf(w, "# BRM: blocks where |z| = |signal|/σ ≥ %.6g (genome-wide alpha = %g)\n", t.BRMU, t.BRMAlpha)
 	}

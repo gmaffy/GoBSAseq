@@ -110,7 +110,7 @@ func (p plantSim) datasetPhase(rng *rand.Rand, nPlants int, rho float64, qtl, ra
 // TestHMMLODCalibration checks the genome-wide null against data from an
 // independent plant-level generator (F2 plants with Poisson crossovers,
 // gamma-Poisson depths, optional beta-binomial overdispersion): about 5% of
-// no-QTL genomes should exceed the p95 HMM LOD and CompositeZ thresholds and
+// no-QTL genomes should exceed the p95 HMM LOD and DsiGconsensusZ thresholds and
 // 1% the p99 (both genome-wide), with and without overdispersion, and the
 // estimated read overdispersion ρ should be near the truth. Slow: set
 // GOBSASEQ_CALIBRATION=1 to run.
@@ -147,7 +147,7 @@ func TestHMMLODCalibration(t *testing.T) {
 		}
 		tmpl := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
 		th, err := genomeNullThresholds(cfg, sc.mode, tmpl)
-		zt, ht := th.Z, th.HMM
+		zt, ht := th.Consensus, th.HMM
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -174,6 +174,9 @@ func TestHMMLODCalibration(t *testing.T) {
 		for range nNull {
 			raw := withHMM(p.datasetPhase(rng, 20, sc.rho, false, sc.randomPhase))
 			sm, _ := scorer.score(raw, false, 1)
+			if err := applyDsiGConsensus(cfg, sc.mode, sm, th); err != nil { // as SmoothAndNormalise
+				t.Fatal(err)
+			}
 			mx := 0.0
 			for i := range raw {
 				mx = math.Max(mx, raw[i].HMMLOD)
@@ -186,7 +189,7 @@ func TestHMMLODCalibration(t *testing.T) {
 			}
 			cz := math.Inf(-1)
 			for i := range sm {
-				cz = math.Max(cz, sm[i].CompositeZ)
+				cz = math.Max(cz, sm[i].DsiGconsensusZ)
 			}
 			if o99, o95 := crossesAny(sm, th, lay); o99 {
 				statOver99++
@@ -194,10 +197,10 @@ func TestHMMLODCalibration(t *testing.T) {
 			} else if o95 {
 				statOver95++
 			}
-			if cz > zt.CompositeZP95 {
+			if cz > zt.P95 {
 				czOver95++
 			}
-			if cz > zt.CompositeZP99 {
+			if cz > zt.P99 {
 				czOver99++
 			}
 			blocks, _ := RunBRM(cfg, sc.mode, sm, th)
@@ -223,6 +226,9 @@ func TestHMMLODCalibration(t *testing.T) {
 		// power: one QTL dataset
 		qraw := withHMM(p.datasetPhase(rng, 20, sc.rho, true, sc.randomPhase))
 		qsm, _ := scorer.score(qraw, false, 1)
+		if err := applyDsiGConsensus(cfg, sc.mode, qsm, th); err != nil {
+			t.Fatal(err)
+		}
 		qBRM, qCons := 0, false
 		qBlocks, _ := RunBRM(cfg, sc.mode, qsm, th)
 		for _, b := range qBlocks {
@@ -259,7 +265,7 @@ func TestHMMLODCalibration(t *testing.T) {
 			t.Errorf("%s/%s rho=%.3f: BRM missed the QTL", sc.mode, sc.refParent, sc.rho)
 		}
 		if czOver99 > 5 || czOver95 > 12 {
-			t.Errorf("%s/%s rho=%.3f: null genomes over CompositeZ p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, czOver95, nNull, czOver99, nNull)
+			t.Errorf("%s/%s rho=%.3f: null genomes over DsiGconsensusZ p95 %d/%d, over p99 %d/%d: thresholds too low", sc.mode, sc.refParent, sc.rho, czOver95, nNull, czOver99, nNull)
 		}
 		if statOver99 > 5*len(nullExtremes(lay)) {
 			t.Errorf("%s/%s rho=%.3f: %d/%d null genomes cross a per-statistic p99", sc.mode, sc.refParent, sc.rho, statOver99, nNull)
@@ -268,16 +274,16 @@ func TestHMMLODCalibration(t *testing.T) {
 		qcz := math.Inf(-1)
 		for i := range qsm {
 			if qsm[i].CHROM == "A" {
-				qcz = math.Max(qcz, qsm[i].CompositeZ)
+				qcz = math.Max(qcz, qsm[i].DsiGconsensusZ)
 			}
 		}
-		t.Logf("%s ref-parent=%s rho=%.3f (estimated %.4f): HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | CompositeZ p95/p99 %.2f/%.2f, null genomes over %d/%d | QTL max LOD %.1f, max CompositeZ %.1f | BRM |z| ≥ %.2f: null genomes with a block %d/%d, QTL found %v",
-			sc.mode, sc.refParent, sc.rho, rhoHat, ht.LODP95, ht.LODP99, over95, over99, nNull, zt.CompositeZP95, zt.CompositeZP99, czOver95, czOver99, qmax, qcz, th.BRMU, brmGenomes, nNull, qBRM == 1)
+		t.Logf("%s ref-parent=%s rho=%.3f (estimated %.4f): HMM LOD p95/p99 %.2f/%.2f, null genomes over %d/%d of %d | DsiGconsensusZ p95/p99 %.2f/%.2f, null genomes over %d/%d | QTL max LOD %.1f, max DsiGconsensusZ %.1f | BRM |z| ≥ %.2f: null genomes with a block %d/%d, QTL found %v",
+			sc.mode, sc.refParent, sc.rho, rhoHat, ht.LODP95, ht.LODP99, over95, over99, nNull, zt.P95, zt.P99, czOver95, czOver99, qmax, qcz, th.BRMU, brmGenomes, nNull, qBRM == 1)
 	}
 }
 
 // crossesAny reports whether any detection track (ΔSI or AFDev both tails,
-// G′/G1, ED⁴; not SI or CompositeZ) crosses its p99, and its p95.
+// G′/G1, ED⁴; not SI or DsiGconsensusZ) crosses its p99, and its p95.
 func crossesAny(sm []SmoothedStats, th Thresholds, lay smoothLayout) (p99, p95 bool) {
 	tb, ob := th.TwoBulk, th.OneBulk
 	type tr struct {

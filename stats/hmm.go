@@ -64,10 +64,14 @@ const (
 	hmmMinProb  = 1e-6   // clamp for read probabilities
 	hmmTiny     = 1e-300 // floor for log of likelihood sums
 	hmmFGrid    = 41     // grid points for the shared frequency f (two-bulk)
-	// hmmBinMorgans: markers closer than this (0.01 cM) share one HMM step;
-	// their reads are combined. A crossover inside a bin is rare (≈ U·1e-4 per
+	// hmmBinMorgans: markers closer than this (0.05 cM) share one HMM step;
+	// their reads are combined. A crossover inside a bin is rare (≈ U·5e-4 per
 	// bin), so this barely changes the LOD but makes dense marker sets cheap.
-	hmmBinMorgansDefault = 1e-4
+	// Against 0.01 cM bins on 1 kb-spaced simulated F2 data: the HMM ran 3–3.4×
+	// faster, the genome maximum LOD and the peak LOD of every simulated QTL were
+	// unchanged (to 5e-4), and 1.5-LOD support intervals moved by ≤ 10 kb for a
+	// strong QTL and by ≤ 0.8 Mb on the flat 3.5–17 Mb plateaus of moderate ones.
+	hmmBinMorgansDefault = 5e-4
 )
 
 // hmmBinMorgans is the bin width in use (a variable so tests can compare
@@ -144,6 +148,8 @@ func (m *poolModel) tables(t *stepTables, a, b float64) {
 	if len(t.powA) != m.U+1 {
 		t.powA, t.powB = make([]float64, m.U+1), make([]float64, m.U+1)
 		t.lossBuf, t.gainBuf = make([]float64, m.U+1), make([]float64, m.U+1)
+	} else if t.a == a && t.b == b { // same gap as the previous step (evenly spaced bins)
+		return
 	}
 	t.a, t.b, t.ra, t.rb = a, b, a/(1-a), b/(1-b)
 	t.powA[0], t.powB[0] = 1, 1
@@ -154,7 +160,11 @@ func (m *poolModel) tables(t *stepTables, a, b float64) {
 }
 
 // Truncation of the binomial loss/gain distributions: stop past the mean once
-// terms fall below binomTail.
+// terms fall below binomTail. Not raised to save time: on linked simulated
+// data 1e-10 changed the LOD by < 3e-7 for a 1.0–1.2× speed-up, but where
+// neighbouring markers disagree strongly (outlier sites; unlinked test data)
+// the likelihood rests on these tiny many-switch transitions, and 1e-10
+// moved the LOD by up to 0.23.
 const binomTail = 1e-15
 
 // binomInto fills buf[0:k] with P(Binomial(n, p) = i), i < k, truncated past
@@ -302,12 +312,16 @@ func (m *poolModel) chromLikelihoods(data hmmBulkData, binStart []int, dM []floa
 	cur, prev, e, scratch := make([]float64, S), make([]float64, S), make([]float64, S), make([]float64, S)
 	var tab stepTables
 	var cache logCache
+	// Per-bin switch probabilities, computed once in the forward pass and
+	// reused by the backward pass.
+	ab := make([]float64, 2*nb)
 
 	for x := range nb {
 		if x == 0 {
 			copy(cur, m.prior)
 		} else {
 			a, b := m.switchProbs(dM[x])
+			ab[2*x], ab[2*x+1] = a, b
 			m.tables(&tab, a, b)
 			m.forwardStep(cur, prev, scratch, &tab)
 		}
@@ -342,8 +356,7 @@ func (m *poolModel) chromLikelihoods(data hmmBulkData, binStart []int, dM []floa
 			for j := range next {
 				next[j] *= float64(emis[x+1][j])
 			}
-			a, b := m.switchProbs(dM[x+1])
-			m.tables(&tab, a, b)
+			m.tables(&tab, ab[2*(x+1)], ab[2*(x+1)+1])
 			m.backwardStep(beta, next, scratch, &tab)
 			mx := 0.0
 			for _, v := range beta {
@@ -440,6 +453,31 @@ func (t *twoBulkLOD) lod(LH, LL []float32) float64 {
 	return math.Max(0, -mx/math.Ln10)
 }
 
+// lodUpperStride picks the coarse subset of the f grid (every 8th point from
+// the 4th) that lodUpper evaluates.
+const lodUpperStride = 8
+
+// lodUpper is an upper bound on lod(LH, LL) at about 1/8 of its cost: the
+// shared-frequency log likelihood maximised over a subset of the f grid is at
+// most its maximum over the whole grid, which is at most the parabolic
+// refinement, so the bound is ≥ the exact LOD. The null simulation only needs
+// each genome's maximum LOD, so it skips the exact LOD wherever the bound is
+// already below the running maximum.
+func (t *twoBulkLOD) lodUpper(LH, LL []float32) float64 {
+	best := math.Inf(-1)
+	for i := lodUpperStride / 2; i < len(t.fGrid); i += lodUpperStride {
+		sh, sl := 0.0, 0.0
+		for j, v := range LH {
+			sh += t.tabH[i][j] * float64(v)
+		}
+		for j, v := range LL {
+			sl += t.tabL[i][j] * float64(v)
+		}
+		best = math.Max(best, math.Log(math.Max(sh, hmmTiny))+math.Log(math.Max(sl, hmmTiny)))
+	}
+	return math.Max(0, -best/math.Ln10)
+}
+
 // hmmSetup is everything the HMM needs for one run of a mode.
 type hmmSetup struct {
 	high, low *poolModel // nil if the mode lacks that bulk
@@ -489,9 +527,48 @@ func HMMAvailable(cfg utils.AnalysisConfig, bsaType string) bool {
 // computeHMMLOD fills raw[i].HMMLOD for every site, one chromosome per
 // worker, using the shared marker order (chromosomes sorted by position).
 func computeHMMLOD(s *hmmSetup, raw []BSAstats, order *markerOrder) {
+	computeHMMLODWorkers(s, raw, order, s.workers(order))
+}
+
+// hmmMemBudget bounds the HMM's per-chromosome state held at once (the
+// forward probabilities and emissions of every bin, float32).
+const hmmMemBudget = 2 << 30
+
+// workers is how many chromosomes the HMM can run at once: every core, unless
+// the per-chromosome state of the largest chromosome would exceed
+// hmmMemBudget.
+func (s *hmmSetup) workers(order *markerOrder) int {
+	maxN := 0
+	for _, idx := range order.chroms {
+		maxN = max(maxN, len(idx))
+	}
+	return max(1, min(runtime.GOMAXPROCS(0), int(hmmMemBudget/max(int64(1), s.chromBytes(maxN)))))
+}
+
+// chromBytes bounds the HMM state for a chromosome of n markers (at most n
+// bins): alpha and emissions per bulk, float32.
+func (s *hmmSetup) chromBytes(n int) int64 {
+	u := 0
+	for _, m := range []*poolModel{s.high, s.low} {
+		if m != nil {
+			u += m.U + 1
+		}
+	}
+	return int64(n) * int64(u) * 2 * 4
+}
+
+// computeHMMLODWorkers is computeHMMLOD with a fixed number of workers (1 runs
+// the chromosomes in order on the calling goroutine).
+func computeHMMLODWorkers(s *hmmSetup, raw []BSAstats, order *markerOrder, workers int) {
+	if workers <= 1 {
+		for _, idx := range order.chroms {
+			s.chromLOD(raw, idx, order.rep)
+		}
+		return
+	}
 	jobs := make(chan []int)
 	var wg sync.WaitGroup
-	for range min(runtime.GOMAXPROCS(0), 8) { // bounded: each job holds per-bin state vectors
+	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -507,11 +584,87 @@ func computeHMMLOD(s *hmmSetup, raw []BSAstats, order *markerOrder) {
 	wg.Wait()
 }
 
+// maxHMMLOD returns the largest HMM LOD over raw's sites without storing
+// per-site values (the null simulation needs only each genome's maximum).
+// Chromosomes run in order on the calling goroutine. It equals the maximum
+// of computeHMMLOD's values exactly: two-bulk bins whose lodUpper bound is
+// below the running maximum cannot hold the maximum and are skipped.
+func (s *hmmSetup) maxHMMLOD(raw []BSAstats, order *markerOrder) float64 {
+	best := 0.0
+	for _, idx := range order.chroms {
+		best = s.chromMaxLOD(raw, idx, order.rep, best)
+	}
+	return best
+}
+
+// maxHMMLODWorkers is maxHMMLOD with the chromosomes shared among workers
+// goroutines (the maximum, and so the result, does not depend on the split).
+func (s *hmmSetup) maxHMMLODWorkers(raw []BSAstats, order *markerOrder, workers int) float64 {
+	if workers <= 1 {
+		return s.maxHMMLOD(raw, order)
+	}
+	jobs := make(chan []int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	best := 0.0
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			local := 0.0
+			for idx := range jobs {
+				local = s.chromMaxLOD(raw, idx, order.rep, local)
+			}
+			mu.Lock()
+			best = math.Max(best, local)
+			mu.Unlock()
+		}()
+	}
+	for _, idx := range order.chroms {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+	return best
+}
+
 // chromLOD computes the HMM LOD for one chromosome's sites (indices into raw,
 // sorted by position). Only representative views (rep) contribute reads: the
 // views of a split multi-allelic site share their reads, so multiplying them
 // would count those reads more than once.
 func (s *hmmSetup) chromLOD(raw []BSAstats, idx []int, rep []bool) {
+	binStart, lod := s.chromBinLODs(raw, idx, rep)
+	for b := 0; b+1 < len(binStart); b++ {
+		v := lod(b)
+		for x := binStart[b]; x < binStart[b+1]; x++ {
+			raw[idx[x]].HMMLOD = v
+		}
+	}
+}
+
+// chromMaxLOD returns max(floor, the chromosome's largest bin LOD).
+func (s *hmmSetup) chromMaxLOD(raw []BSAstats, idx []int, rep []bool, floor float64) float64 {
+	binStart, lod, upper := s.chromBins(raw, idx, rep)
+	best := floor
+	for b := 0; b+1 < len(binStart); b++ {
+		if upper != nil && upper(b) <= best {
+			continue
+		}
+		best = math.Max(best, lod(b))
+	}
+	return best
+}
+
+// chromBinLODs runs the HMM on one chromosome and returns its bins (binStart,
+// with a final sentinel) and the LOD of each bin.
+func (s *hmmSetup) chromBinLODs(raw []BSAstats, idx []int, rep []bool) ([]int, func(int) float64) {
+	binStart, lod, _ := s.chromBins(raw, idx, rep)
+	return binStart, lod
+}
+
+// chromBins runs forward–backward on one chromosome and returns its bins, the
+// LOD of a bin, and (two-bulk) a cheap upper bound on it (nil otherwise).
+func (s *hmmSetup) chromBins(raw []BSAstats, idx []int, rep []bool) ([]int, func(int) float64, func(int) float64) {
 	n := len(idx)
 	gaps := gapsMorgans(raw, idx, s.cmPerMb)
 
@@ -552,24 +705,18 @@ func (s *hmmSetup) chromLOD(raw []BSAstats, idx []int, rep []bool) {
 		return d
 	}
 
-	set := func(lod func(b int) float64) {
-		for b := 0; b+1 < len(binStart); b++ {
-			v := lod(b)
-			for x := binStart[b]; x < binStart[b+1]; x++ {
-				raw[idx[x]].HMMLOD = v
-			}
-		}
-	}
 	switch {
 	case s.two != nil:
 		LH := s.high.chromLikelihoods(bulk(true), binStart, binDM)
 		LL := s.low.chromLikelihoods(bulk(false), binStart, binDM)
-		set(func(b int) float64 { return s.two.lod(LH[b], LL[b]) })
+		return binStart, func(b int) float64 { return s.two.lod(LH[b], LL[b]) },
+			func(b int) float64 { return s.two.lodUpper(LH[b], LL[b]) }
 	case s.high != nil:
 		L := s.high.chromLikelihoods(bulk(true), binStart, binDM)
-		set(func(b int) float64 { return s.high.lodOneBulk(L[b]) })
+		return binStart, func(b int) float64 { return s.high.lodOneBulk(L[b]) }, nil
 	case s.low != nil:
 		L := s.low.chromLikelihoods(bulk(false), binStart, binDM)
-		set(func(b int) float64 { return s.low.lodOneBulk(L[b]) })
+		return binStart, func(b int) float64 { return s.low.lodOneBulk(L[b]) }, nil
 	}
+	return binStart, func(int) float64 { return 0 }, nil
 }

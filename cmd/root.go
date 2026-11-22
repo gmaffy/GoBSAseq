@@ -220,6 +220,7 @@ var rootCmd = &cobra.Command{
 		}
 		cmPerMb, _ := cmd.Flags().GetFloat64("cm-per-mb")
 		nullReps, _ := cmd.Flags().GetInt("null-reps")
+		noNullCache, _ := cmd.Flags().GetBool("no-null-cache")
 		if cmPerMb < 0 || nullReps < 20 {
 			color.Red("Error: --cm-per-mb must be ≥ 0 and --null-reps ≥ 20")
 			os.Exit(1)
@@ -450,6 +451,7 @@ var rootCmd = &cobra.Command{
 			OneBulkP0Mode:          oneBulkP0Mode,
 			CMPerMb:                cmPerMb,
 			NullReps:               nullReps,
+			NoNullCache:            noNullCache,
 			OutputDir:              resultsDir,
 
 			HighParentName:     highParentName,
@@ -527,7 +529,8 @@ func init() {
 	rootCmd.Flags().Bool("no-split-multiallelic", false, "Do not decompose multi-allelic records into biallelic records before filtering")
 	rootCmd.Flags().Bool("require-nonparent-allele", false, "One parent + one bulk modes: drop sites where the bulk has <2 reads of the allele the parent does not carry (removes non-segregating sites, but also QTL markers where the bulk is fixed for the parent's allele)")
 	rootCmd.Flags().Float64("cm-per-mb", 0, "Recombination rate for the HMM LOD, in cM per Mb. 0 = assume 1 Morgan (one crossover per meiosis) over each chromosome")
-	rootCmd.Flags().Int("null-reps", 200, "Number of simulated no-QTL genomes for the genome-wide HMM LOD and CompositeZ thresholds")
+	rootCmd.Flags().Int("null-reps", 200, "Number of simulated no-QTL genomes for the genome-wide thresholds (HMM LOD, BRM, DsiGconsensusZ, smoothed tracks)")
+	rootCmd.Flags().Bool("no-null-cache", false, "Recompute the genome-wide null instead of reusing the one cached by an earlier run on the same data and settings")
 	rootCmd.Flags().String("one-bulk-p0", "empirical", "One-bulk modes: null allele frequency of the high-parent allele. empirical = genome-wide median per polarity (absorbs reference mapping bias); theoretical = the population's expected value")
 	rootCmd.Flags().String("ref-parent", "none", "Bulks-only (2b) mode: which parent the reference genome is (high, low or none). high/low fixes allele polarity so ΔSI is signed; none (unknown, or the reference is not a parent) makes 2b use |ΔSI|. Use high/low only if the reference is that parent or the same inbred line. Ignored when a parent sample is given")
 	rootCmd.Flags().Float64("min-pooled-maf", -1, "Segregation floor for 2b/hp2b/lp2b: minimum pooled minor allele frequency of the two bulks (-1 = auto: 0.4 x expected minor AF, 0.2 for F2; 0 = off)")
@@ -541,7 +544,7 @@ func init() {
 	rootCmd.Flags().Int("min-qtl-markers", 5, "Minimum significant markers supporting a QTL")
 
 	// ------------------------------------------------- Threshold -------------------------------------------------- //
-	rootCmd.Flags().Float64("brm-alpha", 0.05, "Significance level")
+	rootCmd.Flags().Float64("brm-alpha", 0.01, "BRM genome-wide significance level (also its level in the final QTL overlap with the HMM LOD and DsiGconsensusZ p99)")
 	rootCmd.Flags().StringP("population", "m", "F2", "Population type (F2, F3, RIL, BC1H, BC1L, BC2H, BC2L, ...)")
 	rootCmd.Flags().Int("rep", 1000, "Ignored: thresholds come from the genome-wide null (--null-reps)")
 	_ = rootCmd.Flags().MarkDeprecated("rep", "thresholds now come from the genome-wide null simulation; use --null-reps")
@@ -566,7 +569,7 @@ func init() {
 
 	rootCmd.Flags().String("snpEffDB", "", "snpEff database")
 	rootCmd.Flags().String("gff", "", "gff3 file path")
-	rootCmd.Flags().Bool("gene-space-span", false, "Gene space analysis on the final QTLs' span (union of HMM LOD, BRM and CompositeZ regions) instead of their consensus core")
+	rootCmd.Flags().Bool("gene-space-span", false, "Gene space analysis on the final QTLs' span (union of HMM LOD, BRM and DsiGconsensusZ regions) instead of their consensus core")
 	rootCmd.Flags().String("cds", "", "cds file path")
 	rootCmd.Flags().StringP("reference", "r", "", "reference file path")
 	rootCmd.Flags().String("protein", "", "protein fasta path")

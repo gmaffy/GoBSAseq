@@ -123,7 +123,7 @@ func TestRawStatsGolden(t *testing.T) {
 					if err != nil {
 						t.Fatalf("%v (run with -update-golden to create)", err)
 					}
-					if !bytes.Equal(data, want) {
+					if !bytes.Equal(data, bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))) { // ignore CRLF from Windows checkouts
 						t.Errorf("%s differs from golden", file)
 					}
 				}

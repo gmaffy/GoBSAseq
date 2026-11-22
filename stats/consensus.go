@@ -7,17 +7,24 @@ import (
 	"strings"
 )
 
-// Final QTLs: consensus of the HMM LOD, BRM and CompositeZ
+// Final QTLs: consensus of the HMM LOD, BRM and DsiGconsensusZ
 // (qtl_detection_todo.md, 1.6).
 //
 // Each method contributes its significant regions on a chromosome: HMM LOD
-// and CompositeZ regions beyond their genome-wide p99 thresholds, and BRM
-// blocks at the genome-wide --brm-alpha; regions need --min-qtl-markers
-// markers. Regions of any method that overlap, or lie within the merge
-// distance of each other, form a locus. A locus is a consensus (final) QTL
-// when every available method has a region in it: all three, or BRM and
-// CompositeZ in 2b without --ref-parent (no HMM LOD). Loci with partial
-// support are reported too, labelled by their support, but are not final.
+// and DsiGconsensusZ regions beyond their genome-wide p99 thresholds, and BRM
+// blocks at the genome-wide --brm-alpha (default 0.01, the same level);
+// regions need --min-qtl-markers markers. Regions of any method that overlap,
+// or lie within the merge distance of each other, form a locus. A locus is a
+// consensus (final) QTL when every available method has a region in it: all
+// three, or BRM and DsiGconsensusZ in 2b without --ref-parent (no HMM LOD).
+// Loci with partial support are reported too, labelled by their support, but
+// are not final.
+//
+// BRM and DsiGconsensusZ both test the bulks' allele-frequency contrast (BRM's
+// z is DsiGconsensusZ's ΔSI component), so they are one line of evidence, the
+// "ΔSI family"; the HMM LOD, which models linkage along the chromosome
+// instead of averaging over a window, is the other. Evidence names the lines
+// present (FinalQTL.Evidence).
 //
 // A locus reports its span (the union of its regions) and its core: where
 // all its methods are above their thresholds at once (the intersection; the
@@ -27,13 +34,19 @@ import (
 // 1.5-LOD support interval (the markers around its maximum within 1.5 LOD of
 // it; the standard QTL support interval, and robust where the LOD is a flat
 // plateau and its maximum is arbitrary), else the BRM peak, else the
-// CompositeZ peak.
+// DsiGconsensusZ peak.
 
 // Method names, in report order.
 const (
-	methodHMM = "HMMLOD"
-	methodBRM = "BRM"
-	methodCZ  = "CompositeZ"
+	methodHMM  = "HMMLOD"
+	methodBRM  = "BRM"
+	methodDsiG = "DsiGconsensusZ"
+)
+
+// Evidence lines (FinalQTL.Evidence).
+const (
+	evidenceHMM = "HMM"
+	evidenceDSI = "ΔSI-family"
 )
 
 // MethodPeak is one method's strongest peak in a locus. Z is the
@@ -53,8 +66,13 @@ type FinalQTL struct {
 	SpanStart, SpanStop int64
 	// Consensus: every available method supports the locus.
 	Consensus bool
-	// Support: the supporting methods, e.g. "HMMLOD+BRM+CompositeZ".
+	// Support: the supporting methods, e.g. "HMMLOD+BRM+DsiGconsensusZ".
 	Support string
+	// Evidence: the independent lines of evidence among them: "HMM" (the HMM
+	// LOD) and "ΔSI-family" (BRM and/or DsiGconsensusZ), e.g.
+	// "HMM+ΔSI-family". In 2b without --ref-parent a consensus rests on the
+	// ΔSI family alone.
+	Evidence string
 	// Direction: "+" or "−" from the BRM peak (ΔSI or AFDev sign: the
 	// high-parent allele enriched in the high bulk, or depleted); "none" when
 	// BRM is polarity-free or absent; "mixed" when BRM blocks of both signs
@@ -66,7 +84,7 @@ type FinalQTL struct {
 	// there is no HMM region).
 	HMMSupportStart, HMMSupportStop int64
 	// Per-method strongest peaks; nil when the method has no region here.
-	HMM, BRM, CZ *MethodPeak
+	HMM, BRM, DsiG *MethodPeak
 	// Statistics: the individual statistics whose regions overlap the span.
 	Statistics string
 }
@@ -81,14 +99,14 @@ type consensusRegion struct {
 }
 
 // ConsensusQTLs builds the final QTL list from the smoothed markers (HMM LOD
-// and CompositeZ regions are found here at p99), the BRM blocks and the
+// and DsiGconsensusZ regions are found here at p99), the BRM blocks and the
 // individual-statistic regions (for the Statistics column). signedDSI is
 // cfg.SignedDeltaSI(bsaType); hmmOn whether the HMM LOD was computed.
 func ConsensusQTLs(smoothed []SmoothedStats, th Thresholds, brm []BRMBlock, individual []PeakIntersection,
 	signedDSI, hmmOn bool, gap int64, minMarkers int) []FinalQTL {
-	methods := []string{methodBRM, methodCZ}
+	methods := []string{methodBRM, methodDsiG}
 	if hmmOn {
-		methods = []string{methodHMM, methodBRM, methodCZ}
+		methods = []string{methodHMM, methodBRM, methodDsiG}
 	}
 	brmBy := map[string][]BRMBlock{}
 	for _, b := range brm {
@@ -120,7 +138,7 @@ func ConsensusQTLs(smoothed []SmoothedStats, th Thresholds, brm []BRMBlock, indi
 		if hmmOn && th.HMM.LODP99 > 0 {
 			rs = append(rs, regions(c.sm, methodHMM, th.HMM.LODP99, func(s SmoothedStats) float64 { return s.HMMLOD })...)
 		}
-		rs = append(rs, regions(c.sm, methodCZ, th.Z.CompositeZP99, func(s SmoothedStats) float64 { return s.CompositeZ })...)
+		rs = append(rs, regions(c.sm, methodDsiG, th.Consensus.P99, func(s SmoothedStats) float64 { return s.DsiGconsensusZ })...)
 		for _, b := range brmBy[c.chrom] {
 			rs = append(rs, consensusRegion{methodBRM, float64(b.Start), float64(b.Stop), MethodPeak{b.PeakPos, b.Peak, b.Threshold, b.PeakZ}})
 		}
@@ -161,7 +179,7 @@ func buildLocus(chrom string, rs []consensusRegion, methods []string, signedDSI 
 		}
 		return best
 	}
-	q.HMM, q.BRM, q.CZ = strongest(methodHMM), strongest(methodBRM), strongest(methodCZ)
+	q.HMM, q.BRM, q.DsiG = strongest(methodHMM), strongest(methodBRM), strongest(methodDsiG)
 
 	var support []string
 	q.Consensus = true
@@ -173,6 +191,14 @@ func buildLocus(chrom string, rs []consensusRegion, methods []string, signedDSI 
 		}
 	}
 	q.Support = strings.Join(support, "+")
+	var lines []string
+	if q.HMM != nil {
+		lines = append(lines, evidenceHMM)
+	}
+	if q.BRM != nil || q.DsiG != nil {
+		lines = append(lines, evidenceDSI)
+	}
+	q.Evidence = strings.Join(lines, "+")
 
 	switch {
 	case q.HMM != nil:
@@ -181,7 +207,7 @@ func buildLocus(chrom string, rs []consensusRegion, methods []string, signedDSI 
 	case q.BRM != nil:
 		q.LeadMethod, q.LeadPos = methodBRM, q.BRM.Pos
 	default:
-		q.LeadMethod, q.LeadPos = methodCZ, q.CZ.Pos
+		q.LeadMethod, q.LeadPos = methodDsiG, q.DsiG.Pos
 	}
 
 	q.Direction = "none"

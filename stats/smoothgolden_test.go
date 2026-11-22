@@ -70,8 +70,7 @@ func dumpSmoothed(sm []SmoothedStats) []byte {
 		fmt.Fprintln(&b, s.CHROM, s.POS, s.Depth, s.HighDepth, s.LowDepth, g(s.NEff),
 			g(s.SmHighSI), g(s.SmLowSI), g(s.SmDeltaSI), g(s.SmGstat), g(s.SmED),
 			g(s.OneBulkP0), g(s.SmAFDev), g(s.SmOneBulkG), g(s.HMMLOD),
-			g(s.ZHighSI), g(s.ZLowSI), g(s.ZDeltaSI), g(s.ZGstat), g(s.ZED),
-			g(s.ZAFDev), g(s.ZOneBulkG), g(s.CompositeZ), g(s.MaxAbsZ))
+			g(s.NZDeltaSI), g(s.NZGstat), g(s.DsiGconsensusZ))
 	}
 	return b.Bytes()
 }
@@ -96,7 +95,7 @@ func TestSmoothGolden(t *testing.T) {
 				}
 				computeHMMLOD(setup, raw, newMarkerOrder(raw))
 			}
-			sm, err := SmoothAndNormalise(cfg, tc.mode, raw)
+			sm, err := SmoothAndNormalise(cfg, tc.mode, raw, Thresholds{}) // smoothing only: no null model
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -116,7 +115,7 @@ func TestSmoothGolden(t *testing.T) {
 				if err != nil {
 					t.Fatalf("%v (run with -update-golden to create)", err)
 				}
-				if !bytes.Equal(data, want) {
+				if !bytes.Equal(data, bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))) { // ignore CRLF from Windows checkouts
 					t.Errorf("%s differs from golden", file)
 				}
 			}

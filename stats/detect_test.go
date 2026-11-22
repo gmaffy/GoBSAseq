@@ -116,7 +116,7 @@ func TestDetectionDeterministic(t *testing.T) {
 			if (i >= 10 && i < 20) || (i >= 40 && i < 50) {
 				v = 20
 			}
-			sm = append(sm, SmoothedStats{CHROM: c, POS: int64(10_000 * (i + 1)), SmGstat: v, CompositeZ: v, HMMLOD: v, SmDeltaSI: v / 40})
+			sm = append(sm, SmoothedStats{CHROM: c, POS: int64(10_000 * (i + 1)), SmGstat: v, DsiGconsensusZ: v, HMMLOD: v, SmDeltaSI: v / 40})
 		}
 	}
 	var th Thresholds
@@ -124,11 +124,11 @@ func TestDetectionDeterministic(t *testing.T) {
 	th.TwoBulk.DeltaSIP99, th.TwoBulk.DeltaSIP95, th.TwoBulk.DeltaSIMp99, th.TwoBulk.DeltaSIMp95 = 0.3, 0.2, -0.3, -0.2
 	th.TwoBulk.ED4P99, th.TwoBulk.ED4P95 = 1, 1
 	th.HMM.LODP99, th.HMM.LODP95 = 5, 4
-	th.Z.CompositeZP99, th.Z.CompositeZP95 = 10, 5
+	th.Consensus.P99, th.Consensus.P95 = 10, 5
 	_, q0 := DetectIndividualQTLs(sm, th, "2p2b", true, 1000, 5)
-	c0 := DetectCompositeZQTLs(sm, th, 1000, 5)
+	c0 := DetectDsiGconsensusZQTLs(sm, th, 1000, 5)
 	if len(q0) != 6 || len(c0) != 6 {
-		t.Fatalf("individual %d, CompositeZ %d, want 6 each", len(q0), len(c0))
+		t.Fatalf("individual %d, DsiGconsensusZ %d, want 6 each", len(q0), len(c0))
 	}
 	for i := 1; i < len(q0); i++ {
 		a, b := q0[i-1], q0[i]
@@ -138,7 +138,7 @@ func TestDetectionDeterministic(t *testing.T) {
 	}
 	for range 5 {
 		_, q := DetectIndividualQTLs(sm, th, "2p2b", true, 1000, 5)
-		c := DetectCompositeZQTLs(sm, th, 1000, 5)
+		c := DetectDsiGconsensusZQTLs(sm, th, 1000, 5)
 		if !reflect.DeepEqual(q, q0) || !reflect.DeepEqual(c, c0) {
 			t.Fatal("detection output differs between runs")
 		}
@@ -150,8 +150,8 @@ func TestQTLWritersReturnErrors(t *testing.T) {
 	if err := WriteIndividualQTLs([]ConsolidatedQTL{{Chrom: "c"}}, "2p2b", bad); err == nil {
 		t.Error("individual: expected an error")
 	}
-	if err := WriteCompositeZQTLs([]PeakIntersection{{Chrom: "c"}}, bad); err == nil {
-		t.Error("CompositeZ: expected an error")
+	if err := WriteDsiGconsensusZQTLs([]PeakIntersection{{Chrom: "c"}}, bad); err == nil {
+		t.Error("DsiGconsensusZ: expected an error")
 	}
 	if err := WriteFinalQTLs([]FinalQTL{{Chrom: "c", BRM: &MethodPeak{Z: math.NaN()}}}, bad); err == nil {
 		t.Error("final: expected an error")
@@ -166,11 +166,11 @@ func TestQTLWritersReturnErrors(t *testing.T) {
 	if b, err := os.ReadFile(filepath.Join(filepath.Dir(good), "ind.tsv")); err != nil || !strings.Contains(string(b), "p95 (suggestive)\t+") {
 		t.Fatalf("individual TSV: %q, %v", b, err)
 	}
-	if err := WriteCompositeZQTLs([]PeakIntersection{{Chrom: "c", ThresholdLevel: "p99", PeakPos: 7, PeakValue: 20}}, filepath.Join(filepath.Dir(good), "cz.xlsx")); err != nil {
+	if err := WriteDsiGconsensusZQTLs([]PeakIntersection{{Chrom: "c", ThresholdLevel: "p99", PeakPos: 7, PeakValue: 20}}, filepath.Join(filepath.Dir(good), "cz.xlsx")); err != nil {
 		t.Fatal(err)
 	}
 	if b, err := os.ReadFile(filepath.Join(filepath.Dir(good), "cz.tsv")); err != nil || !strings.Contains(string(b), "p99\t7\t20") {
-		t.Fatalf("CompositeZ TSV: %q, %v", b, err)
+		t.Fatalf("DsiGconsensusZ TSV: %q, %v", b, err)
 	}
 	for _, f := range []string{good, strings.TrimSuffix(good, ".xlsx") + ".tsv"} {
 		if fi, err := os.Stat(f); err != nil || fi.Size() == 0 {

@@ -189,7 +189,7 @@ func TestOneBulkP0IgnoresCommonShift(t *testing.T) {
 }
 
 // The HMM LOD is computed in the raw stage, written to the raw TSV, and
-// carried unsmoothed into the smoothed output (no Z, not in CompositeZ).
+// carried unsmoothed into the smoothed output (not in DsiGconsensusZ).
 func TestHMMLODRawColumnCarriedThrough(t *testing.T) {
 	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), RefParent: "high", Population: "F2", HighBulkSize: 20, LowBulkSize: 20,
 		WindowSize: 2_000_000}
@@ -233,7 +233,7 @@ func TestHMMLODRawColumnCarriedThrough(t *testing.T) {
 	if maxLOD < 3 {
 		t.Fatalf("max HMM LOD %v: want a clear peak", maxLOD)
 	}
-	sm, err := SmoothAndNormalise(cfg, "2b", raw)
+	sm, err := SmoothAndNormalise(cfg, "2b", raw, Thresholds{})
 	if err != nil || len(sm) == 0 {
 		t.Fatal(err, len(sm))
 	}

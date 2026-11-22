@@ -37,10 +37,10 @@ func WriteIndividualQTLs(qtls []ConsolidatedQTL, bsaType string, filename string
 	return writeTable(filename, header, rows)
 }
 
-// WriteCompositeZQTLs writes the CompositeZ QTLs to filename (.xlsx) and the
-// same path with a .tsv extension.
-func WriteCompositeZQTLs(peaks []PeakIntersection, filename string) error {
-	header := []string{"Chrom", "Start", "End", "Threshold", "CompositeZ_Pos", "CompositeZ_Value"}
+// WriteDsiGconsensusZQTLs writes the DsiGconsensusZ QTLs to filename (.xlsx)
+// and the same path with a .tsv extension.
+func WriteDsiGconsensusZQTLs(peaks []PeakIntersection, filename string) error {
+	header := []string{"Chrom", "Start", "End", "Threshold", "DsiGconsensusZ_Pos", "DsiGconsensusZ_Value"}
 	rows := make([][]interface{}, 0, len(peaks))
 	for _, p := range peaks {
 		rows = append(rows, []interface{}{p.Chrom, bp(p.Start), bp(p.End), levelLabel(p.ThresholdLevel), p.PeakPos, p.PeakValue})
@@ -49,11 +49,11 @@ func WriteCompositeZQTLs(peaks []PeakIntersection, filename string) error {
 }
 
 // finalHeader and finalRow define the final QTL table (Excel and TSV).
-var finalHeader = []string{"Chrom", "Start", "Stop", "Span_Start", "Span_Stop", "Consensus", "Support", "Direction",
+var finalHeader = []string{"Chrom", "Start", "Stop", "Span_Start", "Span_Stop", "Consensus", "Support", "Evidence", "Direction",
 	"Lead_Method", "Lead_Pos",
 	"HMMLOD_Pos", "HMMLOD_Value", "HMMLOD_Threshold", "HMMLOD_Support_Start", "HMMLOD_Support_Stop",
 	"BRM_Pos", "BRM_Peak", "BRM_Threshold", "BRM_Z",
-	"CompositeZ_Pos", "CompositeZ_Value", "CompositeZ_Threshold",
+	"DsiGconsensusZ_Pos", "DsiGconsensusZ_Value", "DsiGconsensusZ_Threshold",
 	"Statistics"}
 
 func finalRow(q FinalQTL) []interface{} {
@@ -61,7 +61,7 @@ func finalRow(q FinalQTL) []interface{} {
 	if q.Consensus {
 		cons = "yes"
 	}
-	row := []interface{}{q.Chrom, q.Start, q.Stop, q.SpanStart, q.SpanStop, cons, q.Support, q.Direction, q.LeadMethod, q.LeadPos}
+	row := []interface{}{q.Chrom, q.Start, q.Stop, q.SpanStart, q.SpanStop, cons, q.Support, q.Evidence, q.Direction, q.LeadMethod, q.LeadPos}
 	peak := func(p *MethodPeak, withZ bool) {
 		switch {
 		case p == nil && withZ:
@@ -81,7 +81,7 @@ func finalRow(q FinalQTL) []interface{} {
 		row = append(row, "", "")
 	}
 	peak(q.BRM, true)
-	peak(q.CZ, false)
+	peak(q.DsiG, false)
 	return append(row, q.Statistics)
 }
 

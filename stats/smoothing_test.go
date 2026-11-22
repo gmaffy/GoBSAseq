@@ -5,7 +5,6 @@ import (
 	"math"
 	"math/rand"
 	"os"
-	"sort"
 	"testing"
 
 	"github.com/fatih/color"
@@ -101,40 +100,6 @@ func TestSmoothChromosomesIndependentAndSparseDropped(t *testing.T) {
 	}
 }
 
-func TestRobustZScores(t *testing.T) {
-	// median 3, |dev| = 2 1 0 1 2 → MAD 1 → scale 1.4826.
-	z := robustZScores([]float64{1, 2, 3, 4, 5})
-	for i, want := range []float64{-2 / 1.4826, -1 / 1.4826, 0, 1 / 1.4826, 2 / 1.4826} {
-		if math.Abs(z[i]-want) > 1e-6 {
-			t.Fatalf("z[%d] = %v, want %v", i, z[i], want)
-		}
-	}
-	// MAD = 0 → classical Z (population SD).
-	z = robustZScores([]float64{0, 0, 0, 0, 4})
-	if math.Abs(z[4]-2) > 1e-6 || math.Abs(z[0]+0.5) > 1e-6 {
-		t.Fatalf("MAD=0 fallback = %v, want [-0.5 … 2]", z)
-	}
-	if z := robustZScores([]float64{7, 7, 7}); z[0] != 0 || z[2] != 0 {
-		t.Fatalf("constant input = %v, want zeros", z)
-	}
-}
-
-// countZStats (used by the CompositeZ null) must match the number of Z-scores
-// consolidate actually combines. With every component Z = 1, CompositeZ = √k.
-func TestCompositeZStatCountMatchesConsolidate(t *testing.T) {
-	for _, m := range allModes {
-		hb, lb, _, _ := BulkFlags(m.mode)
-		for _, hmm := range []bool{true, false} { // the HMM LOD never enters CompositeZ
-			sm := []SmoothedStats{{ZDeltaSI: 1, ZGstat: 1, ZAFDev: 1, ZOneBulkG: 1, HMMLOD: 5}}
-			consolidate(sm, smoothLayout{highBulk: hb, lowBulk: lb, signedDSI: true, hmm: hmm}, nil)
-			k := int(math.Round(sm[0].CompositeZ * sm[0].CompositeZ))
-			if k != countZStats(m.mode) || k != 2 {
-				t.Errorf("%s hmm=%v: consolidate combines %d Z-scores, countZStats says %d (want 2)", m.mode, hmm, k, countZStats(m.mode))
-			}
-		}
-	}
-}
-
 func TestWriteSmoothedTSVReportsWriteErrors(t *testing.T) {
 	if _, err := os.Stat("/dev/full"); err != nil {
 		t.Skip("/dev/full not available")
@@ -206,23 +171,6 @@ func TestSmoothDropsIsolatedMarkerByNEff(t *testing.T) {
 	}
 }
 
-// SI Z-scores enter MaxAbsZ only in one-bulk modes; two-bulk modes do not
-// normalise SI (ΔSI carries the contrast).
-func TestMaxAbsZSIOnlyInOneBulk(t *testing.T) {
-	sm := []SmoothedStats{{ZHighSI: 10, ZLowSI: -9, ZDeltaSI: 1, ZGstat: 1}}
-	for _, signed := range []bool{true, false} {
-		consolidate(sm, smoothLayout{highBulk: true, lowBulk: true, signedDSI: signed, hmm: true}, nil)
-		if sm[0].MaxAbsZ != 1 {
-			t.Fatalf("two-bulk MaxAbsZ = %v (signed %v), want 1", sm[0].MaxAbsZ, signed)
-		}
-	}
-	one := []SmoothedStats{{ZHighSI: 10, ZAFDev: 1}}
-	consolidate(one, smoothLayout{highBulk: true, signedDSI: true, hmm: true}, nil)
-	if one[0].MaxAbsZ != 10 {
-		t.Fatalf("one-bulk MaxAbsZ = %v, want 10", one[0].MaxAbsZ)
-	}
-}
-
 // Loess (local quadratic) reproduces a quadratic exactly, including at the
 // chromosome ends, where a local average is biased.
 func TestLoessReproducesQuadratic(t *testing.T) {
@@ -245,8 +193,9 @@ func TestLoessReproducesQuadratic(t *testing.T) {
 	}
 }
 
-// G′: tricube-weighted mean over ±h (h = 2·bw) with marker weights; checked
-// by hand at one marker.
+// G′: plain tricube mean over ±h (h = 2·bw), as Magwene's G′ — marker
+// (depth) weights do not enter, since per-site G already grows with depth;
+// checked by hand at one marker.
 func TestGPrimeTricube(t *testing.T) {
 	color.Output = io.Discard
 	bw := 1000.0 // h = 2000
@@ -265,7 +214,7 @@ func TestGPrimeTricube(t *testing.T) {
 		if d >= 1 {
 			continue
 		}
-		w := float64(r.Depth) * math.Pow(1-d*d*d, 3)
+		w := math.Pow(1-d*d*d, 3) // no depth weight
 		num += w * r.Gstat
 		den += w
 	}
@@ -308,23 +257,6 @@ func TestLoessFallbackAndClamp(t *testing.T) {
 	for _, s := range sm {
 		if s.SmED < 0 {
 			t.Fatalf("negative smoothed ED⁴ %v at %d", s.SmED, s.POS)
-		}
-	}
-}
-
-// robustZField (in place, one buffer) gives exactly robustZScores' values.
-func TestRobustZFieldMatchesRobustZScores(t *testing.T) {
-	for _, vals := range [][]float64{{1, 5, 2, 8, 3, 3, 9, 0.5}, {0, 0, 0, 0, 4}, {7, 7, 7}} {
-		sm := make([]SmoothedStats, len(vals))
-		for i, v := range vals {
-			sm[i].SmGstat = v
-		}
-		robustZField(sm, zField{func(s *SmoothedStats) float64 { return s.SmGstat }, func(s *SmoothedStats, v float64) { s.ZGstat = v }, false}, make([]float64, len(sm)))
-		want := robustZScores(vals)
-		for i := range sm {
-			if sm[i].ZGstat != want[i] {
-				t.Fatalf("%v: z[%d] = %v, want %v", vals, i, sm[i].ZGstat, want[i])
-			}
 		}
 	}
 }
@@ -449,50 +381,6 @@ func TestShortContigNoEdgeFit(t *testing.T) {
 	}
 }
 
-// robustZScores is an independent reference implementation of the robust
-// Z-score (copies and sorts its own data), used to check robustZField.
-func robustZScores(vals []float64) []float64 {
-	n := len(vals)
-	if n == 0 {
-		return nil
-	}
-	median := func(v []float64) float64 {
-		s := append([]float64(nil), v...)
-		sort.Float64s(s)
-		if len(s)%2 == 1 {
-			return s[len(s)/2]
-		}
-		return (s[len(s)/2-1] + s[len(s)/2]) / 2
-	}
-	med := median(vals)
-	dev := make([]float64, n)
-	for i, v := range vals {
-		dev[i] = math.Abs(v - med)
-	}
-	mad := median(dev) * 1.4826
-	zs := make([]float64, n)
-	if mad > 0 {
-		for i, v := range vals {
-			zs[i] = (v - med) / mad
-		}
-		return zs
-	}
-	mean, variance := 0.0, 0.0
-	for _, v := range vals {
-		mean += v
-	}
-	mean /= float64(n)
-	for _, v := range vals {
-		variance += (v - mean) * (v - mean)
-	}
-	if sd := math.Sqrt(variance / float64(n)); sd > 0 {
-		for i, v := range vals {
-			zs[i] = (v - mean) / sd
-		}
-	}
-	return zs
-}
-
 // Markers all at one position (a multi-allelic site split on a tiny contig)
 // with a grid step set: no crash. They are one site (NEff 1), so all are
 // dropped as too sparse.
@@ -559,28 +447,6 @@ func TestUnitsOnlyWhenNeeded(t *testing.T) {
 	}
 }
 
-// logZ: the robust Z of log(x + c), c = 10% of the median, matches the
-// reference applied to the transformed values (zeros stay finite).
-func TestRobustZFieldLog(t *testing.T) {
-	vals := []float64{0, 0.5, 1, 2, 4, 8, 16, 3, 1.5}
-	sm := make([]SmoothedStats, len(vals))
-	for i, v := range vals {
-		sm[i].SmED = v
-	}
-	robustZField(sm, zField{func(s *SmoothedStats) float64 { return s.SmED }, func(s *SmoothedStats, v float64) { s.ZED = v }, true}, make([]float64, len(sm)))
-	c := 0.1 * 2.0 // median of vals is 2
-	logged := make([]float64, len(vals))
-	for i, v := range vals {
-		logged[i] = math.Log(v + c)
-	}
-	want := robustZScores(logged)
-	for i := range sm {
-		if math.IsInf(sm[i].ZED, 0) || math.Abs(sm[i].ZED-want[i]) > 1e-12 {
-			t.Fatalf("z[%d] = %v, want %v", i, sm[i].ZED, want[i])
-		}
-	}
-}
-
 // Views sharing a position: only the deepest represents it, in the kernels
 // (smoothed values equal those with the shallower view removed) and in the
 // marker order.
@@ -612,44 +478,6 @@ func TestDeepestViewRepresentsPosition(t *testing.T) {
 		if math.Abs(a[ai].SmHighSI-s.SmHighSI) > 1e-12 || math.Abs(a[ai].NEff-s.NEff) > 1e-9 {
 			t.Fatalf("at %d: %v (NEff %v) with both views, %v (NEff %v) with the deep view only", s.POS, a[ai].SmHighSI, a[ai].NEff, s.SmHighSI, s.NEff)
 		}
-	}
-}
-
-// MaxAbsZ: |Z| for signed tracks, positive part for one-sided tracks (a very
-// low G′ is not evidence).
-func TestMaxAbsZOneSided(t *testing.T) {
-	lay := smoothLayout{highBulk: true, lowBulk: true, signedDSI: true, hmm: true}
-	sm := []SmoothedStats{{ZDeltaSI: -2, ZGstat: -9, ZED: -12, HMMLOD: 40}} // HMM LOD is not in MaxAbsZ
-	consolidate(sm, lay, nil)
-	if sm[0].MaxAbsZ != 2 {
-		t.Fatalf("MaxAbsZ = %v, want 2 (|ZΔSI|; low G′/ED⁴ ignored)", sm[0].MaxAbsZ)
-	}
-	sm = []SmoothedStats{{ZDeltaSI: -2, ZGstat: 5}}
-	consolidate(sm, lay, nil)
-	if sm[0].MaxAbsZ != 5 {
-		t.Fatalf("MaxAbsZ = %v, want 5", sm[0].MaxAbsZ)
-	}
-}
-
-// CompositeZ uses the untransformed robust Z of the log-Z track G′, while its
-// Z column stays log-based; the HMM LOD is not part of CompositeZ.
-func TestCompositeZUsesUntransformedZ(t *testing.T) {
-	lay := smoothLayout{highBulk: true, lowBulk: true, signedDSI: true, hmm: true}
-	tracks := lay.tracks()
-	scales := make([]zScale, len(tracks))
-	for i, tr := range tracks {
-		if tr.smCol == "Sm_Gstat" {
-			scales[i] = zScale{center: 3, scale: 1, set: true}
-		}
-	}
-	sm := []SmoothedStats{{SmGstat: 5, ZGstat: 0.4, HMMLOD: 20, ZDeltaSI: -1}}
-	consolidate(sm, lay, scales)
-	want := (1 + 2) / math.Sqrt(2) // |ZΔSI| + (5−3)/1
-	if math.Abs(sm[0].CompositeZ-want) > 1e-12 {
-		t.Fatalf("CompositeZ = %v, want %v", sm[0].CompositeZ, want)
-	}
-	if sm[0].ZGstat != 0.4 {
-		t.Fatal("Z column was changed")
 	}
 }
 

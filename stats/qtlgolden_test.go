@@ -14,7 +14,7 @@ import (
 
 // qtlGoldenInput: three chromosomes of smooth bumps (Gaussian in position):
 // chr1 a "+" QTL supported by every statistic, chr2 a "−" QTL, chr3 an HMM
-// LOD plateau with a small CompositeZ blip elsewhere (partial support).
+// LOD plateau with a small DsiGconsensusZ blip elsewhere (partial support).
 func qtlGoldenInput() []SmoothedStats {
 	bump := func(x, mu, sd float64) float64 { return math.Exp(-0.5 * (x - mu) * (x - mu) / (sd * sd)) }
 	var sm []SmoothedStats
@@ -26,15 +26,15 @@ func qtlGoldenInput() []SmoothedStats {
 			switch c {
 			case "chr1":
 				b := bump(x, 8e6, 1.5e6)
-				s.SmDeltaSI, s.SmGstat, s.SmED, s.HMMLOD, s.CompositeZ = 0.5*b, 20*b, 0.3*b*b, 15*b, 25*b
+				s.SmDeltaSI, s.SmGstat, s.SmED, s.HMMLOD, s.DsiGconsensusZ = 0.5*b, 20*b, 0.3*b*b, 15*b, 25*b
 			case "chr2":
 				b := bump(x, 12e6, 1e6)
-				s.SmDeltaSI, s.SmGstat, s.SmED, s.HMMLOD, s.CompositeZ = -0.45*b, 16*b, 0.2*b*b, 12*b, 18*b
+				s.SmDeltaSI, s.SmGstat, s.SmED, s.HMMLOD, s.DsiGconsensusZ = -0.45*b, 16*b, 0.2*b*b, 12*b, 18*b
 			case "chr3":
 				if x > 4e6 && x < 7e6 {
 					s.HMMLOD = 9 + 0.2*math.Sin(x/1e5) // plateau
 				}
-				s.CompositeZ = 14 * bump(x, 15e6, 3e5)
+				s.DsiGconsensusZ = 14 * bump(x, 15e6, 3e5)
 			}
 			s.SmHighSI, s.SmLowSI = 0.5+s.SmDeltaSI/2, 0.5-s.SmDeltaSI/2
 			sm = append(sm, s)
@@ -53,14 +53,14 @@ func TestQTLGolden(t *testing.T) {
 	tb.DeltaSIP99, tb.DeltaSIP95, tb.DeltaSIMp99, tb.DeltaSIMp95 = 0.3, 0.25, -0.3, -0.25
 	tb.GstatP99, tb.GstatP95, tb.ED4P99, tb.ED4P95 = 10, 8, 0.1, 0.08
 	th.HMM.LODP99, th.HMM.LODP95 = 5, 4
-	th.Z.CompositeZP99, th.Z.CompositeZP95 = 12, 9
+	th.Consensus.P99, th.Consensus.P95 = 12, 9
 	th.BRMU, th.BRMAlpha, th.Rho = 3, 0.05, 0.01
 	cfg := utils.AnalysisConfig{OutputDir: t.TempDir(), Population: "F2", HighBulkSize: 20, LowBulkSize: 20, BrmAlpha: 0.05,
 		RefParent: "high", MinQTLMarkers: 5}
 	gap, minM := int64(1_000_000), cfg.EffectiveMinQTLMarkers()
 
 	peaks, ind := DetectIndividualQTLs(sm, th, "2p2b", true, gap, minM)
-	cz := DetectCompositeZQTLs(sm, th, gap, minM)
+	cz := DetectDsiGconsensusZQTLs(sm, th, gap, minM)
 	brm, err := RunBRM(cfg, "2p2b", sm, th)
 	if err != nil {
 		t.Fatal(err)
@@ -69,9 +69,9 @@ func TestQTLGolden(t *testing.T) {
 
 	dir := t.TempDir()
 	write := map[string]func(string) error{
-		"individual": func(p string) error { return WriteIndividualQTLs(ind, "2p2b", p) },
-		"compositez": func(p string) error { return WriteCompositeZQTLs(cz, p) },
-		"final":      func(p string) error { return WriteFinalQTLs(final, p) },
+		"individual":     func(p string) error { return WriteIndividualQTLs(ind, "2p2b", p) },
+		"dsigconsensusz": func(p string) error { return WriteDsiGconsensusZQTLs(cz, p) },
+		"final":          func(p string) error { return WriteFinalQTLs(final, p) },
 	}
 	for name, w := range write {
 		if err := w(filepath.Join(dir, name+".xlsx")); err != nil {
@@ -95,7 +95,7 @@ func TestQTLGolden(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%v (run with -update-golden to create)", err)
 		}
-		if !bytes.Equal(got, want) {
+		if !bytes.Equal(got, bytes.ReplaceAll(want, []byte("\r\n"), []byte("\n"))) { // ignore CRLF from Windows checkouts
 			t.Errorf("%s.tsv differs from golden:\n%s", name, got)
 		}
 	}

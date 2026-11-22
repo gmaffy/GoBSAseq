@@ -43,16 +43,3 @@ func TestAbsDeltaSITracks(t *testing.T) {
 		t.Fatalf("unexpected |ΔSI| track set %v", names)
 	}
 }
-
-func TestConsolidateAbsDeltaSINotFolded(t *testing.T) {
-	// 2b without --ref-parent: no HMM, so k = 2.
-	sm := []SmoothedStats{{ZDeltaSI: -2, ZGstat: 0}}
-	consolidate(sm, smoothLayout{highBulk: true, lowBulk: true}, nil)
-	if want := -2 / math.Sqrt(2); math.Abs(sm[0].CompositeZ-want) > 1e-6 {
-		t.Fatalf("unsigned CompositeZ = %v, want %v (Z(|ΔSI|) not folded)", sm[0].CompositeZ, want)
-	}
-	consolidate(sm, smoothLayout{highBulk: true, lowBulk: true, signedDSI: true, hmm: true}, nil)
-	if want := 2 / math.Sqrt(2); math.Abs(sm[0].CompositeZ-want) > 1e-6 {
-		t.Fatalf("signed CompositeZ = %v, want %v", sm[0].CompositeZ, want)
-	}
-}

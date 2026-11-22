@@ -7,7 +7,7 @@ import (
 )
 
 // QTL interval merging. Every merge in QTL detection (individual-statistic
-// QTLs, CompositeZ regions, BRM blocks, consensus loci) goes through
+// QTLs, DsiGconsensusZ regions, BRM blocks, consensus loci) goes through
 // mergeRuns.
 
 // mergeRuns sorts items by chromosome, then start (stable), and joins each

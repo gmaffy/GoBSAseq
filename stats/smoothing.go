@@ -63,28 +63,31 @@ type SmoothedStats struct {
 	// HMMLOD is the pool-HMM LOD at the site, computed in raw stats (hmm.go):
 	// two-bulk, bulks differ; one-bulk, the bulk deviates from p0. A separate
 	// track in LOD units: carried through unsmoothed, not normalised, not in
-	// CompositeZ. 0 where the HMM is not computed (2b without --ref-parent).
+	// DsiGconsensusZ. 0 where the HMM is not computed (2b without --ref-parent).
 	HMMLOD float64
 
-	// ── robust Z-scores of smoothed values ──────────────────────────────
-	ZHighSI   float64
-	ZLowSI    float64
-	ZDeltaSI  float64
-	ZGstat    float64
-	ZED       float64
-	ZAFDev    float64
-	ZOneBulkG float64
-
-	// ── consolidated scores ──────────────────────────────────────────────
-	// CompositeZ = (|ZDeltaSI| + ZGstat) / √2 in two-bulk modes (see
-	// consolidate). It is not bounded below: ZGstat is negative where G′ is
-	// under the genome-wide median.
-	CompositeZ float64
-	// max|Z| across all valid statistics (unsigned)
-	MaxAbsZ float64
+	// ── null-standardised scores (dsigconsensus.go) ──────────────────────
+	// Standardised against the genome-wide null simulation at the marker, not
+	// against the genome's own spread; zero when no null model is available.
+	//
+	// NZDeltaSI: the ΔSI-family z = signal/σ (BRM's statistic: smoothed
+	// signed ΔSI; one-bulk SmAFDev; 2b without --ref-parent the polarity-free
+	// √ΔSI²c, ≥ 0), rescaled to unit root-mean-square over the null genomes.
+	NZDeltaSI float64
+	// NZGstat: G′ (one-bulk G1) standardised by its null mean and SD at the
+	// marker, as a normal score (N(0, 1) under the null).
+	NZGstat float64
+	// DsiGconsensusZ combines the ΔSI evidence (NZDeltaSI², either direction)
+	// and NZGstat, each as a one-sided normal score, by Stouffer's method
+	// corrected for their null correlation r: (s₁ + s₂)/√(2 + 2r).
+	DsiGconsensusZ float64
 }
 
-func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats) ([]SmoothedStats, error) {
+// SmoothAndNormalise smooths the raw statistics, standardises the ΔSI and G
+// tracks against the genome-wide null in th and fills DsiGconsensusZ, and
+// writes stats/GoBSAseq.<bsaType>.smoothed_and_normalised.tsv. th comes from
+// CalculateThresholds on the same raw statistics.
+func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSAstats, th Thresholds) ([]SmoothedStats, error) {
 	if len(rawStats) == 0 {
 		return nil, fmt.Errorf("no raw stats supplied to SmoothAndNormalise")
 	}
@@ -102,6 +105,9 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 	if err != nil {
 		return nil, err
 	}
+	if err := applyDsiGConsensus(cfg, bsaType, smoothed, th); err != nil {
+		return nil, err
+	}
 
 	outDir := filepath.Join(cfg.OutputDir, "stats")
 	if err := os.MkdirAll(outDir, 0775); err != nil {
@@ -116,9 +122,9 @@ func SmoothAndNormalise(cfg utils.AnalysisConfig, bsaType string, rawStats []BSA
 	return smoothed, nil
 }
 
-// scorer runs the in-memory scoring pipeline (kernel smoothing → robust Z →
-// CompositeZ) on raw stats whose HMMLOD is already filled. The real data and every null-simulation replicate
-// go through it, so thresholds are calibrated on exactly what is scanned.
+// scorer runs the in-memory kernel smoothing on raw stats whose HMMLOD is
+// already filled. The real data and every null-simulation replicate go
+// through it, so thresholds are calibrated on exactly what is scanned.
 type scorer struct {
 	bw      float64
 	step    float64 // smoothing grid spacing (gridStep)
@@ -149,10 +155,11 @@ func newScorer(cfg utils.AnalysisConfig, bsaType string) (*scorer, error) {
 	return sc, nil
 }
 
-// score returns the smoothed, normalised and consolidated markers (HMMLOD is
-// carried from raw, where RawStats or the null simulation computed it). report prints the sparse-marker summary. every > 1
-// smooths only every n-th marker of each chromosome (all markers still feed
-// the kernel); the null simulation uses it, since it only samples CompositeZ.
+// score returns the smoothed markers (HMMLOD is carried from raw, where
+// RawStats or the null simulation computed it). report prints the
+// sparse-marker summary. every > 1 smooths only every n-th marker of each
+// chromosome (all markers still feed the kernel); the null simulation uses
+// it, since it only needs each track's genome-wide extremes.
 func (sc *scorer) score(raw []BSAstats, report bool, every int) ([]SmoothedStats, error) {
 	return sc.scoreOrdered(raw, newMarkerOrder(raw), report, every)
 }
@@ -162,14 +169,14 @@ func (sc *scorer) score(raw []BSAstats, report bool, every int) ([]SmoothedStats
 // same). With every > 1 the output is compact and in chromosome order, not
 // input order.
 func (sc *scorer) scoreOrdered(raw []BSAstats, order *markerOrder, report bool, every int) ([]SmoothedStats, error) {
-	smoothed, err := gaussianSmoothOpts(raw, smoothOpts{bw: sc.bw, step: sc.step, weight: sc.weight,
-		lay: sc.lay, report: report, every: every, order: order, readVar: sc.readVar})
-	if err != nil {
-		return nil, err
-	}
-	compScales := normalise(smoothed, sc.lay)
-	consolidate(smoothed, sc.lay, compScales)
-	return smoothed, nil
+	return sc.scoreWorkers(raw, order, report, every, 0)
+}
+
+// scoreWorkers is scoreOrdered on at most workers goroutines (0 = every
+// core); the null simulation runs several replicates at once, each on few.
+func (sc *scorer) scoreWorkers(raw []BSAstats, order *markerOrder, report bool, every, workers int) ([]SmoothedStats, error) {
+	return gaussianSmoothOpts(raw, smoothOpts{bw: sc.bw, step: sc.step, weight: sc.weight,
+		lay: sc.lay, report: report, every: every, order: order, readVar: sc.readVar, workers: workers})
 }
 
 // ─── smoothing ─────────────────────────────────────────────────────────────────
@@ -312,10 +319,12 @@ const (
 	// cuts the kernel off (see edgeBlend), which removes the average's bias
 	// toward the interior there.
 	kGauss smoothKernel = iota
-	// kTricube: tricube kernel average over ±h, Magwene's G′ (G, G1).
+	// kTricube: plain tricube kernel average over ±h, Magwene's G′ (G, G1),
+	// as QTLseqr computes it. No marker weights: per-site G already grows
+	// with depth, so depth weights would count deep sites twice.
 	kTricube
-	// kLoess: local quadratic regression with tricube weights over ±h, as in
-	// MMAPPR's loess of ED⁴.
+	// kLoess: local quadratic regression with plain tricube weights over ±h,
+	// as in MMAPPR's loess of ED⁴.
 	kLoess
 )
 
@@ -323,8 +332,7 @@ const (
 
 // smoothLayout is a mode's track layout: which bulks, whether ΔSI is signed,
 // and whether the HMM LOD is computed. Its tracks() table is the single
-// source for what is smoothed, normalised, combined into CompositeZ and
-// written to the TSV.
+// source for what is smoothed and written to the TSV.
 type smoothLayout struct {
 	highBulk, lowBulk bool
 	signedDSI         bool
@@ -334,85 +342,59 @@ type smoothLayout struct {
 func (l smoothLayout) both() bool { return l.highBulk && l.lowBulk }
 func (l smoothLayout) one() bool  { return l.highBulk != l.lowBulk }
 
-// compositeRole is a track's part in CompositeZ.
-type compositeRole uint8
-
-const (
-	notInComposite  compositeRole = iota
-	compositePlain                // + Z
-	compositeFolded               // + |Z| (signed tracks: either direction is signal)
-)
-
 // track is one output track of a layout.
 type track struct {
-	smCol, zCol string                        // TSV columns ("" = none)
-	sm          func(*SmoothedStats) *float64 // the smoothed (or carried) value
-	z           func(*SmoothedStats) *float64 // its robust Z-score; nil = not normalised
-	raw         func(*BSAstats) float64       // smoothed from this; nil = carried from the site (set in emit)
-	kernel      smoothKernel
-	lo, hi      float64 // clamp for the fitted value
-	composite   compositeRole
-	// logZ: the robust Z is taken of log(x + c), c = 10% of the track's
-	// genome-wide median. For the non-negative, right-skewed tracks (G′, G1,
-	// ED⁴, HMM LOD) the median/MAD Z assumes a symmetry they lack; on
-	// simulated no-QTL genomes the log brings G′ and ED⁴ from Bowley skew
-	// +0.36/+0.49 to +0.14/+0.17 and their largest null Z from 7.8/17.9 to
-	// 2.7 (as Magwene's log G′). The offset keeps a clamped zero ~2.3 log
-	// units below the median instead of stretching the lower tail.
-	logZ bool
+	smCol  string                        // TSV column
+	sm     func(*SmoothedStats) *float64 // the smoothed (or carried) value
+	raw    func(*BSAstats) float64       // smoothed from this; nil = carried from the site (set in emit)
+	kernel smoothKernel
+	lo, hi float64 // clamp for the fitted value
 }
 
 // tracks lists a layout's tracks in TSV column order.
 //
-//	two-bulk: HighSI, LowSI (smoothed, not normalised: ΔSI carries the
-//	          contrast), ΔSI (|ΔSI| without polarity), G′, ED⁴
-//	one-bulk: SI (smoothed and normalised), P0 (carried), AFDev, G1
+//	two-bulk: HighSI, LowSI, ΔSI (|ΔSI| without polarity), G′, ED⁴
+//	one-bulk: SI, P0 (carried), AFDev, G1
 //	both:     HMM LOD (carried: already linkage-aware) when computed
 //
-// CompositeZ = Σ of the composite tracks' Z (|Z| when folded) / √k.
+// The null-standardised NZ columns and DsiGconsensusZ follow them in the TSV
+// (consensusColumns).
 func (l smoothLayout) tracks() []track {
 	inf := math.Inf(1)
 	var t []track
-	si := func(name string, raw func(*BSAstats) float64, sm, z func(*SmoothedStats) *float64) {
-		tr := track{smCol: "Sm_" + name, sm: sm, raw: raw, kernel: kGauss, lo: 0, hi: 1}
-		if !l.both() { // SI Z-scores only in one-bulk modes
-			tr.zCol, tr.z = "Z_"+name, z
-		}
-		t = append(t, tr)
-	}
 	if l.highBulk {
-		si("HighSI", func(s *BSAstats) float64 { return s.HighSI },
-			func(s *SmoothedStats) *float64 { return &s.SmHighSI }, func(s *SmoothedStats) *float64 { return &s.ZHighSI })
+		t = append(t, track{"Sm_HighSI", func(s *SmoothedStats) *float64 { return &s.SmHighSI },
+			func(s *BSAstats) float64 { return s.HighSI }, kGauss, 0, 1})
 	}
 	if l.lowBulk {
-		si("LowSI", func(s *BSAstats) float64 { return s.LowSI },
-			func(s *SmoothedStats) *float64 { return &s.SmLowSI }, func(s *SmoothedStats) *float64 { return &s.ZLowSI })
+		t = append(t, track{"Sm_LowSI", func(s *SmoothedStats) *float64 { return &s.SmLowSI },
+			func(s *BSAstats) float64 { return s.LowSI }, kGauss, 0, 1})
 	}
 	if l.both() {
-		name, lo, role := DeltaSIName(l.signedDSI), -1.0, compositeFolded
-		if !l.signedDSI { // |ΔSI|: already folded
-			lo, role = 0, compositePlain
+		lo := -1.0
+		if !l.signedDSI { // |ΔSI|
+			lo = 0
 		}
 		t = append(t,
-			track{"Sm_" + name, "Z_" + name, func(s *SmoothedStats) *float64 { return &s.SmDeltaSI }, func(s *SmoothedStats) *float64 { return &s.ZDeltaSI },
-				func(s *BSAstats) float64 { return s.DeltaSI }, kGauss, lo, 1, role, false},
-			track{"Sm_Gstat", "Z_Gstat", func(s *SmoothedStats) *float64 { return &s.SmGstat }, func(s *SmoothedStats) *float64 { return &s.ZGstat },
-				func(s *BSAstats) float64 { return s.Gstat }, kTricube, 0, inf, compositePlain, true},
-			track{"Sm_ED4", "Z_ED4", func(s *SmoothedStats) *float64 { return &s.SmED }, func(s *SmoothedStats) *float64 { return &s.ZED },
-				func(s *BSAstats) float64 { return s.ED }, kLoess, 0, inf, notInComposite, true},
+			track{"Sm_" + DeltaSIName(l.signedDSI), func(s *SmoothedStats) *float64 { return &s.SmDeltaSI },
+				func(s *BSAstats) float64 { return s.DeltaSI }, kGauss, lo, 1},
+			track{"Sm_Gstat", func(s *SmoothedStats) *float64 { return &s.SmGstat },
+				func(s *BSAstats) float64 { return s.Gstat }, kTricube, 0, inf},
+			track{"Sm_ED4", func(s *SmoothedStats) *float64 { return &s.SmED },
+				func(s *BSAstats) float64 { return s.ED }, kLoess, 0, inf},
 		)
 		if !l.signedDSI { // polarity-free BRM input
-			t = append(t, track{smCol: "Sm_DeltaSI2c", sm: func(s *SmoothedStats) *float64 { return &s.SmDeltaSI2 },
-				raw: deltaSI2c, kernel: kGauss, lo: -1, hi: 1})
+			t = append(t, track{"Sm_DeltaSI2c", func(s *SmoothedStats) *float64 { return &s.SmDeltaSI2 },
+				deltaSI2c, kGauss, -1, 1})
 		}
 	}
 	if l.one() {
 		t = append(t,
 			track{smCol: "P0", sm: func(s *SmoothedStats) *float64 { return &s.OneBulkP0 }},
-			track{"Sm_AFDev", "Z_AFDev", func(s *SmoothedStats) *float64 { return &s.SmAFDev }, func(s *SmoothedStats) *float64 { return &s.ZAFDev },
-				func(s *BSAstats) float64 { return s.OneBulkAFDev }, kGauss, -1, 1, compositeFolded, false},
-			track{"Sm_OneBulkGstat", "Z_OneBulkGstat", func(s *SmoothedStats) *float64 { return &s.SmOneBulkG }, func(s *SmoothedStats) *float64 { return &s.ZOneBulkG },
-				func(s *BSAstats) float64 { return s.OneBulkGstat }, kTricube, 0, inf, compositePlain, true},
+			track{"Sm_AFDev", func(s *SmoothedStats) *float64 { return &s.SmAFDev },
+				func(s *BSAstats) float64 { return s.OneBulkAFDev }, kGauss, -1, 1},
+			track{"Sm_OneBulkGstat", func(s *SmoothedStats) *float64 { return &s.SmOneBulkG },
+				func(s *BSAstats) float64 { return s.OneBulkGstat }, kTricube, 0, inf},
 		)
 	}
 	if l.hmm && (l.both() || l.one()) { // carried from raw stats; its own track only
@@ -420,10 +402,6 @@ func (l smoothLayout) tracks() []track {
 	}
 	return t
 }
-
-// oneSided reports whether only high values of a track are evidence: the
-// non-negative statistics (log-Z tracks) and |ΔSI|.
-func (tr track) oneSided() bool { return tr.logZ || tr.smCol == "Sm_AbsDeltaSI" }
 
 // deltaSI2c is a site's bias-corrected squared ΔSI: (SI_H − SI_L)² minus the
 // unbiased read-sampling variance SI(1−SI)/(d−1) of each bulk. ΔSI² does not
@@ -440,17 +418,6 @@ func deltaSI2c(s *BSAstats) float64 {
 		v -= s.LowSI * (1 - s.LowSI) / float64(s.LowDepth-1)
 	}
 	return v
-}
-
-// compositeCount is k, the number of Z-scores in CompositeZ.
-func (l smoothLayout) compositeCount() int {
-	k := 0
-	for _, tr := range l.tracks() {
-		if tr.composite != notInComposite {
-			k++
-		}
-	}
-	return k
 }
 
 // smoothField pairs a raw statistic with the smoothed field it fills; lo/hi
@@ -491,6 +458,8 @@ type smoothOpts struct {
 	// readVar, if set, gives a marker's null read variance terms (r0, r1:
 	// variance r0 + ρ·r1); the Gaussian pass then fills ReadVar0/ReadVar1.
 	readVar func(*BSAstats) (r0, r1 float64)
+	// workers bounds the goroutines smoothing query points (0 = every core).
+	workers int
 }
 
 // gridStep is the smoothing grid spacing: --step-size, capped at σ/20 so
@@ -523,10 +492,13 @@ func gaussianSmooth(raw []BSAstats, bw float64, weight func(*BSAstats) float64, 
 //	kGauss:   weights w_m = weight(m)·exp(−½(Δ/bw)²), |Δ| ≤ 3·bw; the
 //	          weighted mean, blended near chromosome ends into β0 of the
 //	          weighted linear fit x ≈ β0 + β1·Δ (edgeBlend)
-//	kTricube: Σ t_m·x_m / Σ t_m,  t_m = weight(m)·(1 − |Δ/h|³)³, |Δ| < h
-//	          (Magwene's G′)
+//	kTricube: Σ t_m·x_m / Σ t_m,  t_m = (1 − |Δ/h|³)³, |Δ| < h
+//	          (Magwene's G′; no marker weights)
 //	kLoess:   β0 of the weighted fit x ≈ β0 + β1·u + β2·u², u = Δ/h,
 //	          weights t_m (local quadratic, as R's loess)
+//
+// Each position counts once in every kernel (the representative view of a
+// split multi-allelic site).
 //
 // h = 2·bw = WindowSize (QTLseqr's windowSize). Fitted values are clamped to
 // each statistic's range. Markers whose effective number of markers under the
@@ -576,7 +548,10 @@ func gaussianSmoothOpts(raw []BSAstats, o smoothOpts) ([]SmoothedStats, error) {
 		c      *chromWork
 		done   *sync.WaitGroup
 	}
-	workers := max(runtime.GOMAXPROCS(0), 1)
+	workers := o.workers
+	if workers <= 0 {
+		workers = max(runtime.GOMAXPROCS(0), 1)
+	}
 	jobs := make(chan job, 64)
 	var pool sync.WaitGroup
 	for range workers {
@@ -736,7 +711,10 @@ func (k *kernelSpec) eval(c *chromWork, qi int, w window, acc *kernelAcc, edgeFi
 		u := 0.5 * d // Δ/h, since h = 2·bw
 		a := math.Abs(u)
 		q := 1 - a*a*a
-		tw := c.nwt[m] * q * q * q // marker weight × tricube
+		tw := q * q * q // plain tricube, × the positions an aggregated neighbour holds
+		if c.ncnt != nil {
+			tw *= c.ncnt[m]
+		}
 		s0 += tw
 		for f := range nt {
 			acc.t[f] += tw * row[ng+f]
@@ -816,10 +794,14 @@ type chromWork struct {
 	// aggregated point per dense grid interval (at the weighted centroid,
 	// carrying Σwt, Σwt² and the weighted mean values) plus the individual
 	// markers of sparse intervals.
-	npos  []float64 // neighbour positions
-	nwt   []float64 // neighbour weights (Σ marker weights)
-	nwt2  []float64 // Σ marker weight² per neighbour; nil when neighbours are markers
-	nvals []float64 // neighbour values (weighted means), row-major [neighbour][field]
+	npos []float64 // neighbour positions
+	nwt  []float64 // neighbour weights (Σ marker weights)
+	nwt2 []float64 // Σ marker weight² per neighbour; nil when neighbours are markers
+	ncnt []float64 // positions per neighbour (aggregated grid points); nil = 1 each
+	// nvals: neighbour values, row-major [neighbour][field]: the weighted mean
+	// for Gaussian fields, the plain mean over positions for tricube and loess
+	// fields (unweighted kernels).
+	nvals []float64
 	nrv   []float64 // Σ marker weight²·(r0, r1) per neighbour, row-major [neighbour][2]; nil if not computed
 	q     []float64 // query positions, sorted (markers, or grid points plus sparse markers)
 	grid  bool      // grid mode: dense markers are interpolated between grid points
@@ -880,7 +862,13 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 		for k, ri := range idx {
 			isRep[k] = o.order.rep[ri]
 		}
-		u := newPosUnits(c.pos, wt, vals, rv, nf, isRep)
+		ng := 0 // Gaussian (weighted) fields come first
+		for _, fd := range fields {
+			if fd.kernel == kGauss {
+				ng++
+			}
+		}
+		u := newPosUnits(c.pos, wt, vals, rv, nf, ng, isRep)
 		if dup {
 			c.npos, c.nwt, c.nwt2, c.nvals, c.nrv = u.pos, u.w, u.w2, u.means(), u.rv
 		}
@@ -898,17 +886,19 @@ func newChromWork(raw []BSAstats, idx []int, fields []smoothField, o smoothOpts)
 }
 
 // posUnits are a chromosome's distinct marker positions: per position, the
-// representative view's weight (w), w² (w2), weighted values (sums, w·value,
-// row-major [unit][field]) and the index of the position's first marker.
+// representative view's weight (w), w² (w2), values (sums, row-major
+// [unit][field]: w·value for the ng weighted (Gaussian) fields, the value for
+// the unweighted tricube and loess fields) and the index of the position's
+// first marker.
 type posUnits struct {
 	pos, w, w2, sums []float64
 	rv               []float64 // representative's wt²·(r0, r1), [unit][2]; nil if not computed
 	first            []int
-	nf               int
+	nf, ng           int
 }
 
-func newPosUnits(pos, wt, vals, rv []float64, nf int, isRep []bool) *posUnits {
-	u := &posUnits{nf: nf}
+func newPosUnits(pos, wt, vals, rv []float64, nf, ng int, isRep []bool) *posUnits {
+	u := &posUnits{nf: nf, ng: ng}
 	for k := 0; k < len(pos); {
 		j, r := k, k
 		for j < len(pos) && pos[j] == pos[k] {
@@ -923,7 +913,11 @@ func newPosUnits(pos, wt, vals, rv []float64, nf int, isRep []bool) *posUnits {
 		u.w2 = append(u.w2, w*w)
 		u.first = append(u.first, k)
 		for f := range nf {
-			u.sums = append(u.sums, w*vals[r*nf+f])
+			if f < ng {
+				u.sums = append(u.sums, w*vals[r*nf+f])
+			} else {
+				u.sums = append(u.sums, vals[r*nf+f])
+			}
 		}
 		if rv != nil {
 			u.rv = append(u.rv, rv[2*r], rv[2*r+1])
@@ -935,12 +929,15 @@ func newPosUnits(pos, wt, vals, rv []float64, nf int, isRep []bool) *posUnits {
 
 func (u *posUnits) n() int { return len(u.pos) }
 
-// means returns the units' weighted-mean values.
+// means returns the units' values (the representative view's).
 func (u *posUnits) means() []float64 {
 	m := make([]float64, len(u.sums))
 	for i := range u.pos {
 		for f := range u.nf {
-			if u.w[i] > 0 {
+			switch {
+			case f >= u.ng:
+				m[i*u.nf+f] = u.sums[i*u.nf+f]
+			case u.w[i] > 0:
 				m[i*u.nf+f] = u.sums[i*u.nf+f] / u.w[i]
 			}
 		}
@@ -956,24 +953,29 @@ const aggregateBinSigmas = 100
 // aggregate builds the grid-mode kernel neighbours from the position units:
 // units of dense grid intervals (whose markers are interpolated, c.mq < 0)
 // are grouped into bins of width ≤ width, each becoming one point at its
-// weighted centroid with weight Σw, Σw² and weighted-mean values; units
+// weighted centroid with weight Σw, Σw², the number of positions, and
+// weighted-mean values (plain means for the unweighted kernels); units
 // evaluated exactly (sparse intervals) stay individual. Placing the point at
 // the centroid cancels the first-order kernel error, Σw·(pos − centroid) = 0;
 // what remains is second order in the bin width (σ/100).
 func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
-	c.npos, c.nwt, c.nwt2, c.nvals, c.nrv = nil, nil, nil, nil, nil
+	c.npos, c.nwt, c.nwt2, c.ncnt, c.nvals, c.nrv = nil, nil, nil, nil, nil, nil
 	sums := make([]float64, nf)
 	var rv0, rv1 float64 // Σ wt²·(r0, r1) of the point
-	add := func(p, w, w2 float64) {
+	add := func(p, w, w2, cnt float64) {
 		c.npos = append(c.npos, p)
 		c.nwt = append(c.nwt, w)
 		c.nwt2 = append(c.nwt2, w2)
+		c.ncnt = append(c.ncnt, cnt)
 		if u.rv != nil {
 			c.nrv = append(c.nrv, rv0, rv1)
 		}
 		for f := range nf {
 			v := 0.0
-			if w > 0 {
+			switch {
+			case f >= u.ng: // unweighted kernels: plain mean over the positions
+				v = sums[f] / cnt
+			case w > 0:
 				v = sums[f] / w
 			}
 			c.nvals = append(c.nvals, v)
@@ -986,7 +988,7 @@ func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
 			if u.rv != nil {
 				rv0, rv1 = u.rv[2*k], u.rv[2*k+1]
 			}
-			add(u.pos[k], u.w[k], u.w2[k])
+			add(u.pos[k], u.w[k], u.w2[k], 1)
 			k++
 			continue
 		}
@@ -998,13 +1000,14 @@ func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
 			hi = math.Inf(1) // last interval includes the last position
 		}
 		hi = math.Min(hi, u.pos[k]+width) // bin: within the interval and ≤ width
-		var w, w2, wp float64
+		var w, w2, wp, cnt float64
 		clear(sums)
 		rv0, rv1 = 0, 0
 		j := k
 		for ; j < u.n() && c.mq[u.first[j]] < 0 && u.pos[j] < hi; j++ {
 			w += u.w[j]
 			w2 += u.w2[j]
+			cnt++
 			if u.rv != nil {
 				rv0 += u.rv[2*j]
 				rv1 += u.rv[2*j+1]
@@ -1018,7 +1021,7 @@ func (c *chromWork) aggregate(u *posUnits, nf int, width float64) {
 		if w > 0 {
 			centroid = wp / w
 		}
-		add(centroid, w, w2)
+		add(centroid, w, w2, cnt)
 		k = j
 	}
 }
@@ -1225,211 +1228,6 @@ func reportSparseDrops(drops []chromDrop, total, dropped int) {
 	}
 }
 
-// ─── normalisation ─────────────────────────────────────────────────────────────
-
-// zField pairs a smoothed statistic with its Z-score field; logZ: take the Z
-// of log(x + c), c = 10% of the genome-wide median (see track.logZ).
-type zField struct {
-	get  func(*SmoothedStats) float64
-	set  func(*SmoothedStats, float64)
-	logZ bool
-}
-
-// zScale is a robust Z transform: z = (x − center) / scale (0 if scale = 0).
-type zScale struct {
-	center, scale float64
-	set           bool
-}
-
-func (z zScale) of(x float64) float64 {
-	if z.scale > 0 {
-		return (x - z.center) / z.scale
-	}
-	return 0
-}
-
-// normalise computes the genome-wide robust Z-score of every track that has
-// one (smoothLayout.tracks), in place. It returns, per track index, the
-// untransformed robust Z scale of the log-Z tracks that enter CompositeZ:
-// the Z columns of those tracks are log-based (symmetric display), while
-// CompositeZ uses the untransformed robust Z (see consolidate).
-func normalise(sm []SmoothedStats, lay smoothLayout) []zScale {
-	tracks := lay.tracks()
-	raw := make([]zScale, len(tracks))
-	type job struct {
-		f   zField
-		dst *zScale // raw-scale job: store the scale instead of setting Z
-	}
-	var jobs []job
-	for i, tr := range tracks {
-		if tr.z == nil {
-			continue
-		}
-		get, set := tr.sm, tr.z
-		jobs = append(jobs, job{f: zField{func(s *SmoothedStats) float64 { return *get(s) }, func(s *SmoothedStats, v float64) { *set(s) = v }, tr.logZ}})
-		if tr.logZ && tr.composite != notInComposite {
-			jobs = append(jobs, job{f: zField{get: func(s *SmoothedStats) float64 { return *get(s) }}, dst: &raw[i]})
-		}
-	}
-
-	// At most normaliseWorkers jobs at a time, each with one reused buffer
-	// of len(sm) floats (the median and MAD sort it in place).
-	sem := make(chan struct{}, normaliseWorkers)
-	var wg sync.WaitGroup
-	for _, jb := range jobs {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer func() { <-sem; wg.Done() }()
-			buf := make([]float64, len(sm))
-			if jb.dst != nil {
-				*jb.dst = robustZScale(sm, jb.f.get, buf)
-				jb.dst.set = true
-				return
-			}
-			robustZField(sm, jb.f, buf)
-		}()
-	}
-	wg.Wait()
-	return raw
-}
-
-// normaliseWorkers bounds how many fields are normalised at once (memory:
-// one len(sm) buffer each).
-const normaliseWorkers = 3
-
-// robustZScale returns the robust Z transform of get over sm: center = median,
-// scale = 1.4826 × MAD (a consistent estimator of σ under normality; Rousseeuw
-// & Croux 1993); when MAD = 0, the classical mean and population SD. buf
-// (len(sm)) is the only scratch.
-func robustZScale(sm []SmoothedStats, get func(*SmoothedStats) float64, buf []float64) zScale {
-	const consistencyFactor = 1.4826
-	n := len(sm)
-	if n == 0 {
-		return zScale{}
-	}
-	for i := range sm {
-		buf[i] = get(&sm[i])
-	}
-	sort.Float64s(buf)
-	med := sortedMedian(buf)
-	for i := range sm {
-		buf[i] = math.Abs(get(&sm[i]) - med)
-	}
-	sort.Float64s(buf)
-	if mad := sortedMedian(buf) * consistencyFactor; mad > 0 {
-		return zScale{center: med, scale: mad}
-	}
-	mean := 0.0
-	for i := range sm {
-		mean += get(&sm[i])
-	}
-	mean /= float64(n)
-	variance := 0.0
-	for i := range sm {
-		d := get(&sm[i]) - mean
-		variance += d * d
-	}
-	return zScale{center: mean, scale: math.Sqrt(variance / float64(n))}
-}
-
-// robustZField sets f's robust Z-score (robustZScale) on every marker, using
-// buf (len(sm)) as the only scratch; zeros for a constant track. With f.logZ
-// the Z is of log(x + c), c = 10% of the median (see track.logZ).
-func robustZField(sm []SmoothedStats, f zField, buf []float64) {
-	if len(sm) == 0 {
-		return
-	}
-	get := f.get
-	if f.logZ {
-		for i := range sm {
-			buf[i] = f.get(&sm[i])
-		}
-		sort.Float64s(buf)
-		c := 0.1 * sortedMedian(buf)
-		if !(c > 0) {
-			c = 1e-12
-		}
-		get = func(s *SmoothedStats) float64 { return math.Log(math.Max(f.get(s), 0) + c) }
-	}
-	z := robustZScale(sm, get, buf)
-	for i := range sm {
-		f.set(&sm[i], z.of(get(&sm[i])))
-	}
-}
-
-// sortedMedian is the median of an already sorted slice.
-func sortedMedian(s []float64) float64 {
-	n := len(s)
-	if n%2 == 1 {
-		return s[n/2]
-	}
-	return (s[n/2-1] + s[n/2]) / 2
-}
-
-// ─── consolidation ─────────────────────────────────────────────────────────────
-
-// consolidate fills CompositeZ (Stouffer's Z) and MaxAbsZ for every variant,
-// from the layout's tracks:
-//
-//	Two-bulk: (|ZDeltaSI| + ZGstat) / √2   (Z(|ΔSI|) unfolded when ΔSI is unsigned)
-//	One-bulk: (|ZAFDev|  + ZOneBulkG) / √2
-//
-// The HMM LOD is not part of it: it is a separate track in LOD units with its
-// own genome-wide thresholds. ΔSI and AFDev are folded so that both tails
-// count as signal. ZGstat is a robust Z of a non-negative statistic, so it is
-// negative below the genome-wide median; CompositeZ is not bounded below.
-// Direction is kept in the individual tracks (ZDeltaSI / ZAFDev).
-//
-// MaxAbsZ is the largest deviation over all normalised tracks, a diagnostic
-// column: |Z| for signed tracks (ΔSI, AFDev, one-bulk SI), and the positive
-// part of Z for one-sided tracks (G′, G1, ED⁴, |ΔSI|), where a low value is
-// not evidence.
-//
-// For the log-Z tracks in CompositeZ (G′, G1) it uses their untransformed
-// robust Z (raw, from normalise), not the log-based Z column: on overdispersed
-// data the log-based components raised CompositeZ's pointwise false-positive
-// rate (1.4% vs 1.0% at p99). raw = nil uses the Z columns as they are.
-//
-// Its thresholds come from the null simulation (hmmnull.go), which runs the
-// same scorer, so the combination and its null always match.
-func consolidate(sm []SmoothedStats, lay smoothLayout, raw []zScale) {
-	tracks := lay.tracks()
-	k := lay.compositeCount()
-	for i := range sm {
-		s := &sm[i]
-		if k == 0 {
-			continue
-		}
-		sum, maxAbs := 0.0, 0.0
-		for ti, tr := range tracks {
-			if tr.z == nil {
-				continue
-			}
-			z := *tr.z(s)
-			zc := z // CompositeZ component: untransformed Z for log-Z tracks
-			if ti < len(raw) && raw[ti].set {
-				zc = raw[ti].of(*tr.sm(s))
-			}
-			switch tr.composite {
-			case compositePlain:
-				sum += zc
-			case compositeFolded:
-				sum += math.Abs(zc)
-			}
-			a := math.Abs(z)
-			if tr.oneSided() { // only high values are evidence
-				a = math.Max(z, 0)
-			}
-			if a > maxAbs {
-				maxAbs = a
-			}
-		}
-		s.CompositeZ = sum / math.Sqrt(float64(k))
-		s.MaxAbsZ = maxAbs
-	}
-}
-
 // ─── TSV output ────────────────────────────────────────────────────────────────
 
 func smoothedHeader(lay smoothLayout) []byte {
@@ -1439,14 +1237,23 @@ func smoothedHeader(lay smoothLayout) []byte {
 	}
 	header = append(header, "NEff")
 	for _, tr := range lay.tracks() {
-		for _, col := range []string{tr.smCol, tr.zCol} {
-			if col != "" {
-				header = append(header, col)
-			}
-		}
+		header = append(header, tr.smCol)
 	}
-	header = append(header, "CompositeZ", "MaxAbsZ")
+	if lay.both() || lay.one() {
+		dsi, g := lay.consensusColumns()
+		header = append(header, dsi, g, "DsiGconsensusZ")
+	}
 	return []byte(strings.Join(header, "\t") + "\n")
+}
+
+// consensusColumns names the null-standardised component columns: NZ_ plus
+// the ΔSI-family track (DeltaSI, AbsDeltaSI or AFDev) and the G track (Gstat
+// or OneBulkGstat).
+func (l smoothLayout) consensusColumns() (dsi, g string) {
+	if l.one() {
+		return "NZ_AFDev", "NZ_OneBulkGstat"
+	}
+	return "NZ_" + DeltaSIName(l.signedDSI), "NZ_Gstat"
 }
 
 // appendSmoothedRow appends one marker's TSV row (floats to 6 decimals,
@@ -1465,14 +1272,11 @@ func appendSmoothedRow(buf []byte, s *SmoothedStats, lay smoothLayout, tracks []
 	}
 	buf = strconv.AppendFloat(append(buf, '\t'), s.NEff, 'f', 2, 64)
 	for _, tr := range tracks {
-		if tr.smCol != "" {
-			buf = f6(buf, *tr.sm(s))
-		}
-		if tr.zCol != "" {
-			buf = f6(buf, *tr.z(s))
-		}
+		buf = f6(buf, *tr.sm(s))
 	}
-	buf = f6(f6(buf, s.CompositeZ), s.MaxAbsZ)
+	if lay.both() || lay.one() {
+		buf = f6(f6(f6(buf, s.NZDeltaSI), s.NZGstat), s.DsiGconsensusZ)
+	}
 	return append(buf, '\n')
 }
 

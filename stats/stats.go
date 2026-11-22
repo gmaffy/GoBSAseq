@@ -56,7 +56,7 @@ type BSAstats struct {
 	// ALT reads; 0 when the mode lacks that bulk).
 	HighDepth int
 	LowDepth  int
-	// Depth is the depth used for smoothing weights and the CompositeZ null:
+	// Depth is the depth used for smoothing weights and the null simulation:
 	// the bulk's depth in one-bulk modes, and in two-bulk modes the effective
 	// depth 2·dH·dL/(dH+dL), i.e. the equal depth that gives ΔSI the same
 	// read-sampling variance, p(1−p)(1/dH + 1/dL).
@@ -147,7 +147,7 @@ func RawStats(cfg utils.AnalysisConfig, bsaType string, idxs []int, passedVarian
 	// HMM LOD: a linkage- and pool-aware statistic computed along each
 	// chromosome from the per-site read counts (hmm.go). It stays a separate
 	// track in LOD units: carried through smoothing unsmoothed, not
-	// normalised, not in CompositeZ, with its own genome-wide thresholds.
+	// normalised, not in DsiGconsensusZ, with its own genome-wide thresholds.
 	if layout.hmm {
 		setup, err := newHMMSetup(cfg, bsaType)
 		if err != nil {

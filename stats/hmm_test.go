@@ -112,11 +112,11 @@ func TestGenomeNullThresholdsRuns(t *testing.T) {
 	}
 	cfg := utils.AnalysisConfig{WindowSize: 2_000_000, Population: "F2", HighBulkSize: 20, LowBulkSize: 20, RefParent: "high", NullReps: 20}
 	th, err := genomeNullThresholds(cfg, "2p2b", raw)
-	zt, ht := th.Z, th.HMM
+	zt, ht := th.Consensus, th.HMM
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !(ht.LODP99 >= ht.LODP95 && ht.LODP95 > 0 && zt.CompositeZP99 >= zt.CompositeZP95) || math.IsInf(ht.LODP99, 0) {
+	if !(ht.LODP99 >= ht.LODP95 && ht.LODP95 > 0 && zt.P99 >= zt.P95) || math.IsInf(ht.LODP99, 0) {
 		t.Fatalf("thresholds HMM %+v, Z %+v", ht, zt)
 	}
 	if tb := th.TwoBulk; !(tb.GstatP99 >= tb.GstatP95 && tb.GstatP95 > 0 && tb.DeltaSIP99 > 0 && tb.DeltaSIMp99 < 0 && tb.ED4P99 > 0) {
@@ -125,8 +125,8 @@ func TestGenomeNullThresholdsRuns(t *testing.T) {
 	if th.BRMU != 0 { // BrmAlpha unset: no BRM threshold
 		t.Fatalf("BRMU = %v without --brm-alpha", th.BRMU)
 	}
-	if zt.NumStats != 2 {
-		t.Fatalf("NumStats = %d, want 2", zt.NumStats)
+	if m := zt.Model; m == nil || !(zt.R > -1 && zt.R < 1) || !(m.DSIScale > 0) || len(m.Moments) != 2 {
+		t.Fatalf("DsiGconsensusZ null model %+v, r = %v", m, zt.R)
 	}
 }
 

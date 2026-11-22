@@ -280,20 +280,21 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	color.Cyan("STEP 3/10: Smoothing and normalising raw statistics ...\n")
+	color.Cyan("STEP 3/10: Calculating genome-wide thresholds (null simulation) ...\n")
 
-	// ---------------------------------------- smoothing ------------------------------------------------------------//
-	smoothedStats, err := stats.SmoothAndNormalise(*cfg, btype, rawStats)
+	// ----------------------------------------- Threshold calculation -----------------------------------------------//
+	// Before smoothing: DsiGconsensusZ is standardised against this null.
+	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats)
 	if err != nil {
 		return err
 	}
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	color.Cyan("STEP 4/10: Calculating thresholds ...\n")
+	color.Cyan("STEP 4/10: Smoothing and normalising raw statistics ...\n")
 
-	// ----------------------------------------- Threshold calculation -----------------------------------------------//
-	thresholds, err := stats.CalculateThresholds(*cfg, btype, rawStats)
+	// ---------------------------------------- smoothing ------------------------------------------------------------//
+	smoothedStats, err := stats.SmoothAndNormalise(*cfg, btype, rawStats, thresholds)
 	if err != nil {
 		return err
 	}
@@ -330,19 +331,22 @@ func bsaseq(cfg *utils.AnalysisConfig, hfcfg *utils.HardFilterConfig, btype stri
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	color.Cyan("STEP 7/10: Detecting QTLs from normalised and consolidated statistics ...\n")
+	color.Cyan("STEP 7/10: Detecting QTLs from DsiGconsensusZ ...\n")
 
-	compositePeaks := stats.DetectCompositeZQTLs(smoothedStats, thresholds, mergeGap, cfg.EffectiveMinQTLMarkers())
-	err = stats.WriteCompositeZQTLs(compositePeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.compositez.qtl.xlsx", btype)))
+	consensusPeaks := stats.DetectDsiGconsensusZQTLs(smoothedStats, thresholds, mergeGap, cfg.EffectiveMinQTLMarkers())
+	err = stats.WriteDsiGconsensusZQTLs(consensusPeaks, filepath.Join(cfg.OutputDir, "qtls", fmt.Sprintf("GoBSAseq.%s.dsigconsensusz.qtl.xlsx", btype)))
 	if err != nil {
-		fmt.Printf("Error writing composite Z QTLs to Excel: %v\n", err)
+		fmt.Printf("Error writing DsiGconsensusZ QTLs to Excel: %v\n", err)
 		return err
 	}
-	color.Green("Detected %d CompositeZ QTL peaks", len(compositePeaks))
+	color.Green("Detected %d DsiGconsensusZ QTL peaks", len(consensusPeaks))
 
 	fmt.Printf("-------------------------------------------------------------------------------------------------\n\n")
 
-	color.Cyan("STEP 8/10: Final QTLs: consensus of HMM LOD, BRM and CompositeZ ...\n")
+	color.Cyan("STEP 8/10: Final QTLs: consensus of HMM LOD, BRM and DsiGconsensusZ ...\n")
+	if !stats.HMMAvailable(*cfg, btype) {
+		color.Yellow("No HMM LOD in this mode (2b without --ref-parent): BRM and DsiGconsensusZ both test the ΔSI contrast, so final QTLs rest on a single line of evidence")
+	}
 
 	final := stats.ConsensusQTLs(smoothedStats, thresholds, brmBlocks, individualPeaks,
 		cfg.SignedDeltaSI(btype), stats.HMMAvailable(*cfg, btype), mergeGap, cfg.EffectiveMinQTLMarkers())

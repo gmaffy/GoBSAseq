@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/fatih/color"
 	"github.com/gmaffy/GoBSAseq/filter"
@@ -28,8 +29,12 @@ import (
 //     read-level overdispersion ρ estimated from the data (estimateRho), so
 //     overdispersed data are not scored against a binomial null;
 //   - per-site statistics are computed by the same rawCalc and the HMM LOD as
-//     in RawStats, then the replicate goes through the same scorer as the
-//     real data (kernel smoothing, robust Z, CompositeZ).
+//     in RawStats, then the replicate goes through the same kernel smoothing
+//     as the real data.
+//
+// Two sets of replicates: consensusMomentReps genomes (smoothing only, no
+// HMM) fit DsiGconsensusZ's null standardisation (dsigconsensus.go); NullReps
+// further genomes set every threshold, DsiGconsensusZ's included.
 //
 // Every threshold is genome-wide: a quantile of the most extreme value each
 // scanned statistic reaches in a replicate (maximum, and minimum for lower
@@ -37,6 +42,10 @@ import (
 // extremes (extremeQuantile). The fit uses every replicate, so the 99% quantile is
 // stable at the default 200 replicates, where the empirical one rests on the
 // top two.
+//
+// Replicates run in parallel (nullPool), each from its own seeds, and are
+// consumed in replicate order, so the thresholds do not depend on the number
+// of cores.
 
 // nullSeed seeds the null simulation, so thresholds are reproducible.
 const nullSeed = 20240611
@@ -51,6 +60,7 @@ type nullExtreme struct {
 }
 
 // nullExtremes lists the smoothed tracks that get thresholds in layout lay.
+// (DsiGconsensusZ and BRM are handled separately: they need the null model.)
 func nullExtremes(lay smoothLayout) []*nullExtreme {
 	var out []*nullExtreme
 	add := func(two bool, get func(*SmoothedStats) float64, set func(t *Thresholds, p99, p95, m99, m95 float64)) {
@@ -85,9 +95,6 @@ func nullExtremes(lay smoothLayout) []*nullExtreme {
 			t.OneBulk.OneBulkGstatP99, t.OneBulk.OneBulkGstatP95 = p99, p95
 		})
 	}
-	add(false, func(s *SmoothedStats) float64 { return s.CompositeZ }, func(t *Thresholds, p99, p95, _, _ float64) {
-		t.Z.CompositeZP99, t.Z.CompositeZP95 = p99, p95
-	})
 	return out
 }
 
@@ -113,8 +120,8 @@ func (e *nullExtreme) apply(t *Thresholds) {
 		r6(-extremeQuantile(e.min, 0.995)), r6(-extremeQuantile(e.min, 0.975)))
 }
 
-// genomeNullThresholds runs cfg.NullReps null replicates and returns every
-// threshold.
+// genomeNullThresholds runs the genome-wide null simulation and returns every
+// threshold and DsiGconsensusZ's null model.
 func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (Thresholds, error) {
 	reps := cfg.NullReps
 	if reps <= 0 {
@@ -151,29 +158,39 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 			return Thresholds{}, err
 		}
 	}
+	spec, err := newConsensusSpec(cfg, bsaType, rho)
+	if err != nil {
+		return Thresholds{}, err
+	}
+	pool := newNullPool(sim, sc, order, every)
+	color.Cyan("Null simulation: %d replicate(s) at a time, %d core(s) each\n", pool.outer, pool.inner)
+
+	// DsiGconsensusZ's null model, from its own genomes (no HMM needed).
+	mReps := consensusMomentReps(reps)
+	color.Cyan("DsiGconsensusZ null model: %d simulated no-QTL genomes\n", mReps)
+	fit := newConsensusFitter(spec, mReps)
+	bar := progressbar.Default(int64(mReps), "Null model")
+	if err := pool.run(mReps, nullSeed+1, false, func(_ int, sm []SmoothedStats, _ float64) error {
+		_ = bar.Add(1)
+		return fit.add(sm)
+	}); err != nil {
+		return Thresholds{}, err
+	}
+	_ = bar.Finish()
+	model, gMean, gSD, err := fit.model()
+	if err != nil {
+		return Thresholds{}, err
+	}
+	reportConsensusModel(spec, model)
 
 	color.Cyan("Genome-wide null: %d simulated no-QTL genomes at the real markers and depths\n", reps)
-	bar := progressbar.Default(int64(reps), "Null genomes")
-	rng := rand.New(rand.NewSource(nullSeed))
-	hmmMax, brmMax := make([]float64, 0, reps), make([]float64, 0, reps)
-	buf := make([]BSAstats, len(raw))
-	for range reps {
-		sim.replicate(rng, buf)
-		if sc.hmm != nil { // as RawStats: HMM LOD from the per-site counts, before smoothing
-			computeHMMLOD(sc.hmm, buf, order)
-		}
-		sm, err := sc.scoreOrdered(buf, order, false, every)
-		if err != nil {
-			return Thresholds{}, err
-		}
+	bar = progressbar.Default(int64(reps), "Null genomes")
+	hmmMax, brmMax, consMax := make([]float64, 0, reps), make([]float64, 0, reps), make([]float64, 0, reps)
+	err = pool.run(reps, nullSeed, sc.hmm != nil, func(_ int, sm []SmoothedStats, lod float64) error {
 		if len(sm) == 0 {
-			return Thresholds{}, fmt.Errorf("no markers were scored in the null simulation")
+			return fmt.Errorf("no markers were scored in the null simulation")
 		}
-		mh := 0.0
-		for i := range buf {
-			mh = math.Max(mh, buf[i].HMMLOD)
-		}
-		hmmMax = append(hmmMax, mh)
+		hmmMax = append(hmmMax, lod)
 		for _, e := range ext {
 			e.observe(sm)
 		}
@@ -184,7 +201,16 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 			}
 			brmMax = append(brmMax, mz)
 		}
+		cz, err := model.consensusMaximum(spec, sm, gMean, gSD)
+		if err != nil {
+			return err
+		}
+		consMax = append(consMax, cz)
 		_ = bar.Add(1)
+		return nil
+	})
+	if err != nil {
+		return Thresholds{}, err
 	}
 	_ = bar.Finish()
 
@@ -193,7 +219,6 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 		th.BRMU, th.BRMAlpha = r6(extremeQuantile(brmMax, 1-alpha)), alpha
 		color.Green("BRM genome-wide threshold: |z| ≥ %.3f (α = %g)\n", th.BRMU, alpha)
 	}
-	th.Z.NumStats = countZStats(bsaType)
 	for _, e := range ext {
 		e.apply(&th)
 	}
@@ -201,13 +226,133 @@ func genomeNullThresholds(cfg utils.AnalysisConfig, bsaType string, raw []BSAsta
 		th.HMM = HMMThresholds{LODP99: r6(extremeQuantile(hmmMax, 0.99)), LODP95: r6(extremeQuantile(hmmMax, 0.95))}
 		color.Green("HMM LOD genome-wide thresholds: p99 %.2f, p95 %.2f\n", th.HMM.LODP99, th.HMM.LODP95)
 	}
-	color.Green("CompositeZ genome-wide thresholds: p99 %.3f, p95 %.3f\n", th.Z.CompositeZP99, th.Z.CompositeZP95)
+	th.Consensus = ConsensusThresholds{P99: r6(extremeQuantile(consMax, 0.99)), P95: r6(extremeQuantile(consMax, 0.95)),
+		R: r6(model.R), Model: model}
+	color.Green("DsiGconsensusZ genome-wide thresholds: p99 %.3f, p95 %.3f\n", th.Consensus.P99, th.Consensus.P95)
 	return th, nil
+}
+
+// nullMemBudget bounds the memory of the replicates the null runs at once.
+const nullMemBudget = 2 << 30
+
+// smoothBytesPerMarker bounds the smoothing state per marker of the
+// chromosome being smoothed (positions, weights, values, query results).
+const smoothBytesPerMarker = 256
+
+// nullOuterOverride, if > 0, fixes how many replicates run at once (tests).
+var nullOuterOverride int
+
+// nullPool runs null replicates in parallel: outer replicates at a time, each
+// on inner goroutines (outer × inner ≈ the cores). Whole replicates in
+// parallel keep every core busy, where one replicate at a time waited on its
+// longest chromosome three times over (simulation, HMM, smoothing); outer is
+// bounded by nullMemBudget, since each replicate holds a genome buffer.
+type nullPool struct {
+	sim          *nullSim
+	sc           *scorer
+	order        *markerOrder
+	every        int
+	outer, inner int
+}
+
+func newNullPool(sim *nullSim, sc *scorer, order *markerOrder, every int) *nullPool {
+	procs := max(runtime.GOMAXPROCS(0), 1)
+	maxN := 0
+	for _, idx := range order.chroms {
+		maxN = max(maxN, len(idx))
+	}
+	per := int64(len(sim.raw))*int64(unsafe.Sizeof(BSAstats{})) + // replicate buffer
+		int64(maxN)*smoothBytesPerMarker + // smoothing state of the largest chromosome
+		int64(len(sim.raw)/max(every, 1)+1)*int64(unsafe.Sizeof(SmoothedStats{})) // scored markers
+	if sc.hmm != nil {
+		per += sc.hmm.chromBytes(maxN)
+	}
+	outer := int(min(int64(procs), max(1, nullMemBudget/max(per, 1))))
+	if nullOuterOverride > 0 {
+		outer = nullOuterOverride
+	}
+	return &nullPool{sim: sim, sc: sc, order: order, every: every, outer: outer, inner: max(1, procs/outer)}
+}
+
+// run simulates n replicates from seed and passes each one's scored markers
+// (and, with hmm, its maximum HMM LOD) to consume, in replicate order, on the
+// calling goroutine. Replicate r's per-chromosome seeds are the r-th block of
+// a stream seeded with seed, whatever the scheduling, so the results do not
+// depend on the number of workers. The first error stops the run.
+func (p *nullPool) run(n int, seed int64, hmm bool, consume func(rep int, sm []SmoothedStats, lod float64) error) error {
+	nc := len(p.sim.chroms)
+	rng := rand.New(rand.NewSource(seed))
+	seeds := make([]int64, n*nc)
+	for i := range seeds {
+		seeds[i] = rng.Int63()
+	}
+	type result struct {
+		rep int
+		sm  []SmoothedStats
+		lod float64
+		err error
+	}
+	results := make(chan result, p.outer)
+	// A worker takes a token before a replicate number and the collector
+	// returns it once that replicate is consumed: at most 2·outer replicates
+	// are held at once, and the lowest unconsumed one always holds a token.
+	tokens := make(chan struct{}, 2*p.outer)
+	var next atomic.Int64
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	for range p.outer {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := p.sim.newWorker()
+			for !stop.Load() {
+				tokens <- struct{}{}
+				r := int(next.Add(1)) - 1
+				if r >= n {
+					<-tokens
+					return
+				}
+				p.sim.replicateWith(w, seeds[r*nc:(r+1)*nc], p.inner)
+				res := result{rep: r}
+				if hmm {
+					res.lod = p.sc.hmm.maxHMMLODWorkers(w.buf, p.order, p.inner)
+				}
+				res.sm, res.err = p.sc.scoreWorkers(w.buf, p.order, false, p.every, p.inner)
+				results <- res
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	pending := map[int]result{}
+	want := 0
+	var firstErr error
+	for res := range results {
+		pending[res.rep] = res
+		for {
+			r, ok := pending[want]
+			if !ok {
+				break
+			}
+			delete(pending, want)
+			want++
+			if firstErr == nil {
+				if firstErr = r.err; firstErr == nil {
+					firstErr = consume(r.rep, r.sm, r.lod)
+				}
+				if firstErr != nil {
+					stop.Store(true)
+				}
+			}
+			<-tokens
+		}
+	}
+	return firstErr
 }
 
 // nullEvery is how many markers apart the null replicates are scored: enough
 // that the scored markers are on average ≤ σ/10 apart, so the replicate's
-// CompositeZ maximum is not underestimated (the smoothed tracks vary on the
+// track maxima are not underestimated (the smoothed tracks vary on the
 // scale of σ), and no more, since only the maximum is kept.
 func nullEvery(order *markerOrder, raw []BSAstats, sigma float64) int {
 	span, n := 0.0, 0
@@ -224,8 +369,8 @@ func nullEvery(order *markerOrder, raw []BSAstats, sigma float64) int {
 // extremeQuantile fits a generalized extreme-value (GEV) distribution to
 // sample maxima x by probability-weighted moments (Hosking, Wallis & Wood
 // 1985) and returns its p quantile. The GEV is the limit law of maxima; its
-// shape lets the tail be heavier than Gumbel's (CompositeZ maxima: a robust
-// Z of strongly linked tracks) or lighter, and it reduces to the Gumbel when
+// shape lets the tail be heavier than Gumbel's (maxima of strongly linked
+// smoothed tracks) or lighter, and it reduces to the Gumbel when
 // the shape is 0. PWM estimates are stable for small samples, so the 99%
 // quantile is usable at 200 replicates, where the empirical one rests on the
 // top two. Falls back to the empirical quantile for small or constant x.
@@ -397,7 +542,8 @@ func estimateRho(raw []BSAstats, order *markerOrder, s *nullSim) (float64, int) 
 
 // nullSim holds what a replicate needs: the template markers in chromosome
 // order, the gaps, the pool models, the per-site calculator and the
-// overdispersion; rngs are per-chromosome streams, reseeded each replicate.
+// overdispersion. It is read-only while replicates run; each worker has its
+// own simWorker (genome buffer and RNG streams).
 type nullSim struct {
 	raw       []BSAstats
 	chroms    [][]int     // indices into raw, by position
@@ -407,10 +553,23 @@ type nullSim struct {
 	p0        float64
 	rho       float64 // read overdispersion (estimateRho)
 	oneBulk   bool
-	sites     []filter.Site
-	srcs      []splitMix   // per-chromosome RNG state
-	rngs      []*rand.Rand // wrap srcs
-	bySize    []int        // chromosome indices, most markers first (scheduling)
+	bySize    []int // chromosome indices, most markers first (scheduling)
+}
+
+// simWorker is one worker's replicate state: the genome buffer and one RNG
+// stream per chromosome, reseeded for every replicate.
+type simWorker struct {
+	buf  []BSAstats
+	srcs []splitMix
+	rngs []*rand.Rand // wrap srcs
+}
+
+func (s *nullSim) newWorker() *simWorker {
+	w := &simWorker{buf: make([]BSAstats, len(s.raw)), srcs: make([]splitMix, len(s.chroms)), rngs: make([]*rand.Rand, len(s.chroms))}
+	for c := range w.srcs {
+		w.rngs[c] = rand.New(&w.srcs[c])
+	}
+	return w
 }
 
 func newNullSim(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (*nullSim, error) {
@@ -423,7 +582,7 @@ func newNullSim(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (*null
 	if err != nil {
 		return nil, err
 	}
-	s := &nullSim{raw: raw, p0: p0, oneBulk: one, sites: make([]filter.Site, len(raw))}
+	s := &nullSim{raw: raw, p0: p0, oneBulk: one}
 	mk := func(n int) (*poolModel, error) {
 		m, err := newPoolModel(cfg.Population, n)
 		return &m, err
@@ -479,11 +638,8 @@ func newNullSim(cfg utils.AnalysisConfig, bsaType string, raw []BSAstats) (*null
 		s.chroms = append(s.chroms, idx)
 		s.dM = append(s.dM, gapsMorgans(raw, idx, cfg.CMPerMb))
 	}
-	s.srcs = make([]splitMix, len(s.chroms))
-	s.rngs = make([]*rand.Rand, len(s.chroms))
 	s.bySize = make([]int, len(s.chroms))
 	for c := range s.chroms {
-		s.rngs[c] = rand.New(&s.srcs[c])
 		s.bySize[c] = c
 	}
 	sort.SliceStable(s.bySize, func(a, b int) bool { return len(s.chroms[s.bySize[a]]) > len(s.chroms[s.bySize[b]]) })
@@ -523,16 +679,23 @@ func gapsMorgans(raw []BSAstats, idx []int, cmPerMb float64) []float64 {
 	return dM
 }
 
-// replicate fills out with one simulated no-QTL genome's per-site statistics.
-// Chromosomes are simulated in parallel, each from its own stream seeded from
-// rng, so the result does not depend on the number of workers.
-func (s *nullSim) replicate(rng *rand.Rand, out []BSAstats) {
-	for c := range s.srcs {
-		s.srcs[c].Seed(rng.Int63())
+// replicateWith fills w.buf with one simulated no-QTL genome's per-site
+// statistics. Chromosome c is drawn from its own stream seeded with seeds[c],
+// so the result does not depend on how many goroutines (inner) share the
+// chromosomes.
+func (s *nullSim) replicateWith(w *simWorker, seeds []int64, inner int) {
+	for c := range w.srcs {
+		w.srcs[c].Seed(seeds[c])
+	}
+	if inner <= 1 {
+		for _, c := range s.bySize {
+			s.replicateChrom(c, w.buf, w.rngs[c])
+		}
+		return
 	}
 	var next atomic.Int64
 	var wg sync.WaitGroup
-	for range min(runtime.GOMAXPROCS(0), len(s.chroms)) {
+	for range min(inner, len(s.chroms)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -541,15 +704,15 @@ func (s *nullSim) replicate(rng *rand.Rand, out []BSAstats) {
 				if k >= len(s.bySize) {
 					return
 				}
-				s.replicateChrom(s.bySize[k], out)
+				c := s.bySize[k]
+				s.replicateChrom(c, w.buf, w.rngs[c])
 			}
 		}()
 	}
 	wg.Wait()
 }
 
-func (s *nullSim) replicateChrom(c int, out []BSAstats) {
-	rng := s.rngs[c]
+func (s *nullSim) replicateChrom(c int, out []BSAstats, rng *rand.Rand) {
 	var jh, jl int
 	for x, i := range s.chroms[c] {
 		if s.high != nil {
@@ -559,8 +722,7 @@ func (s *nullSim) replicateChrom(c int, out []BSAstats) {
 			jl = s.low.stepState(rng, jl, x, s.dM[c][x])
 		}
 		t := &s.raw[i]
-		site := &s.sites[i]
-		*site = filter.Site{Chrom: t.CHROM, Pos: t.POS, Ref: t.REF, Alt: t.ALT, HighIsAlt: t.HighIsAlt, NSamples: 2}
+		site := &filter.Site{Chrom: t.CHROM, Pos: t.POS, Ref: t.REF, Alt: t.ALT, HighIsAlt: t.HighIsAlt, NSamples: 2}
 		shift := 0.0
 		if s.oneBulk {
 			shift = t.OneBulkP0 - s.p0
